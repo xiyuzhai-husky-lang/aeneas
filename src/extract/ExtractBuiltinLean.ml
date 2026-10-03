@@ -3,6 +3,8 @@ open ExtractBuiltinCore
 
 let lean_builtin_types =
   [
+    (* file: "Aeneas/Std/IteratorOps.lean", line: 40 *)
+  mk_type "core::iter::sources::repeat::Repeat" "core.iter.sources.repeat.Repeat" ~kind:(KStruct [("element", Some "element")]);
     (* file: "Aeneas/Std/Alloc.lean", line: 18 *)
     mk_type "alloc::alloc::Global" "Global" ~kind:(KEnum [ ("Mk", Some "mk") ]);
     (* file: "Aeneas/Std/Alloc.lean", line: 13 *)
@@ -192,6 +194,20 @@ let lean_builtin_consts =
 
 let lean_builtin_funs =
   [
+    (* file: "Aeneas/Std/VecSupport.lean", line: 20 *)
+  mk_fun "alloc::vec::{alloc::vec::Vec<@T>}::reserve" "alloc.vec.Vec.reserve" ~keep_params:(Some [true; false]);
+    (* file: "Aeneas/Std/VecSupport.lean", line: 10 *)
+  mk_fun "alloc::vec::{core::default::Default<alloc::vec::Vec<@T>>}::default" "alloc.vec.VecDefault.default";
+    (* file: "Aeneas/Std/VecSupport.lean", line: 38 *)
+  mk_fun "alloc::vec::{core::iter::traits::collect::Extend<alloc::vec::Vec<@T>, @T>}::extend" "alloc.vec.Vec.extend" ~keep_params:(Some [true; false; true; true]);
+  (* file: "Aeneas/Std/IteratorOps.lean", line: 17 *)
+  mk_fun "core::iter::adapters::map::{core::iter::traits::iterator::Iterator<core::iter::adapters::map::Map<@I, @F>, @B>}::next" "core.iter.adapters.map.IteratorMap.next";
+    (* file: "Aeneas/Std/IteratorOps.lean", line: 44 *)
+  mk_fun "core::iter::sources::repeat::repeat" "core.iter.sources.repeat.make";
+    (* file: "Aeneas/Std/IteratorOps.lean", line: 48 *)
+  mk_fun "core::iter::sources::repeat::{core::iter::traits::iterator::Iterator<core::iter::sources::repeat::Repeat<@A>, @A>}::next" "core.iter.sources.repeat.IteratorRepeat.next";
+    (* file: "Aeneas/Std/IteratorOps.lean", line: 11 *)
+  mk_fun "core::iter::traits::iterator::Iterator::map" "core.iter.traits.iterator.Iterator.map.trait_default";
     (* file: "Aeneas/Std/SliceFirst.lean", line: 10 *)
     mk_fun "core::slice::{[@T]}::first" "core.slice.Slice.first";
     (* file: "Aeneas/Std/SliceLast.lean", line: 10 *)
@@ -1573,6 +1589,12 @@ let lean_builtin_trait_decls =
 
 let lean_builtin_trait_impls =
   [
+    (* file: "Aeneas/Std/VecSupport.lean", line: 13 *)
+  mk_trait_impl "core::default::Default<alloc::vec::Vec<@T>>" "core.default.DefaultVec";
+    (* file: "Aeneas/Std/IteratorOps.lean", line: 31 *)
+  mk_trait_impl "core::iter::traits::iterator::Iterator<core::iter::adapters::map::Map<@I, @F>, @B>" "core.iter.traits.iterator.IteratorMap";
+    (* file: "Aeneas/Std/IteratorOps.lean", line: 56 *)
+  mk_trait_impl "core::iter::traits::iterator::Iterator<core::iter::sources::repeat::Repeat<@A>, @A>" "core.iter.traits.iterator.IteratorRepeat";
     (* file: "Aeneas/Std/Core/Core.lean", line: 57 *)
     mk_trait_impl "core::clone::Clone<Box<@T>>" "core.core.clone.CloneBox"
       ~keep_params:(Some [ true; false ])
