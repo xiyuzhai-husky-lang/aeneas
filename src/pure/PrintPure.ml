@@ -922,6 +922,16 @@ let binop_to_string (env : fmt_env) (binop : binop) =
   | BitXor int_ty -> "^" ^ int_ty_to_string int_ty
   | BitAnd int_ty -> "&" ^ int_ty_to_string int_ty
   | BitOr int_ty -> "|" ^ int_ty_to_string int_ty
+  | FloatArith (op, fty) ->
+      let op =
+        match op with
+        | FpAdd -> "+"
+        | FpSub -> "-"
+        | FpMul -> "*"
+        | FpDiv -> "/"
+        | FpRem -> "%"
+      in
+      op ^ "::<" ^ float_type_to_string fty ^ ">"
   | FloatCmp (op, fty) ->
       let op =
         match op with

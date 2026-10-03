@@ -475,6 +475,29 @@ let extract_cast_kind_gen (span : Meta.span)
              in
              let tgt = integer_type_to_string tgt in
              (cast_str, None, Some tgt)
+         | (TInt _ | TUInt _), TFloat fty ->
+             [%cassert] span (backend () = Lean)
+               "Floating-point casts are currently supported only in Lean";
+             let op =
+               match src with
+               | TInt _ -> "fromIScalar"
+               | _ -> "fromUScalar"
+             in
+             (float_name fty ^ "." ^ op, None, None)
+         | TFloat fty, (TInt _ | TUInt _) ->
+             [%cassert] span (backend () = Lean)
+               "Floating-point casts are currently supported only in Lean";
+             let op =
+               match tgt with
+               | TInt _ -> "toIScalar"
+               | _ -> "toUScalar"
+             in
+             let tgt = integer_type_to_string (literal_as_integer tgt) in
+             (float_name fty ^ "." ^ op, None, Some tgt)
+         | TFloat src, TFloat tgt ->
+             [%cassert] span (backend () = Lean)
+               "Floating-point casts are currently supported only in Lean";
+             (float_name tgt ^ ".from" ^ float_name src, None, None)
          | TInt _, TBool | TUInt _, TBool ->
              (* This is not allowed by rustc: the way of doing it in Rust is: [x != 0] *)
              [%craise] span "Unexpected cast: integer to bool"

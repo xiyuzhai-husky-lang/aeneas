@@ -174,4 +174,268 @@ def infinities32 : Result (F32 × F32) := do
 def infinities64 : Result (F64 × F64) := do
   ok (F64.ofBits 9218868437227405312, F64.ofBits 18442240474082181120)
 
+/-- [floats::add32]:
+    Source: 'tests/src/floats.rs', lines 92:0-94:1
+    Visibility: public -/
+def add32 (x : F32) (y : F32) : Result F32 := do
+  ok (F32.add x y)
+
+/-- [floats::sub32]:
+    Source: 'tests/src/floats.rs', lines 96:0-98:1
+    Visibility: public -/
+def sub32 (x : F32) (y : F32) : Result F32 := do
+  ok (F32.sub x y)
+
+/-- [floats::mul32]:
+    Source: 'tests/src/floats.rs', lines 100:0-102:1
+    Visibility: public -/
+def mul32 (x : F32) (y : F32) : Result F32 := do
+  ok (F32.mul x y)
+
+/-- [floats::div32]:
+    Source: 'tests/src/floats.rs', lines 104:0-106:1
+    Visibility: public -/
+def div32 (x : F32) (y : F32) : Result F32 := do
+  ok (F32.div x y)
+
+/-- [floats::rem32]:
+    Source: 'tests/src/floats.rs', lines 108:0-110:1
+    Visibility: public -/
+def rem32 (x : F32) (y : F32) : Result F32 := do
+  ok (F32.rem x y)
+
+/-- [floats::add64]:
+    Source: 'tests/src/floats.rs', lines 112:0-114:1
+    Visibility: public -/
+def add64 (x : F64) (y : F64) : Result F64 := do
+  ok (F64.add x y)
+
+/-- [floats::sub64]:
+    Source: 'tests/src/floats.rs', lines 116:0-118:1
+    Visibility: public -/
+def sub64 (x : F64) (y : F64) : Result F64 := do
+  ok (F64.sub x y)
+
+/-- [floats::mul64]:
+    Source: 'tests/src/floats.rs', lines 120:0-122:1
+    Visibility: public -/
+def mul64 (x : F64) (y : F64) : Result F64 := do
+  ok (F64.mul x y)
+
+/-- [floats::div64]:
+    Source: 'tests/src/floats.rs', lines 124:0-126:1
+    Visibility: public -/
+def div64 (x : F64) (y : F64) : Result F64 := do
+  ok (F64.div x y)
+
+/-- [floats::rem64]:
+    Source: 'tests/src/floats.rs', lines 128:0-130:1
+    Visibility: public -/
+def rem64 (x : F64) (y : F64) : Result F64 := do
+  ok (F64.rem x y)
+
+/-- [floats::f32_to_i32]:
+    Source: 'tests/src/floats.rs', lines 132:0-134:1
+    Visibility: public -/
+def f32_to_i32 (x : F32) : Result Std.I32 := do
+  ok (F32.toIScalar .I32 x)
+
+/-- [floats::i32_to_f32]:
+    Source: 'tests/src/floats.rs', lines 136:0-138:1
+    Visibility: public -/
+def i32_to_f32 (x : Std.I32) : Result F32 := do
+  ok (F32.fromIScalar x)
+
+/-- [floats::f32_to_u32]:
+    Source: 'tests/src/floats.rs', lines 140:0-142:1
+    Visibility: public -/
+def f32_to_u32 (x : F32) : Result Std.U32 := do
+  ok (F32.toUScalar .U32 x)
+
+/-- [floats::u32_to_f32]:
+    Source: 'tests/src/floats.rs', lines 144:0-146:1
+    Visibility: public -/
+def u32_to_f32 (x : Std.U32) : Result F32 := do
+  ok (F32.fromUScalar x)
+
+/-- [floats::f32_to_i64]:
+    Source: 'tests/src/floats.rs', lines 148:0-150:1
+    Visibility: public -/
+def f32_to_i64 (x : F32) : Result Std.I64 := do
+  ok (F32.toIScalar .I64 x)
+
+/-- [floats::i64_to_f32]:
+    Source: 'tests/src/floats.rs', lines 152:0-154:1
+    Visibility: public -/
+def i64_to_f32 (x : Std.I64) : Result F32 := do
+  ok (F32.fromIScalar x)
+
+/-- [floats::f32_to_u64]:
+    Source: 'tests/src/floats.rs', lines 156:0-158:1
+    Visibility: public -/
+def f32_to_u64 (x : F32) : Result Std.U64 := do
+  ok (F32.toUScalar .U64 x)
+
+/-- [floats::u64_to_f32]:
+    Source: 'tests/src/floats.rs', lines 160:0-162:1
+    Visibility: public -/
+def u64_to_f32 (x : Std.U64) : Result F32 := do
+  ok (F32.fromUScalar x)
+
+/-- [floats::f32_to_i128]:
+    Source: 'tests/src/floats.rs', lines 164:0-166:1
+    Visibility: public -/
+def f32_to_i128 (x : F32) : Result Std.I128 := do
+  ok (F32.toIScalar .I128 x)
+
+/-- [floats::i128_to_f32]:
+    Source: 'tests/src/floats.rs', lines 168:0-170:1
+    Visibility: public -/
+def i128_to_f32 (x : Std.I128) : Result F32 := do
+  ok (F32.fromIScalar x)
+
+/-- [floats::f32_to_u128]:
+    Source: 'tests/src/floats.rs', lines 172:0-174:1
+    Visibility: public -/
+def f32_to_u128 (x : F32) : Result Std.U128 := do
+  ok (F32.toUScalar .U128 x)
+
+/-- [floats::u128_to_f32]:
+    Source: 'tests/src/floats.rs', lines 176:0-178:1
+    Visibility: public -/
+def u128_to_f32 (x : Std.U128) : Result F32 := do
+  ok (F32.fromUScalar x)
+
+/-- [floats::f32_to_isize]:
+    Source: 'tests/src/floats.rs', lines 180:0-182:1
+    Visibility: public -/
+def f32_to_isize (x : F32) : Result Std.Isize := do
+  ok (F32.toIScalar .Isize x)
+
+/-- [floats::isize_to_f32]:
+    Source: 'tests/src/floats.rs', lines 184:0-186:1
+    Visibility: public -/
+def isize_to_f32 (x : Std.Isize) : Result F32 := do
+  ok (F32.fromIScalar x)
+
+/-- [floats::f32_to_usize]:
+    Source: 'tests/src/floats.rs', lines 188:0-190:1
+    Visibility: public -/
+def f32_to_usize (x : F32) : Result Std.Usize := do
+  ok (F32.toUScalar .Usize x)
+
+/-- [floats::usize_to_f32]:
+    Source: 'tests/src/floats.rs', lines 192:0-194:1
+    Visibility: public -/
+def usize_to_f32 (x : Std.Usize) : Result F32 := do
+  ok (F32.fromUScalar x)
+
+/-- [floats::f64_to_i32]:
+    Source: 'tests/src/floats.rs', lines 196:0-198:1
+    Visibility: public -/
+def f64_to_i32 (x : F64) : Result Std.I32 := do
+  ok (F64.toIScalar .I32 x)
+
+/-- [floats::i32_to_f64]:
+    Source: 'tests/src/floats.rs', lines 200:0-202:1
+    Visibility: public -/
+def i32_to_f64 (x : Std.I32) : Result F64 := do
+  ok (F64.fromIScalar x)
+
+/-- [floats::f64_to_u32]:
+    Source: 'tests/src/floats.rs', lines 204:0-206:1
+    Visibility: public -/
+def f64_to_u32 (x : F64) : Result Std.U32 := do
+  ok (F64.toUScalar .U32 x)
+
+/-- [floats::u32_to_f64]:
+    Source: 'tests/src/floats.rs', lines 208:0-210:1
+    Visibility: public -/
+def u32_to_f64 (x : Std.U32) : Result F64 := do
+  ok (F64.fromUScalar x)
+
+/-- [floats::f64_to_i64]:
+    Source: 'tests/src/floats.rs', lines 212:0-214:1
+    Visibility: public -/
+def f64_to_i64 (x : F64) : Result Std.I64 := do
+  ok (F64.toIScalar .I64 x)
+
+/-- [floats::i64_to_f64]:
+    Source: 'tests/src/floats.rs', lines 216:0-218:1
+    Visibility: public -/
+def i64_to_f64 (x : Std.I64) : Result F64 := do
+  ok (F64.fromIScalar x)
+
+/-- [floats::f64_to_u64]:
+    Source: 'tests/src/floats.rs', lines 220:0-222:1
+    Visibility: public -/
+def f64_to_u64 (x : F64) : Result Std.U64 := do
+  ok (F64.toUScalar .U64 x)
+
+/-- [floats::u64_to_f64]:
+    Source: 'tests/src/floats.rs', lines 224:0-226:1
+    Visibility: public -/
+def u64_to_f64 (x : Std.U64) : Result F64 := do
+  ok (F64.fromUScalar x)
+
+/-- [floats::f64_to_i128]:
+    Source: 'tests/src/floats.rs', lines 228:0-230:1
+    Visibility: public -/
+def f64_to_i128 (x : F64) : Result Std.I128 := do
+  ok (F64.toIScalar .I128 x)
+
+/-- [floats::i128_to_f64]:
+    Source: 'tests/src/floats.rs', lines 232:0-234:1
+    Visibility: public -/
+def i128_to_f64 (x : Std.I128) : Result F64 := do
+  ok (F64.fromIScalar x)
+
+/-- [floats::f64_to_u128]:
+    Source: 'tests/src/floats.rs', lines 236:0-238:1
+    Visibility: public -/
+def f64_to_u128 (x : F64) : Result Std.U128 := do
+  ok (F64.toUScalar .U128 x)
+
+/-- [floats::u128_to_f64]:
+    Source: 'tests/src/floats.rs', lines 240:0-242:1
+    Visibility: public -/
+def u128_to_f64 (x : Std.U128) : Result F64 := do
+  ok (F64.fromUScalar x)
+
+/-- [floats::f64_to_isize]:
+    Source: 'tests/src/floats.rs', lines 244:0-246:1
+    Visibility: public -/
+def f64_to_isize (x : F64) : Result Std.Isize := do
+  ok (F64.toIScalar .Isize x)
+
+/-- [floats::isize_to_f64]:
+    Source: 'tests/src/floats.rs', lines 248:0-250:1
+    Visibility: public -/
+def isize_to_f64 (x : Std.Isize) : Result F64 := do
+  ok (F64.fromIScalar x)
+
+/-- [floats::f64_to_usize]:
+    Source: 'tests/src/floats.rs', lines 252:0-254:1
+    Visibility: public -/
+def f64_to_usize (x : F64) : Result Std.Usize := do
+  ok (F64.toUScalar .Usize x)
+
+/-- [floats::usize_to_f64]:
+    Source: 'tests/src/floats.rs', lines 256:0-258:1
+    Visibility: public -/
+def usize_to_f64 (x : Std.Usize) : Result F64 := do
+  ok (F64.fromUScalar x)
+
+/-- [floats::f32_to_f64]:
+    Source: 'tests/src/floats.rs', lines 260:0-262:1
+    Visibility: public -/
+def f32_to_f64 (x : F32) : Result F64 := do
+  ok (F64.fromF32 x)
+
+/-- [floats::f64_to_f32]:
+    Source: 'tests/src/floats.rs', lines 263:0-265:1
+    Visibility: public -/
+def f64_to_f32 (x : F64) : Result F32 := do
+  ok (F32.fromF64 x)
+
 end floats

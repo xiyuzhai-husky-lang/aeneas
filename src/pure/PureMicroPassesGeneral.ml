@@ -685,6 +685,7 @@ let lift_binop (binop : binop) : bool =
   match binop with
   | FloatCmp _ | Eq _ | Lt _ | Le _ | Ne _ | Ge _ | Gt _ | BoolAnd | BoolOr | BoolXor ->
       false
+  | FloatArith _
   | BitXor _
   | BitAnd _
   | BitOr _

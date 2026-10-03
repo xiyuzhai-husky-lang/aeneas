@@ -40,6 +40,8 @@ package «tests» {}
 @[default_target] lean_lib Dyn
 @[default_target] lean_lib DynamicSize
 @[default_target] lean_lib Floats
+@[default_target] lean_lib FloatsArithmetic
+@[default_target] lean_lib FloatsCasts
 @[default_target] lean_lib FloatsTests
 @[default_target] lean_lib FromTo
 @[default_target] lean_lib GenericUnitOutput

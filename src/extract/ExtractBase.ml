@@ -957,6 +957,16 @@ let named_binop_name (binop : binop) : string =
     | FStar | Coq | HOL4 -> int_name int_ty ^ "_"
   in
   match binop with
+  | FloatArith (op, fty) ->
+      let op =
+        match op with
+        | FpAdd -> "add"
+        | FpSub -> "sub"
+        | FpMul -> "mul"
+        | FpDiv -> "div"
+        | FpRem -> "rem"
+      in
+      float_name fty ^ "." ^ op
   | FloatCmp (op, fty) ->
       let op =
         match op with

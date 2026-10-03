@@ -1159,10 +1159,12 @@ let eval_binary_op_symbolic (config : config) (span : Meta.span) (binop : binop)
         when binop = Lt || binop = Le || binop = Ge || binop = Gt
              || binop = BitAnd || binop = BitOr || binop = BitXor ->
           TScalar TBool
-      | TScalar (TFloat fty1), TScalar (TFloat fty2)
-        when binop = Lt || binop = Le || binop = Ge || binop = Gt ->
+      | TScalar (TFloat fty1), TScalar (TFloat fty2) ->
           [%sanity_check] span (fty1 = fty2);
-          TScalar TBool
+          (match binop with
+          | Lt | Le | Ge | Gt -> TScalar TBool
+          | Add _ | Sub _ | Mul _ | Div _ | Rem _ -> TScalar (TFloat fty1)
+          | _ -> [%craise] span "Invalid floating-point binary operation")
       | TScalar lty1, TScalar lty2
         when scalar_type_is_integer lty1 && scalar_type_is_integer lty2 -> (
           let int_ty1, int_ty2 = (ty_as_integer v1.ty, ty_as_integer v2.ty) in

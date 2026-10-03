@@ -629,7 +629,10 @@ and translate_function_call_aux (call : S.call) (e : S.expr) (ctx : bs_ctx) :
         | [ arg0; arg1 ] ->
             let effect_info =
               {
-                can_fail = ExpressionsUtils.binop_can_fail binop;
+                can_fail =
+                  (match arg0.ty with
+                  | TLiteral (TFloat _) -> false
+                  | _ -> ExpressionsUtils.binop_can_fail binop);
                 can_diverge = false;
                 is_rec = false;
               }
@@ -654,19 +657,20 @@ and translate_function_call_aux (call : S.call) (e : S.expr) (ctx : bs_ctx) :
               | TLiteral (TFloat fty) ->
                   [%sanity_check] ctx.span (arg0.ty = arg1.ty);
                   [%cassert] ctx.span (Config.backend () = Lean)
-                    "Floating-point comparisons are currently supported only in Lean";
-                  let op =
-                    match binop with
-                    | Expressions.Eq -> FpEq
-                    | Expressions.Ne -> FpNe
-                    | Expressions.Lt -> FpLt
-                    | Expressions.Le -> FpLe
-                    | Expressions.Ge -> FpGe
-                    | Expressions.Gt -> FpGt
-                    | _ ->
-                        [%craise] ctx.span "Unsupported floating-point operation"
-                  in
-                  FloatCmp (op, fty)
+                    "Floating-point operations are currently supported only in Lean";
+                  (match binop with
+                  | Expressions.Eq -> FloatCmp (FpEq, fty)
+                  | Expressions.Ne -> FloatCmp (FpNe, fty)
+                  | Expressions.Lt -> FloatCmp (FpLt, fty)
+                  | Expressions.Le -> FloatCmp (FpLe, fty)
+                  | Expressions.Ge -> FloatCmp (FpGe, fty)
+                  | Expressions.Gt -> FloatCmp (FpGt, fty)
+                  | Expressions.Add _ -> FloatArith (FpAdd, fty)
+                  | Expressions.Sub _ -> FloatArith (FpSub, fty)
+                  | Expressions.Mul _ -> FloatArith (FpMul, fty)
+                  | Expressions.Div _ -> FloatArith (FpDiv, fty)
+                  | Expressions.Rem _ -> FloatArith (FpRem, fty)
+                  | _ -> [%craise] ctx.span "Unsupported floating-point operation")
               | _ -> (match binop with
               | Expressions.BitXor ->
                   if arg0.ty = TLiteral TBool then BoolXor

@@ -635,7 +635,10 @@ and predicates = { trait_type_constraints : trait_type_constraint list }
 (** See the documentation of [E.binop] *)
 and float_comparison = FpEq | FpNe | FpLt | FpLe | FpGe | FpGt
 
+and float_arithmetic = FpAdd | FpSub | FpMul | FpDiv | FpRem
+
 and binop =
+  | FloatArith of float_arithmetic * float_type
   | FloatCmp of float_comparison * float_type
       (** IEEE comparisons, deliberately distinct from propositional equality. *)
   | BitXor of integer_type

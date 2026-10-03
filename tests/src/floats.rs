@@ -88,3 +88,178 @@ pub fn infinities32() -> (f32, f32) {
 pub fn infinities64() -> (f64, f64) {
     (1.0e400, -1.0e400)
 }
+
+pub fn add32(x: f32, y: f32) -> f32 {
+    x + y
+}
+
+pub fn sub32(x: f32, y: f32) -> f32 {
+    x - y
+}
+
+pub fn mul32(x: f32, y: f32) -> f32 {
+    x * y
+}
+
+pub fn div32(x: f32, y: f32) -> f32 {
+    x / y
+}
+
+pub fn rem32(x: f32, y: f32) -> f32 {
+    x % y
+}
+
+pub fn add64(x: f64, y: f64) -> f64 {
+    x + y
+}
+
+pub fn sub64(x: f64, y: f64) -> f64 {
+    x - y
+}
+
+pub fn mul64(x: f64, y: f64) -> f64 {
+    x * y
+}
+
+pub fn div64(x: f64, y: f64) -> f64 {
+    x / y
+}
+
+pub fn rem64(x: f64, y: f64) -> f64 {
+    x % y
+}
+
+pub fn f32_to_i32(x: f32) -> i32 {
+    x as i32
+}
+
+pub fn i32_to_f32(x: i32) -> f32 {
+    x as f32
+}
+
+pub fn f32_to_u32(x: f32) -> u32 {
+    x as u32
+}
+
+pub fn u32_to_f32(x: u32) -> f32 {
+    x as f32
+}
+
+pub fn f32_to_i64(x: f32) -> i64 {
+    x as i64
+}
+
+pub fn i64_to_f32(x: i64) -> f32 {
+    x as f32
+}
+
+pub fn f32_to_u64(x: f32) -> u64 {
+    x as u64
+}
+
+pub fn u64_to_f32(x: u64) -> f32 {
+    x as f32
+}
+
+pub fn f32_to_i128(x: f32) -> i128 {
+    x as i128
+}
+
+pub fn i128_to_f32(x: i128) -> f32 {
+    x as f32
+}
+
+pub fn f32_to_u128(x: f32) -> u128 {
+    x as u128
+}
+
+pub fn u128_to_f32(x: u128) -> f32 {
+    x as f32
+}
+
+pub fn f32_to_isize(x: f32) -> isize {
+    x as isize
+}
+
+pub fn isize_to_f32(x: isize) -> f32 {
+    x as f32
+}
+
+pub fn f32_to_usize(x: f32) -> usize {
+    x as usize
+}
+
+pub fn usize_to_f32(x: usize) -> f32 {
+    x as f32
+}
+
+pub fn f64_to_i32(x: f64) -> i32 {
+    x as i32
+}
+
+pub fn i32_to_f64(x: i32) -> f64 {
+    x as f64
+}
+
+pub fn f64_to_u32(x: f64) -> u32 {
+    x as u32
+}
+
+pub fn u32_to_f64(x: u32) -> f64 {
+    x as f64
+}
+
+pub fn f64_to_i64(x: f64) -> i64 {
+    x as i64
+}
+
+pub fn i64_to_f64(x: i64) -> f64 {
+    x as f64
+}
+
+pub fn f64_to_u64(x: f64) -> u64 {
+    x as u64
+}
+
+pub fn u64_to_f64(x: u64) -> f64 {
+    x as f64
+}
+
+pub fn f64_to_i128(x: f64) -> i128 {
+    x as i128
+}
+
+pub fn i128_to_f64(x: i128) -> f64 {
+    x as f64
+}
+
+pub fn f64_to_u128(x: f64) -> u128 {
+    x as u128
+}
+
+pub fn u128_to_f64(x: u128) -> f64 {
+    x as f64
+}
+
+pub fn f64_to_isize(x: f64) -> isize {
+    x as isize
+}
+
+pub fn isize_to_f64(x: isize) -> f64 {
+    x as f64
+}
+
+pub fn f64_to_usize(x: f64) -> usize {
+    x as usize
+}
+
+pub fn usize_to_f64(x: usize) -> f64 {
+    x as f64
+}
+
+pub fn f32_to_f64(x: f32) -> f64 {
+    x as f64
+}
+pub fn f64_to_f32(x: f64) -> f32 {
+    x as f32
+}
