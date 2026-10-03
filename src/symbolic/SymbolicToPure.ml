@@ -295,7 +295,7 @@ let translate_trait_impl (ctx : Contexts.decls_ctx) (trait_impl : A.trait_impl)
   let span = Some item_meta.span in
   let translate_ty = translate_fwd_ty span ctx in
   let impl_trait =
-    (translate_trait_decl_ref span translate_ty) llbc_impl_trait
+    (translate_trait_decl_ref ~crate:ctx.crate ~type_infos:ctx.type_ctx.type_infos span translate_ty) llbc_impl_trait
   in
   let name =
     Print.name_to_string

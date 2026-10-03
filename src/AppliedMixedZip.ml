@@ -1,13 +1,14 @@
-(** Only two admitted native nominal instances; never a generic Zip model.
-    The abstract token proves only the entrypoint's pinned-input checks, not
-    unsafe specialization, allocation, callback destruction or Drop refinement. *)
+(** Two concrete native Zip instance shapes, checked against the current LLBC.
+    This opt-in contents model does not prove unsafe specialization, allocation,
+    callback destruction, or Drop refinement. *)
 open Types
 open LlbcAst
 open AppliedBuiltins
 let ( let* ) = Option.bind
 
 type orientation = SliceVec | VecSlice
-let enabled () = Option.is_some (MixedZipAdmission.token ()) && Config.backend () = Config.Lean
+let enabled () = !Config.applied_mixed_zip && Config.backend () = Config.Lean
+  && !Config.filter_trait_impl_methods
 
 type shape = U8 | U32 | Bool | Vec of shape | Opt of shape | User of string
 let user_path = function
@@ -79,7 +80,6 @@ let vec_witness crate iter item witness =
   | _ -> None
 
 let classify_trait crate original =
-  let* _admission = MixedZipAdmission.token () in
   if not (enabled ()) then None else
   let* tr = resolve_parent crate [] original in
   match tr.kind with

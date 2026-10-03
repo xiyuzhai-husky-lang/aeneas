@@ -201,6 +201,22 @@ let check_loans_borrows_relation_invariant (span : Meta.span) (ctx : eval_ctx) :
     (match sid with
     | None -> ()
     | Some sid ->
+        if SharedBorrowId.Set.mem sid !shared_borrow_ids then begin
+          let roots = List.filter_map (fun root ->
+            let found = ref false in
+            let visitor = object
+              inherit [_] iter_env
+              method! visit_shared_borrow_id () candidate =
+                if candidate = sid then found := true
+            end in
+            visitor#visit_env_elem () root;
+            if !found then Some (env_elem_to_string span ctx root) else None) ctx.env in
+          Printf.eprintf
+            "DUPLICATE_SHARED_BORROW_ID bid=%s sid=%s kind=%s info=%s\noriginal roots:\n%s\n%!"
+            (BorrowId.to_string bid) (SharedBorrowId.to_string sid)
+            (show_borrow_kind kind) (show_borrow_info info)
+            (String.concat "\n" roots)
+        end;
         [%sanity_check] span
           (not (SharedBorrowId.Set.mem sid !shared_borrow_ids));
         shared_borrow_ids := SharedBorrowId.Set.add sid !shared_borrow_ids);
@@ -393,7 +409,7 @@ let check_literal_type (span : Meta.span) (cv : literal) (ty : scalar_type) :
 (** If [lookups] is [true] whenever we encounter a loan/borrow we lookup the
     corresponding borrow/loan to check its type. This only works when checking
     non-partial environments. *)
-let check_typing_invariant_visitor span ctx (lookups : bool) =
+let check_typing_invariant_visitor ?shared_borrow_lookup ?shared_borrow_type_lookup ?mut_borrow_type_lookup span ctx (lookups : bool) =
   (* TODO: the type of aloans doens't make sense: they have a type
    * of the shape [& (mut) T] where they should have type [T]...
    * This messes a bit the type invariant checks when checking the
@@ -429,6 +445,8 @@ let check_typing_invariant_visitor span ctx (lookups : bool) =
 
     method! visit_tvalue info tv =
       (* Check that the types have erased regions *)
+      if not (ty_is_ety tv.ty) then
+        Printf.eprintf "NON_ERASED_RUNTIME_VALUE value=%s\n%!" (show_tvalue tv);
       [%sanity_check] span (ty_is_ety tv.ty);
       (* Check the current pair (value, type) *)
       (match (tv.value, tv.ty) with
@@ -503,12 +521,19 @@ let check_typing_invariant_visitor span ctx (lookups : bool) =
                    checking the loan itself. *)
                 lookups
               then
-                let _, glc = ctx_lookup_loan span ek_all bid ctx in
-                match glc with
-                | Concrete (VSharedLoan (_, sv))
-                | Abstract (ASharedLoan (_, _, sv, _)) ->
-                    [%sanity_check] span (sv.ty = ref_ty)
-                | _ -> [%craise] span "Inconsistent context")
+                let shared_ty = match shared_borrow_type_lookup,info with
+                  | Some lookup,None -> lookup PNone bid
+                  | _ ->
+                      let sv = match shared_borrow_lookup,info with
+                        | Some lookup,None -> lookup PNone bid
+                        | _ ->
+                            let _, glc = ctx_lookup_loan span ek_all bid ctx in
+                            (match glc with
+                            | Concrete (VSharedLoan (_, sv))
+                            | Abstract (ASharedLoan (_, _, sv, _)) -> sv
+                            | _ -> [%craise] span "Inconsistent context") in
+                      sv.ty in
+                [%sanity_check] span (shared_ty = ref_ty))
           | VMutBorrow (_, bv), RMut ->
               [%sanity_check] span
                 ((* Check that the borrowed value has the proper type *)
@@ -520,13 +545,14 @@ let check_typing_invariant_visitor span ctx (lookups : bool) =
           | VMutLoan bid -> (
               if lookups then
                 (* Lookup the borrowed value to check it has the proper type. *)
-                let glc = lookup_borrow span ek_all (UMut bid) ctx in
-                match glc with
-                | Concrete (VMutBorrow (_, bv)) ->
-                    [%sanity_check] span (bv.ty = ty)
-                | Abstract (AMutBorrow (_, _, sv)) ->
-                    [%sanity_check] span (Substitute.erase_regions sv.ty = ty)
-                | _ -> [%craise] span "Inconsistent context"))
+                let borrowed_ty = match mut_borrow_type_lookup,info with
+                  | Some lookup,None -> lookup PNone bid
+                  | _ ->
+                      (match lookup_borrow span ek_all (UMut bid) ctx with
+                      | Concrete (VMutBorrow (_, bv)) -> bv.ty
+                      | Abstract (AMutBorrow (_, _, sv)) -> Substitute.erase_regions sv.ty
+                      | _ -> [%craise] span "Inconsistent context") in
+                [%sanity_check] span (borrowed_ty = ty)))
       | VSymbolic sv, ty ->
           check_symbolic_value_type sv.sv_id sv.sv_ty;
           let ty' = Substitute.erase_regions sv.sv_ty in
@@ -593,6 +619,15 @@ let check_typing_invariant_visitor span ctx (lookups : bool) =
           List.iter
             (fun ((v, ty) : tavalue * ty) -> [%sanity_check] span (v.ty = ty))
             fields_with_types
+      (* Arrays retain their concrete number of abstract element projections.
+         Check the same full element types and length as the concrete array
+         case; each original permission is then visited normally below. *)
+      | AAdt av, TArray (inner_ty, len, None) ->
+          [%sanity_check] span (av.variant_id = None);
+          [%sanity_check] span
+            (List.for_all (fun (v : tavalue) -> v.ty = inner_ty) av.fields);
+          let len = Scalars.get_val (TypesUtils.constant_expr_as_integer len) in
+          [%sanity_check] span (Z.of_int (List.length av.fields) = len)
       (* Builtin type case *)
       | AAdt av, TAdt { generics; builtin = Some aty_id; _ } -> (
           [%sanity_check] span (av.variant_id = None);
@@ -616,18 +651,27 @@ let check_typing_invariant_visitor span ctx (lookups : bool) =
               [%sanity_check] span (region_is_owned abs region);
               (* Check that the child value has the proper type *)
               [%sanity_check] span (av.ty = ref_ty)
-          | ASharedBorrow (_, bid, _), RShared -> (
+          | ASharedBorrow (marker, bid, _), RShared -> (
               (* Check that the region is owned by the abstraction *)
               [%sanity_check] span (region_is_owned abs region);
               if lookups then
-                (* Lookup the borrowed value to check it has the proper type *)
-                let _, glc = ctx_lookup_loan span ek_all bid ctx in
-                match glc with
-                | Concrete (VSharedLoan (_, sv))
-                | Abstract (ASharedLoan (_, _, sv, _)) ->
-                    [%sanity_check] span
-                      (sv.ty = Substitute.erase_regions ref_ty)
-                | _ -> [%craise] span "Inconsistent context")
+                (* Typing may inspect the common type of an exact branch
+                   pair without selecting either payload. Operational lookup
+                   and all loan/borrow relation checks remain unchanged. *)
+                let shared_ty = match shared_borrow_type_lookup with
+                  | Some lookup -> lookup marker bid
+                  | None ->
+                      let sv = match shared_borrow_lookup with
+                        | Some lookup -> lookup marker bid
+                        | None ->
+                            let _, glc = ctx_lookup_loan span ek_all bid ctx in
+                            (match glc with
+                            | Concrete (VSharedLoan (_, sv))
+                            | Abstract (ASharedLoan (_, _, sv, _)) -> sv
+                            | _ -> [%craise] span "Inconsistent context") in
+                      sv.ty in
+                [%sanity_check] span
+                  (shared_ty = Substitute.erase_regions ref_ty))
           | AIgnoredMutBorrow (_opt_bid, av), RMut ->
               [%sanity_check] span (av.ty = ref_ty)
           | ( AEndedIgnoredMutBorrow { given_back; child; given_back_meta = _ },
@@ -664,16 +708,17 @@ let check_typing_invariant_visitor span ctx (lookups : bool) =
               [%sanity_check] span (child_av.ty = borrowed_aty);
               if lookups then
                 (* Lookup the borrowed value to check it has the proper type *)
-                let glc = lookup_borrow span ek_all (UMut bid) ctx in
-                match glc with
-                | Concrete (VMutBorrow (_, bv)) ->
-                    [%sanity_check] span
-                      (bv.ty = Substitute.erase_regions borrowed_aty)
-                | Abstract (AMutBorrow (_, _, sv)) ->
-                    [%sanity_check] span
-                      (Substitute.erase_regions sv.ty
-                      = Substitute.erase_regions borrowed_aty)
-                | _ -> [%craise] span "Inconsistent context")
+                let borrowed_ty = match mut_borrow_type_lookup with
+                  | Some lookup ->
+                      let marker = match lc with AMutLoan (pm,_,_) -> pm | _ -> PNone in
+                      lookup marker bid
+                  | None ->
+                      (match lookup_borrow span ek_all (UMut bid) ctx with
+                      | Concrete (VMutBorrow (_, bv)) -> bv.ty
+                      | Abstract (AMutBorrow (_, _, sv)) -> Substitute.erase_regions sv.ty
+                      | _ -> [%craise] span "Inconsistent context") in
+                [%sanity_check] span
+                  (borrowed_ty = Substitute.erase_regions borrowed_aty))
           | AIgnoredMutLoan (None, child_av) ->
               let borrowed_aty = aloan_get_expected_child_type aty in
               [%sanity_check] span (child_av.ty = borrowed_aty)
@@ -725,6 +770,11 @@ let check_typing_invariant_visitor span ctx (lookups : bool) =
           | AEndedProjBorrows _ | AEmpty -> ())
       | AIgnored _, _ -> ()
       | _ ->
+          if Sys.getenv_opt "AENEAS_EXPERIMENTAL_SHARED_PACKET_SIGNATURE" = Some "1" then
+            Printf.eprintf "NATIVE_ABSTRACT_TYPING_REJECTED root=%s\nowner:\n%s\n%!"
+              (show_tavalue atv)
+              (match info with None -> "none" | Some owner ->
+                abs_to_string span ~with_ended:true ctx owner);
           [%ltrace
             "Erroneous typing:" ^ "\n- raw value: " ^ show_tavalue atv
             ^ "\n- value: "
@@ -735,9 +785,9 @@ let check_typing_invariant_visitor span ctx (lookups : bool) =
       super#visit_tavalue info atv
   end
 
-let check_typing_invariant (span : Meta.span) (ctx : eval_ctx) (lookups : bool)
-    : unit =
-  (check_typing_invariant_visitor span ctx lookups)#visit_eval_ctx
+let check_typing_invariant ?shared_borrow_lookup ?shared_borrow_type_lookup ?mut_borrow_type_lookup (span : Meta.span) (ctx : eval_ctx)
+    (lookups : bool) : unit =
+  (check_typing_invariant_visitor ?shared_borrow_lookup ?shared_borrow_type_lookup ?mut_borrow_type_lookup span ctx lookups)#visit_eval_ctx
     (None : abs option)
     ctx
 
@@ -812,7 +862,8 @@ let normalize_mut_proj_ty (type_infos : TypesAnalysis.type_infos)
     - the union of the aproj_loans contains the aproj_borrows applied on the
       same symbolic values (for mutable regions)
     - all symbolic evalues should contain mutable borrows/loans *)
-let check_symbolic_values (span : Meta.span) (ctx : eval_ctx) : unit =
+let collect_symbolic_value_infos (ctx : eval_ctx)
+    (check_eproj : abs -> eproj -> unit) : sv_info SymbolicValueId.Map.t =
   (* Small utility *)
   let module M = SymbolicValueId.Map in
   let infos : sv_info M.t ref = ref M.empty in
@@ -869,28 +920,91 @@ let check_symbolic_values (span : Meta.span) (ctx : eval_ctx) : unit =
         super#visit_aproj abs aproj
 
       method! visit_eproj abs eproj =
-        (let abs = Option.get abs in
-         match eproj with
-         | EProjLoans { proj; consumed = _; borrows = _ }
-         | EProjBorrows { proj; loans = _ } ->
-             (* Symbolic projections in evalues should be over values which contain
-                mutable borrows/loans *)
-             if
-               not
-                 (ty_has_mut_borrow_for_region_in_set ctx.type_ctx.type_infos
-                    abs.regions.owned proj.proj_ty)
-             then (
-               [%ldebug
-                 "Abs contains evalues with no mutable borrows/loans:\n"
-                 ^ abs_to_string span ctx abs ^ "\n\nProblematic eproj:\n"
-                 ^ eproj_to_string ctx eproj];
-               [%internal_error] span)
-         | EEndedProjLoans _ | EEndedProjBorrows _ | EEmpty -> ());
+        check_eproj (Option.get abs) eproj;
         super#visit_eproj abs eproj
     end
   in
   (* Collect the information *)
   obj#visit_eval_ctx None ctx;
+
+  !infos
+
+(** Failure-only ownership evidence; this prints the original roots and never
+    reorganizes or changes an abstraction. *)
+let trace_missing_symbolic_loan_info (span : Meta.span) (label : string)
+    (ctx : eval_ctx) (id : symbolic_value_id) (info : sv_info) : unit =
+  let owner_ids = List.fold_left
+    (fun ids (borrow : proj_borrows_info) -> AbsId.Set.add borrow.abs_id ids)
+    AbsId.Set.empty info.aproj_borrows in
+  let owner_ids = List.fold_left
+    (fun ids (loan : proj_loans_info) -> AbsId.Set.add loan.abs_id ids)
+    owner_ids info.aproj_loans in
+  let roots = ref [] in
+  let visitor = object
+    inherit [_] iter_eval_ctx as super
+    method! visit_abs () owner =
+      if AbsId.Set.mem owner.abs_id owner_ids then
+        roots := abs_to_string span ctx owner :: !roots;
+      super#visit_abs () owner
+  end in
+  visitor#visit_eval_ctx () ctx;
+  Printf.eprintf "SYMBOLIC_MISSING_LOAN phase=%s sid=%s\ninfo=%s\nowners:\n%s\n%!"
+    label (SymbolicValueId.to_string id) (show_sv_info info)
+    (String.concat "\n" (List.rev !roots))
+
+(** Inspect a transient context without enforcing invariants. This uses the same
+    incidence traversal as the strict check below; strict checks remain enabled. *)
+let trace_missing_symbolic_loans (span : Meta.span) (label : string)
+    (ctx : eval_ctx) : unit =
+  let infos = collect_symbolic_value_infos ctx (fun _ _ -> ()) in
+  SymbolicValueId.Map.iter
+    (fun id (info : sv_info) ->
+      if info.aproj_borrows <> [] && info.aproj_loans = [] then
+        trace_missing_symbolic_loan_info span label ctx id info)
+    infos
+
+(** Read-only ownership and current-root evidence for one symbolic value. *)
+let trace_symbolic_value (span : Meta.span) (label : string)
+    (ctx : eval_ctx) (id : symbolic_value_id) : unit =
+  let infos = collect_symbolic_value_infos ctx (fun _ _ -> ()) in
+  let info = match SymbolicValueId.Map.find_opt id infos with
+    | Some info -> info
+    | None -> {env_count=0; aproj_borrows=[]; aproj_loans=[]} in
+  let roots = List.filter_map (fun root ->
+    let found = ref false in
+    let visitor = object
+      inherit [_] iter_env
+      method! visit_symbolic_value_id () sid = if sid = id then found := true
+    end in
+    visitor#visit_env_elem () root;
+    if !found then Some (env_elem_to_string span ctx root) else None) ctx.env in
+  Printf.eprintf "SYMBOLIC_LOAN_FLOW phase=%s sid=%s\ninfo=%s\nroots:\n%s\n%!"
+    label (SymbolicValueId.to_string id) (show_sv_info info)
+    (String.concat "\n" roots)
+
+let check_symbolic_values (span : Meta.span) (ctx : eval_ctx) : unit =
+  let check_eproj (abs : abs) (eproj : eproj) =
+    match eproj with
+    | EProjLoans { proj; consumed = _; borrows = _ }
+    | EProjBorrows { proj; loans = _ } ->
+        (* Symbolic projections in evalues should be over values which contain
+           mutable borrows/loans *)
+        if
+          not
+            (ty_has_mut_borrow_for_region_in_set ctx.type_ctx.type_infos
+               abs.regions.owned proj.proj_ty)
+        then (
+          Printf.eprintf "SYMBOLIC_EPROJ_MUTABLE_MASK_REJECTED\nprojection=%s\nowner=%s\n%!"
+            (eproj_to_string ctx eproj)
+            (abs_to_string span ~with_ended:true ctx abs);
+          [%ldebug
+            "Abs contains evalues with no mutable borrows/loans:\n"
+            ^ abs_to_string span ctx abs ^ "\n\nProblematic eproj:\n"
+            ^ eproj_to_string ctx eproj];
+          [%internal_error] span)
+    | EEndedProjLoans _ | EEndedProjBorrows _ | EEmpty -> ()
+  in
+  let infos = collect_symbolic_value_infos ctx check_eproj in
 
   (* Check *)
   let check_info id info =
@@ -903,6 +1017,8 @@ let check_symbolic_values (span : Meta.span) (ctx : eval_ctx) : unit =
       (* TODO: check that:
        * - the borrows are mutually disjoint
        *)
+      if info.aproj_borrows <> [] && info.aproj_loans = [] then
+        trace_missing_symbolic_loan_info span "strict invariant check" ctx id info;
       [%sanity_check] span (info.aproj_borrows = [] || info.aproj_loans <> []);
       (* Check that the loan projections don't intersect ON MUTABLE REGIONS
          and compute the normalized union of those projections.
@@ -982,7 +1098,7 @@ let check_symbolic_values (span : Meta.span) (ctx : eval_ctx) : unit =
             (norm_proj_ty_contains span ctx loan_proj_union borrow_proj_union))
   in
 
-  M.iter check_info !infos
+  SymbolicValueId.Map.iter check_info infos
 
 (** Check that all abstraction ids are unique *)
 let check_unique_abs_ids (span : Meta.span) (ctx : eval_ctx) : unit =
@@ -993,14 +1109,14 @@ let check_unique_abs_ids (span : Meta.span) (ctx : eval_ctx) : unit =
       ids := AbsId.Set.add abs.abs_id !ids)
     ctx.env
 
-let check_invariants (span : Meta.span) (ctx : eval_ctx) : unit =
+let check_invariants ?shared_borrow_lookup ?shared_borrow_type_lookup ?mut_borrow_type_lookup (span : Meta.span) (ctx : eval_ctx) : unit =
   if !Config.sanity_checks then (
     [%ltrace
       "Checking invariants in context:\n"
       ^ eval_ctx_to_string ~span:(Some span) ctx];
     check_loans_borrows_relation_invariant span ctx;
     check_borrowed_values_invariant span ctx;
-    check_typing_invariant span ctx true;
+    check_typing_invariant ?shared_borrow_lookup ?shared_borrow_type_lookup ?mut_borrow_type_lookup span ctx true;
     check_symbolic_values span ctx;
     check_unique_abs_ids span ctx)
 

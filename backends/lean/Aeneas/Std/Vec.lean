@@ -89,6 +89,14 @@ instance (α : Type u) : Inhabited (Vec α) := by
 abbrev Vec.len {α : Type u} (v : Vec α) : Usize :=
   Usize.ofNatCore v.val.length (by grind)
 
+@[expose, rust_fun "alloc::vec::{alloc::vec::Vec<@T>}::is_empty" (keepParams := [true,false])]
+def Vec.is_empty {T : Type} (v : Vec T) : Result Bool :=
+  ok v.val.isEmpty
+
+@[simp] theorem Vec.is_empty_exact {T : Type} (v : Vec T) :
+    Vec.is_empty v = ok (decide (v.val = [])) := by
+  cases shape : v.val <;> simp [Vec.is_empty, shape]
+
 @[simp, scalar_tac_simps, simp_lists_safe, grind =, agrind =]
 theorem Vec.len_val {α : Type u} (v : Vec α) : (Vec.len v).val = v.length :=
   by simp
@@ -166,6 +174,28 @@ theorem Vec.push_spec {α : Type u} (v : Vec α) (x : α) (h : v.val.length < Us
   v.push x ⦃ v1 =>
   v1.val = v.val ++ [x] ⦄ := by
   unfold push; grind
+
+/-- Logical contents of native `Vec::pop`; allocation capacity is unobserved. -/
+@[expose, rust_fun "alloc::vec::{alloc::vec::Vec<@T>}::pop" (keepParams := [true,false])]
+def Vec.pop {α : Type u} (v : Vec α) : Result (Option α × Vec α) :=
+  ok (v.val.getLast?, .from v.val.dropLast
+    (by have := v.property; simp only [List.length_dropLast]; omega))
+
+@[step]
+theorem Vec.pop_spec {α : Type u} (v : Vec α) :
+    v.pop ⦃ (item, rest) => item = v.val.getLast? ∧ rest.val = v.val.dropLast ⦄ := by
+  simp [Vec.pop]
+
+@[simp] theorem Vec.pop_empty {α : Type u} :
+    (Vec.new α).pop = ok (none, Vec.new α) := by
+  simp [Vec.pop, Vec.new]
+
+/-- A pop after a successful append returns that element and the original contents. -/
+theorem Vec.pop_append {α : Type u} (before after : Vec α) (last : α)
+    (contents : after.val = before.val ++ [last]) :
+    after.pop = ok (some last, before) := by
+  unfold Vec.pop
+  simp [contents]
 
 @[expose, rust_fun "alloc::vec::{alloc::vec::Vec<@T>}::insert" (keepParams := [true, false])]
 def Vec.insert {α : Type u} (v: Vec α) (i: Usize) (x: α) : Result (Vec α) :=

@@ -2,6 +2,7 @@ module
 public import Aeneas.Std.Core.Fmt
 public import Aeneas.Std.Array.Array
 public import Aeneas.Std.Slice
+public import Aeneas.Std.Vec
 public import Aeneas.Std.Range
 public import Aeneas.Data.List.List
 public import Aeneas.Std.Core.Convert
@@ -512,5 +513,50 @@ theorem core.array.equality.PartialEqSliceArray.eq_spec
   apply spec_mono (core.slice.cmp.PartialEqSlice.eq_homo_spec partialEq left right.to_slice hNe)
   intro b hb
   simpa only [Slice.eq_iff, Array.val_to_slice] using hb
+
+/-- The native slice/array `ne` returns true on unequal lengths; for equal
+    lengths it uses array `ne`, whose ordinary slice fallback negates `eq`.
+    Reusing the existing comparison preserves callback order and Result failure. -/
+@[expose, rust_fun "core::array::equality::{core::cmp::PartialEq<[@T], [@U; @N]>}::ne"]
+def core.array.equality.PartialEqSliceArray.ne
+    {T U : Type} {N : Usize} (partialEq : core.cmp.PartialEq T U)
+    (left : Slice T) (right : Array U N) : Result Bool :=
+  core.cmp.PartialEq.ne.default (core.array.equality.PartialEqSliceArray.eq partialEq) left right
+
+theorem core.array.equality.PartialEqSliceArray.ne_exact
+    {T U : Type} {N : Usize} (partialEq : core.cmp.PartialEq T U)
+    (left : Slice T) (right : Array U N) :
+    core.array.equality.PartialEqSliceArray.ne partialEq left right =
+      (do let same ← core.array.equality.PartialEqSliceArray.eq partialEq left right
+          ok (!same)) := by
+  simp [core.array.equality.PartialEqSliceArray.ne, core.cmp.PartialEq.ne.default]
+
+@[step]
+theorem core.array.equality.PartialEqSliceArray.ne_spec
+    {T : Type} {N : Usize} (partialEq : core.cmp.PartialEq T T)
+    (left : Slice T) (right : Array T N)
+    (law : ∀ x y, partialEq.ne x y ⦃ b => b ↔ ¬ (x = y) ⦄) :
+    core.array.equality.PartialEqSliceArray.ne partialEq left right
+      ⦃ b => b ↔ left.val ≠ right.val ⦄ := by
+  rw [core.array.equality.PartialEqSliceArray.ne_exact]
+  apply WP.spec_bind (core.array.equality.PartialEqSliceArray.eq_spec partialEq left right law)
+  intro b hb
+  simp only [WP.spec_ok]
+  cases b <;> simp_all
+
+/-- Vec/shared-array equality reuses the same slice comparison and reference erasure. -/
+@[expose, rust_fun "alloc::vec::partial_eq::{core::cmp::PartialEq<alloc::vec::Vec<@T>, &'0 [@U; @N]>}::eq"
+  (keepParams := [true,true,false])]
+def alloc.vec.partial_eq.PartialEqVecSharedArray.eq {T U : Type} {N : Usize}
+    (partialEq : core.cmp.PartialEq T U) (left : alloc.vec.Vec T) (right : Array U N) : Result Bool :=
+  core.array.equality.PartialEqSliceArray.eq partialEq left.slice right
+
+theorem alloc.vec.partial_eq.PartialEqVecSharedArray.eq_contents
+    {T : Type} {N : Usize} (partialEq : core.cmp.PartialEq T T)
+    (left : alloc.vec.Vec T) (right : Array T N)
+    (law : ∀ x y, partialEq.ne x y ⦃ b => b ↔ ¬ (x = y) ⦄) :
+    alloc.vec.partial_eq.PartialEqVecSharedArray.eq partialEq left right
+      ⦃ b => b ↔ left.val = right.val ⦄ :=
+  core.array.equality.PartialEqSliceArray.eq_spec partialEq left.slice right law
 
 end Aeneas.Std

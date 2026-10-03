@@ -141,7 +141,11 @@ let compute_regions_hierarchy_for_sig (span : Meta.span option) (crate : crate)
         | Some (TTuple | TBox | TStr) -> (* No clauses for those *) ());
         (* Explore the generics *)
         explore_generics outer generics
-    | TArray _ | TSlice _ -> (* No clauses for those *) ()
+    | TSlice (element, None) ->
+        (* A slice has no own region clauses, but its element can contain
+           lifetimes that must outlive an enclosing reference. *)
+        explore_ty outer element
+    | TArray _ | TSlice (_, Some _) -> (* No clauses for those *) ()
     | TVar _ | TScalar _ | TNever -> ()
     | TRef (r, ty, _) ->
         (* Add the constraints for r *)

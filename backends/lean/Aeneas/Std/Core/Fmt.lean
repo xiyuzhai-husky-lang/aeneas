@@ -10,9 +10,24 @@ namespace Aeneas.Std
 @[reducible, expose, rust_type "core::fmt::Error"]
 def core.fmt.Error := Unit
 
-/- TODO: -/
+/-- Logical external-sink boundary for `Formatter::write_str`.
+
+The native formatter stores formatting options and a mutable `dyn Write` sink;
+`write_str` forwards directly to that sink. The natural-number tokens represent
+opaque options and sink state, not output bytes. The supplied callback determines
+all observable write results and state transitions, including rejection, panic,
+and divergence. Clients using this boundary must relate their native sink to the
+chosen callback; no global successful writer or allocator assumption is installed.
+
+This carrier does not establish correctness of the remaining Debug helpers below,
+whose TODO models remain outside that observation boundary. `write_fmt` models
+literal pieces and default-options placeholders; its unsupported branch is a
+model-coverage boundary, not native error semantics. -/
 @[rust_type "core::fmt::Formatter"]
-axiom core.fmt.Formatter : Type
+structure core.fmt.Formatter where
+  options : Nat
+  writerState : Nat
+  writeStr : Nat → Str → Result (core.result.Result Unit core.fmt.Error × Nat)
 
 @[rust_trait "core::fmt::Debug"]
 structure core.fmt.Debug (T : Type u) where
@@ -45,27 +60,33 @@ def core.result.Result.unwrap.mut {T E : Type}
   | .Err _ => .fail .panic
 
 
--- TODO: this is a simplistic model
-@[expose, rust_type "core::fmt::Arguments"]
-def core.fmt.Arguments : Type := Unit
+/-- A native formatting argument retains the selected trait callback and its
+captured value. Calling `format` invokes precisely that callback; it does not
+replace it with an always-successful printer. -/
+@[rust_type "core::fmt::rt::Argument"]
+structure core.fmt.rt.Argument where
+  format : core.fmt.Formatter → Result (core.result.Result Unit core.fmt.Error × core.fmt.Formatter)
 
-@[expose, rust_type "core::fmt::rt::Argument"]
-def core.fmt.rt.Argument : Type := Unit
+/-- The two native representations, with their contents retained. `encoded`
+stores the original compiler template and ordered argument callbacks. -/
+@[rust_type "core::fmt::Arguments"]
+inductive core.fmt.Arguments where
+  | literal : Str → core.fmt.Arguments
+  | encoded : List U8 → List core.fmt.rt.Argument → core.fmt.Arguments
 
 @[expose, rust_fun "core::fmt::{core::fmt::Arguments<'a>}::from_str"]
-def core.fmt.Arguments.from_str : Str → Result core.fmt.Arguments := fun _ => Result.ok ()
+def core.fmt.Arguments.from_str (text : Str) : Result core.fmt.Arguments :=
+  .ok (.literal text)
 
 @[expose, rust_fun "core::fmt::{core::fmt::Arguments<'a>}::new"]
 def core.fmt.Arguments.new {N : Std.Usize} {M : Std.Usize}
-  (_ : Std.Array Std.U8 N) (_ : Std.Array core.fmt.rt.Argument M) : Result core.fmt.Arguments :=
-  -- TODO
-  Result.ok ()
+  (template : Std.Array Std.U8 N) (args : Std.Array core.fmt.rt.Argument M) : Result core.fmt.Arguments :=
+  .ok (.encoded template.val args.val)
 
 @[expose, rust_fun "core::fmt::rt::{core::fmt::rt::Argument<'0>}::new_debug"]
 def core.fmt.rt.Argument.new_debug
-  {T : Type} (_DebugInst : core.fmt.Debug T) (_ : T) : Result core.fmt.rt.Argument :=
-  -- TODO
-  Result.ok ()
+  {T : Type} (inst : core.fmt.Debug T) (value : T) : Result core.fmt.rt.Argument :=
+  .ok ⟨inst.fmt value⟩
 
 @[rust_trait "core::fmt::Display"]
 structure core.fmt.Display (Self : Type) where
@@ -77,23 +98,94 @@ structure core.fmt.LowerHex (Self : Type) where
 
 @[expose, rust_fun "core::fmt::rt::{core::fmt::rt::Argument<'0>}::new_lower_hex"]
 def core.fmt.rt.Argument.new_lower_hex
-  {T : Type} (_LowerHexInst : core.fmt.LowerHex T) (_ : T) :
+  {T : Type} (inst : core.fmt.LowerHex T) (value : T) :
   Result core.fmt.rt.Argument :=
-  -- TODO
-  .ok ()
+  .ok ⟨inst.fmt value⟩
 
 @[expose, rust_fun "core::fmt::{core::fmt::Formatter<'a>}::write_str"]
-def core.fmt.Formatter.write_str (fmt : core.fmt.Formatter) (_ : Str) :
-  Result (core.result.Result Unit core.fmt.Error × core.fmt.Formatter) :=
-  -- TODO: this is a simplistic model
-  .ok (.Ok (), fmt)
+def core.fmt.Formatter.write_str (fmt : core.fmt.Formatter) (text : Str) :
+  Result (core.result.Result Unit core.fmt.Error × core.fmt.Formatter) := do
+  let (outcome, state) ← fmt.writeStr fmt.writerState text
+  .ok (outcome, { fmt with writerState := state })
+
+/-- The native sink's ordinary result and updated state are returned unchanged.
+In particular an `Err` may still carry an updated sink state. -/
+theorem core.fmt.Formatter.write_str_return (fmt : core.fmt.Formatter) (text : Str)
+    (outcome : core.result.Result Unit core.fmt.Error) (state : Nat)
+    (write : fmt.writeStr fmt.writerState text = .ok (outcome, state)) :
+    fmt.write_str text = .ok (outcome, { fmt with writerState := state }) := by
+  simp [core.fmt.Formatter.write_str, write]
+
+/-- Primitive failure is propagated; no successful write is substituted. -/
+theorem core.fmt.Formatter.write_str_failure (fmt : core.fmt.Formatter) (text : Str)
+    (error : Std.Error) (write : fmt.writeStr fmt.writerState text = .fail error) :
+    fmt.write_str text = .fail error := by
+  simp [core.fmt.Formatter.write_str, write]
+
+/-- A divergent sink remains divergent. -/
+theorem core.fmt.Formatter.write_str_divergence (fmt : core.fmt.Formatter) (text : Str)
+    (write : fmt.writeStr fmt.writerState text = .div) :
+    fmt.write_str text = .div := by
+  simp [core.fmt.Formatter.write_str, write]
+
+/-- Logical token for `FormattingOptions::new()` (no flags, width, or precision).
+Other option tokens are outside the default-formatting fragment below. -/
+@[expose] def core.fmt.defaultOptions : Nat := 0
+
+/-- Construct the exact literal slice, checking the native size boundary. -/
+@[expose] def core.fmt.literalSlice (bytes : List U8) : Result Str :=
+  if h : bytes.length ≤ Usize.max then .ok (.from bytes h)
+  else .fail .maximumSizeExceeded
+
+/-- Execute the native default/literal bytecode fragment in source order.
+Short and u16-length literals and 0xC0 default placeholders are modeled. Custom
+format options are not covered: `.undef` there denotes missing model coverage,
+not an assertion that native formatting fails. Malformed unsafe templates are
+also outside correspondence. Ordinary sink/argument Err, failure and divergence
+are propagated. One fuel unit accounts for each consumed opcode byte. -/
+@[expose] def core.fmt.writeTemplate : Nat → List U8 → List core.fmt.rt.Argument → Nat →
+    core.fmt.Formatter → Result (core.result.Result Unit core.fmt.Error × core.fmt.Formatter)
+  | 0, _, _, _, _ => .fail .undef
+  | fuel + 1, template, args, index, fmt => do
+      match template with
+      | [] => .fail .undef
+      | opcode :: rest =>
+          if opcode.val = 0 then .ok (.Ok (), fmt)
+          else if opcode.val = 192 then
+            match args[index]? with
+            | none => .fail .undef
+            | some argument =>
+                let (outcome, after) ← argument.format {fmt with options := defaultOptions}
+                let updated := {fmt with writerState := after.writerState}
+                match outcome with
+                | .Err error => .ok (.Err error, updated)
+                | .Ok () => writeTemplate fuel rest args (index + 1) updated
+          else
+            let (length, contents) ←
+              if opcode.val < 128 then .ok (opcode.val, rest)
+              else if opcode.val = 128 then
+                match rest with
+                | lo :: hi :: tail => .ok (lo.val + 256 * hi.val, tail)
+                | _ => .fail .undef
+              else .fail .undef
+            if length > contents.length then .fail .undef
+            else
+              let text ← literalSlice (contents.take length)
+              let (outcome, updated) ← fmt.write_str text
+              match outcome with
+              | .Err error => .ok (.Err error, updated)
+              | .Ok () => writeTemplate fuel (contents.drop length) args index updated
 
 @[expose, rust_fun "core::fmt::{core::fmt::Formatter<'a>}::write_fmt"]
 def core.fmt.Formatter.write_fmt
-  (fmt : core.fmt.Formatter) (_ : core.fmt.Arguments) :
+  (fmt : core.fmt.Formatter) (args : core.fmt.Arguments) :
   Result (core.result.Result Unit core.fmt.Error × core.fmt.Formatter) :=
-  -- TODO: we should update something in the formatter, once we have a model for it
-  .ok (.Ok (), fmt)
+  match args with
+  | .literal text => fmt.write_str text
+  | .encoded template arguments => core.fmt.writeTemplate (template.length + 1) template arguments 0 fmt
+
+@[simp] theorem core.fmt.Formatter.write_fmt_literal (fmt : core.fmt.Formatter) (text : Str) :
+    fmt.write_fmt (.literal text) = fmt.write_str text := rfl
 
 @[expose, rust_fun "core::fmt::{core::fmt::Debug<&'0 @T>}::fmt"]
 def core.fmt.DebugShared.fmt {T : Type} (DebugInst : core.fmt.Debug T) (x : T)
@@ -194,9 +286,11 @@ def core.fmt.DebugBool : core.fmt.Debug Bool := {
 
 @[expose, rust_fun "core::fmt::rt::{core::fmt::rt::Argument<'0>}::new_display"]
 def core.fmt.rt.Argument.new_display
-  {T : Type} (_DisplayInst : core.fmt.Display T) :
-  T → Result core.fmt.rt.Argument :=
-  -- TODO: we should at least call the `fmt` method somewhere
-  fun _ => Result.ok ()
+  {T : Type} (inst : core.fmt.Display T) (value : T) : Result core.fmt.rt.Argument :=
+  .ok ⟨inst.fmt value⟩
+
+theorem core.fmt.rt.Argument.new_display_exact {T : Type}
+    (inst : core.fmt.Display T) (value : T) :
+    new_display inst value = .ok ⟨inst.fmt value⟩ := rfl
 
 end Aeneas.Std

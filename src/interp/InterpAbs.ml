@@ -51,6 +51,7 @@ let convert_value_to_abstractions (span : Meta.span) (abs_kind : abs_kind)
   [%ltrace tvalue_to_string ctx v];
   (* Convert the value to a list of avalues *)
   let absl = ref [] in
+  let current_value = ref ("root",v) in
   let push_abs (r_id : RegionId.id) (avalues : tavalue list)
       (output : tevalue option) (input : tevalue option) : unit =
     if avalues = [] then ()
@@ -88,6 +89,7 @@ let convert_value_to_abstractions (span : Meta.span) (abs_kind : abs_kind)
 
   (* We only call this on values inside mutable borrows *)
   let rec to_inputs (rid : RegionId.id) (v : tvalue) : tavalue list * tevalue =
+    current_value := ("mutable-borrow input",v);
     match v.value with
     | VLiteral _ -> ([], { value = EValue (ctx.env, v); ty = v.ty })
     | VAdt { variant_id; fields } ->
@@ -142,9 +144,89 @@ let convert_value_to_abstractions (span : Meta.span) (abs_kind : abs_kind)
 
   (* Convert a value to abstractions *)
   let rec to_abs (v : tvalue) : unit =
+    current_value := ("abstraction conversion",v);
     match v.value with
     | VLiteral _ | VBottom -> ()
     | VAdt { variant_id = _; fields } -> List.iter to_abs fields
+    | VBorrow (VMutBorrow (borrow_id, { value=VLoan (VMutLoan loan_id); ty=runtime_ty }))
+      when InterpSharedPacketSignature.enabled () && not (ty_no_regions runtime_ty) ->
+        (* An exact identity reborrow has no payload to expand or copy:
+             MB old (ML new)  ->  abs { MB old _; ML new _ }.
+           Recover both full endpoint types, then project a complete fresh
+           identity hierarchy, including ignored inner return subscriptions.
+           An outer-only owner would lose the inner loans on native return. *)
+        let _,ref_ty,kind=ty_as_ref v.ty in
+        [%cassert] span (kind=RMut && borrow_id<>loan_id && equal_ty ref_ty runtime_ty)
+          "Nested identity reborrow changed its runtime reference type";
+        let borrowed_ty=match ctx_lookup_loan span ek_all borrow_id ctx with
+          | _,Abstract (AMutLoan (PNone,_,child)) -> child.ty
+          | _ -> [%craise] span "Nested identity reborrow needs its original abstract mutable loan" in
+        let loaned_ty=match lookup_borrow span ek_all (UMut loan_id) ctx with
+          | Abstract (AMutBorrow (PNone,_,child)) -> child.ty
+          | _ -> [%craise] span "Nested identity reborrow needs its original abstract mutable borrower" in
+        List.iter (fun target ->
+          [%cassert] span (equal_ty (Substitute.erase_regions target) runtime_ty)
+            "Nested identity reborrow counterpart has a different erased referent";
+          let check=object inherit [_] iter_ty
+            method! visit_region () = function
+              | RVar (Free region) ->
+                  [%cassert] span (not (RegionId.Set.mem region ctx.ended_regions))
+                    "Nested identity reborrow contains an ended interior region"
+              | _ -> [%craise] span "Nested identity reborrow lacks a full live referent type"
+          end in check#visit_ty () target;
+          let info=TypesAnalysis.analyze_ty (Some span) ctx.type_ctx.type_infos target in
+          [%cassert] span (not (info.contains_mut_borrow || info.contains_static))
+            "Nested identity reborrow currently supports only shared interior references")
+          [borrowed_ty;loaned_ty];
+        (* The endpoint names are independent instantiations. Require identical
+           region-occurrence/alias structure, then allocate a bridge-local copy;
+           no original region is substituted or identified with another one. *)
+        let alpha ty =
+          let _,fresh=RegionId.fresh_stateful_generator () in
+          snd (ty_refresh_regions (Some span) fresh ty) in
+        [%cassert] span (equal_ty (alpha borrowed_ty) (alpha loaned_ty))
+          "Nested identity reborrow endpoints have different region alias structure";
+        let inner_regions,target=ty_refresh_regions (Some span) ctx.fresh_region_id borrowed_ty in
+        let outer=ctx.fresh_region_id () in
+        let reference=mk_ref_ty (RVar (Free outer)) target RMut in
+        let regions=outer::inner_regions in
+        let parameters=List.map (fun index ->
+          {index;name=None;variance=VaUnknown;mutability=LtUnknown}) regions in
+        let sg:LlbcAst.bound_fun_sig={
+          item_binder_params={empty_generic_params with regions=parameters};
+          item_binder_value={is_unsafe=false;abi=AbiRust;is_variadic=false;
+            inputs=[reference];output=reference}} in
+        let groups=RegionsHierarchy.compute_regions_hierarchy_for_sig (Some span) ctx.crate sg in
+        let ids=RegionGroupId.Map.of_list (List.map (fun (group:region_var_group) ->
+          group.id,ctx.fresh_abs_id ()) groups) in
+        [%cassert] span (RegionId.Set.equal (RegionId.Set.of_list regions)
+          (RegionId.Set.of_list (List.concat_map (fun (group:region_var_group)->group.regions) groups)))
+          "Nested identity bridge hierarchy lost a region";
+        List.iter (fun (group:region_var_group) ->
+          let owned=RegionId.Set.of_list group.regions in
+          let owns_outer=RegionId.Set.mem outer owned in
+          if owns_outer then
+            [%cassert] span (group.regions=[outer])
+              "Nested identity bridge outer and interior regions share a hierarchy group";
+          let achild=mk_aignored span target None and echild=mk_eignored None target in
+          let borrow:tavalue={ty=reference;value=ABorrow
+            (if owns_outer then AMutBorrow(PNone,borrow_id,achild)
+             else AIgnoredMutBorrow(Some borrow_id,achild))}
+          and loan:tavalue={ty=reference;value=ALoan
+            (if owns_outer then AMutLoan(PNone,loan_id,achild)
+             else AIgnoredMutLoan(Some loan_id,achild))} in
+          let output:tevalue={ty=reference;value=EBorrow
+            (if owns_outer then EMutBorrow(PNone,borrow_id,echild)
+             else EIgnoredMutBorrow(Some borrow_id,echild))}
+          and input:tevalue={ty=reference;value=ELoan
+            (if owns_outer then EMutLoan(PNone,loan_id,echild)
+             else EIgnoredMutLoan(Some loan_id,echild))} in
+          let abs={abs_id=RegionGroupId.Map.find group.id ids;kind=abs_kind;can_end;
+            parents=AbsId.Set.of_list (List.map (fun id->RegionGroupId.Map.find id ids) group.parents);
+            regions={owned};ended_subabs=AbsLevelSet.empty;avalues=[borrow;loan];
+            cont=Some{output=Some output;input=Some input}} in
+          Invariants.opt_type_check_abs span ctx abs;
+          absl:=abs::!absl) groups
     | VBorrow bc -> (
         let _, ref_ty, kind = ty_as_ref v.ty in
         [%cassert] span (ty_no_regions ref_ty)
@@ -227,15 +309,115 @@ let convert_value_to_abstractions (span : Meta.span) (abs_kind : abs_kind)
             in
             let output = { value = output; ty } in
             let input = { value = EValue (ctx.env, v); ty } in
-            (* *)
+            let output,input =
+              let info=TypesAnalysis.analyze_ty (Some span) ctx.type_ctx.type_infos ty in
+              if InterpSharedPacketSignature.enabled () && info.contains_borrow
+                && not info.contains_mut_borrow && not info.contains_nested_borrows
+                && not info.contains_static then
+                (* Pure shared projections keep their whole A permission, but
+                   have no backward value. This is the same empty continuation
+                   used above for concrete shared borrows and by native
+                   abstraction synthesis, which emits E projectors only for
+                   mutable projected regions. Do not manufacture a mutable
+                   output from a moved Vec<&T> (or another shared-only value). *)
+                mk_etuple ~borrow_proj:true [], mk_etuple ~borrow_proj:false []
+              else output,input in
             push_abs rid [ nv ] (Some output) (Some input))
           regions
   in
 
-  (* Apply *)
-  to_abs v;
-  (* Return *)
-  List.rev !absl
+  (* Preserve the original failure while exposing the exact runtime node. *)
+  try
+    to_abs v;
+    List.rev !absl
+  with error ->
+    let backtrace=Printexc.get_raw_backtrace () in
+    let phase,current = !current_value in
+    Printf.eprintf "VALUE_TO_ABSTRACTIONS_REJECTED phase=%s\ncurrent: %s\noriginal: %s\n%!"
+      phase (show_tvalue current) (show_tvalue v);
+    Printexc.raise_with_backtrace error backtrace
+
+(** Before reducing an exact identity reborrow, deliver the native returns
+    instead of deleting a mutable edge with external return subscriptions.
+    This runs only in analysis: the caller keeps ordinary synthesis/recording
+    on its existing path. All current permissions are changed by end_abs. *)
+let end_subscribed_identity_reborrows (config : config) (span : Meta.span)
+    (fixed_aids : AbsId.Set.t) (before_conversion : eval_ctx) (ctx0 : eval_ctx) : eval_ctx =
+  if not (InterpSharedPacketSignature.enabled ()) || config.mode<>SymbolicMode then ctx0
+  else
+    let identity (owner:abs) =
+      if Option.is_some (ctx_lookup_abs_opt before_conversion owner.abs_id)
+        || not owner.can_end || AbsId.Set.mem owner.abs_id fixed_aids
+        || not (AbsId.Set.is_empty owner.parents)
+        || not (AbsLevelSet.is_empty owner.ended_subabs) then None
+      else match owner.avalues,owner.cont with
+      | [{value=ABorrow(AMutBorrow(PNone,old_id,{value=AIgnored None;ty=old_ty}));ty=old_ref};
+         {value=ALoan(AMutLoan(PNone,new_id,{value=AIgnored None;ty=new_ty}));ty=new_ref}],
+        Some {output=Some {value=EBorrow(EMutBorrow(PNone,out_id,{value=EIgnored None;ty=out_ty}));ty=out_ref};
+              input=Some {value=ELoan(EMutLoan(PNone,in_id,{value=EIgnored None;ty=in_ty}));ty=in_ref}}
+        when old_id<>new_id && old_id=out_id && new_id=in_id
+          && equal_ty old_ty out_ty && equal_ty new_ty in_ty
+          && equal_ty old_ref out_ref && equal_ty new_ref in_ref
+          && equal_ty (Substitute.erase_regions old_ty) (Substitute.erase_regions new_ty)
+          && not (ty_no_regions old_ty) ->
+          (match old_ref,new_ref with
+          | TRef(RVar(Free r),t,RMut),TRef(RVar(Free s),u,RMut)
+            when r=s && RegionId.Set.equal owner.regions.owned (RegionId.Set.singleton r)
+              && equal_ty t old_ty && equal_ty u new_ty
+              && not (RegionId.Set.mem r (ty_regions old_ty))
+              && not (RegionId.Set.mem r (ty_regions new_ty)) -> Some (old_id,new_id)
+          | _ -> None)
+      | _ -> None in
+    let subscribers ctx bid =
+      let found=ref false in
+      let visitor=object inherit [_] iter_tavalue as super
+        method! visit_AIgnoredMutLoan () id child =
+          if id=Some bid then found:=true;
+          super#visit_AIgnoredMutLoan () id child
+      end in
+      env_iter_abs (fun owner->List.iter (visitor#visit_tavalue ()) owner.avalues) ctx.env;
+      !found in
+    let named_borrows (value:tvalue) =
+      let found=ref UniqueBorrowIdSet.empty in
+      let visitor=object inherit [_] iter_tvalue as super
+        method! visit_borrow_content () borrow =
+          let id=match borrow with
+            | VMutBorrow(bid,_)->UMut bid
+            | VSharedBorrow(bid,sid)|VReservedMutBorrow(bid,sid)->UShared(bid,sid) in
+          found:=UniqueBorrowIdSet.add id !found;
+          super#visit_borrow_content () borrow
+      end in visitor#visit_tvalue () value;!found in
+    let candidates=List.filter_map (function
+      | EAbs owner -> (match identity owner with Some _->Some owner.abs_id|None->None)
+      | _->None) ctx0.env in
+    List.fold_left (fun ctx aid -> match ctx_lookup_abs_opt ctx aid with
+      | None->ctx
+      | Some owner -> (match identity owner with
+        | Some(old_id,new_id) when subscribers ctx old_id ->
+            let result,_ = end_abs config span ~snapshots:false aid 0 ctx in
+            AbsId.Set.iter (fun id ->
+              [%classert] span (ctx_lookup_abs_opt ctx id = ctx_lookup_abs_opt result id)
+                (lazy ("Native identity return changed fixed owner " ^ AbsId.to_string id))) fixed_aids;
+            List.iter (function
+              | EBinding(BVar binder,value) ->
+                  let after=List.find_map (function
+                    | EBinding(BVar other,value) when other.index=binder.index->Some value
+                    | _->None) result.env in
+                  [%classert] span (match after with
+                    | Some after -> UniqueBorrowIdSet.subset (named_borrows value) (named_borrows after)
+                    | None->false)
+                    (lazy ("Native identity return would discard named borrow permissions in local "
+                      ^ Expressions.LocalId.to_string binder.index
+                      ^ "\nbefore: " ^ show_tvalue value
+                      ^ "\nafter: " ^ (match after with Some v->show_tvalue v|None->"absent")))
+              | _->()) ctx.env;
+            [%cassert] span (ctx_lookup_abs_opt result aid=None && not (subscribers result old_id))
+              "Native identity return left its owner or old-loan subscriptions active";
+            Invariants.check_invariants span result;
+            Printf.eprintf "IDENTITY_REBORROW_NATIVE_RETURN owner=%s old=%s new=%s\n%!"
+              (AbsId.to_string aid) (BorrowId.to_string old_id) (BorrowId.to_string new_id);
+            result
+        | _->ctx)) ctx0 candidates
 
 (** Move a regular shared alias out of a fully shared ended-loan cell. This is
     deliberately a context operation: the alias must not occur both in its old
@@ -741,7 +923,8 @@ type merge_duplicates_funcs = {
 
     We assume the value has been destructured (there are no nested loans, adts,
     the children are ignored, etc.). *)
-let tavalue_split_marker (span : Meta.span) (ctx : eval_ctx) (av : tavalue) :
+let tavalue_split_marker (span : Meta.span) (ctx : eval_ctx) (owner : abs)
+    (av : tavalue) :
     tavalue list =
   let mk_split mk_value = [ mk_value PLeft; mk_value PRight ] in
   let mk_opt_split pm mk_value =
@@ -776,13 +959,23 @@ let tavalue_split_marker (span : Meta.span) (ctx : eval_ctx) (av : tavalue) :
           mk_opt_split pm mk_value
       | ASharedLoan (pm, bids, sv, child) ->
           [%sanity_check] span (is_aignored child.value);
-          [%sanity_check] span
-            (not (value_has_borrows (Some span) ctx sv.value));
+          (match sv.value with
+           | VBorrow(VSharedBorrow _) when InterpSharedPacketSignature.enabled () ->
+               (* The inner concrete borrow inherits each resulting branch
+                  marker; its original unique ID is preserved on that branch. *)
+               InterpSharedPacketSignature.check_retained_shared_loan
+                 ~allow_marked:true span ctx owner 0 av
+           | _ -> [%sanity_check] span
+               (not (value_has_borrows (Some span) ctx sv.value)));
           let mk_value pm =
             { av with value = ALoan (ASharedLoan (pm, bids, sv, child)) }
           in
           mk_opt_split pm mk_value
-      | _ -> [%internal_error] span)
+      | _ ->
+          [%craise] span
+            ("Unsupported loan during marker splitting: "
+             ^ tavalue_to_string ~with_ended:true ctx av ^ "\n"
+             ^ abs_to_string span ~with_ended:true ctx owner))
   | ASymbolic (pm, proj) -> (
       if pm <> PNone then [ av ]
       else
@@ -802,7 +995,7 @@ let tavalue_split_marker (span : Meta.span) (ctx : eval_ctx) (av : tavalue) :
 let abs_split_markers (span : Meta.span) (ctx : eval_ctx) (abs : abs) : abs =
   {
     abs with
-    avalues = List.concat (List.map (tavalue_split_marker span ctx) abs.avalues);
+    avalues = List.concat (List.map (tavalue_split_marker span ctx abs) abs.avalues);
   }
 
 (** Auxiliary function for {!merge_abstractions}.
@@ -1017,6 +1210,62 @@ let merge_abstractions_merge_loan_borrow_pairs (span : Meta.span)
   (* We are done *)
   !left_avalues @ List.rev !right_avalues
 
+(** Joining two analysis owners can unite disjoint pieces of one shared
+    projection. The unchanged full type then describes their exact union in
+    the resulting owned set. Recognize only the two original top-level nodes:
+    no returned history, continuation, or newly split branch copy is admitted.
+    Every unrelated node must retain its original ownership mask. *)
+let shared_borrow_mask_union_pair span (ctx : eval_ctx) owned original_owners
+    (first : tavalue) (second : tavalue) =
+  match original_owners, first.value, second.value with
+  | [left;right], ASymbolic (pm,AProjBorrows a),
+      ASymbolic (other_pm,AProjBorrows b)
+    when InterpPacketRouting.enabled () && first != second && pm <> PNone && pm = other_pm
+      && a.loans = [] && b.loans = [] && a.proj.sv_id = b.proj.sv_id
+      && equal_ty first.ty a.proj.proj_ty && equal_ty second.ty b.proj.proj_ty
+      && equal_ty first.ty second.ty ->
+      let original owner value = List.length (List.filter (( == ) value) owner.avalues) = 1 in
+      let owners =
+        if original left first && original right second then Some (left,right)
+        else if original right first && original left second then Some (right,left)
+        else None in
+      (match owners with
+      | None -> false
+      | Some (left,right) ->
+          let eligible owner = owner.can_end && Option.is_none owner.cont
+            && AbsId.Set.is_empty owner.parents && AbsLevelSet.is_empty owner.ended_subabs in
+          let matching_roots = List.filter (fun (value:tavalue) -> match value.value with
+            | ASymbolic (marker,AProjBorrows p) -> marker=pm && p.proj.sv_id=a.proj.sv_id
+            | _ -> false) (left.avalues @ right.avalues) in
+          let ty = a.proj.proj_ty in
+          let info = TypesAnalysis.analyze_ty (Some span) ctx.type_ctx.type_infos ty in
+          let regions = TypesUtils.ty_regions ty in
+          let left_mask = RegionId.Set.inter regions left.regions.owned
+          and right_mask = RegionId.Set.inter regions right.regions.owned in
+          let result_mask = RegionId.Set.inter regions owned in
+          if not (left.abs_id <> right.abs_id && eligible left && eligible right
+            && List.length matching_roots = 2
+            && not info.contains_mut_borrow && not info.contains_static
+            && not (TypesUtils.ty_has_nested_borrows (Some span) ctx.type_ctx.type_infos ty)
+            && RegionId.Set.is_empty (RegionId.Set.inter regions ctx.ended_regions)
+            && RegionId.Set.equal owned (RegionId.Set.union left.regions.owned right.regions.owned)
+            && not (RegionId.Set.is_empty left_mask) && not (RegionId.Set.is_empty right_mask)
+            && not (projections_intersect span ctx left.regions.owned ty right.regions.owned ty)
+            && RegionId.Set.equal result_mask (RegionId.Set.union left_mask right_mask))
+          then false
+          else begin
+            let module P = InterpPacketInterface in
+            let pc = P.context_of_eval ctx in
+            List.iter (fun (owner,selected) ->
+              let rest = {owner with avalues=List.filter (fun value -> value != selected) owner.avalues} in
+              try ignore (InterpPacketMerge.check_union_masks pc (P.describe_owner pc rest) owned)
+              with InterpPacketMerge.Unsupported reason ->
+                InterpPacketRouting.reject span ("shared borrow mask union: " ^ reason))
+              [left,first;right,second];
+            true
+          end)
+  | _ -> false
+
 (** Auxiliary function for {!merge_abstractions}.
 
     Phase 2 of the merge: we remove markers, by merging pairs of the same
@@ -1028,7 +1277,7 @@ let merge_abstractions_merge_loan_borrow_pairs (span : Meta.span)
            ~~>
       MB l0, MB l1
     ]} *)
-let merge_abstractions_merge_markers (span : Meta.span)
+let merge_abstractions_merge_markers ?(original_owners = []) (span : Meta.span)
     (merge_funs : merge_duplicates_funcs) (ctx : eval_ctx)
     (owned_regions : RegionId.Set.t) (avalues : tavalue list) : tavalue list =
   [%ltrace
@@ -1097,19 +1346,30 @@ let merge_abstractions_merge_markers (span : Meta.span)
 
   let try_merge_projs ((ty0, pm0, proj0) : ty * proj_marker * aproj)
       ((ty1, pm1, proj1) : ty * proj_marker * aproj) : tavalue option =
+    let check_complementary () =
+      if not (complementary_markers pm0 pm1) then
+        Printf.eprintf
+          "PROJECTOR_MARKER_MERGE_REJECTED owned=%s\nfirst: %s\nsecond: %s\noriginal owners:\n%s\nall phase-2 values:\n%s\n%!"
+          (RegionId.Set.to_string None owned_regions)
+          (show_tavalue {ty=ty0;value=ASymbolic(pm0,proj0)})
+          (show_tavalue {ty=ty1;value=ASymbolic(pm1,proj1)})
+          (String.concat "\n" (List.map (abs_to_string span ~with_ended:true ctx) original_owners))
+          (String.concat "\n" (List.map show_tavalue avalues));
+      [%sanity_check] span (complementary_markers pm0 pm1)
+    in
     match (proj0, proj1) with
     | AProjBorrows proj0, AProjBorrows proj1
       when proj0.proj.sv_id = proj1.proj.sv_id
            && projections_intersect span ctx owned_regions proj0.proj.proj_ty
                 owned_regions proj1.proj.proj_ty ->
-        [%sanity_check] span (complementary_markers pm0 pm1);
+        check_complementary ();
         (* Merge *)
         Some (merge_funs.merge_aborrow_projs ty0 pm0 proj0 ty1 pm1 proj1)
     | AProjLoans proj0, AProjLoans proj1
       when proj0.proj.sv_id = proj1.proj.sv_id
            && projections_intersect span ctx owned_regions proj0.proj.proj_ty
                 owned_regions proj1.proj.proj_ty ->
-        [%sanity_check] span (complementary_markers pm0 pm1);
+        check_complementary ();
         (* Merge *)
         Some (merge_funs.merge_aloan_projs ty0 pm0 proj0 ty1 pm1 proj1)
     | _ ->
@@ -1123,7 +1383,12 @@ let merge_abstractions_merge_markers (span : Meta.span)
      if the two values can't be merged (because they are of two different
      kinds for instance). *)
   let try_merge_avalues (av0 : tavalue) (av1 : tavalue) : tavalue option =
-    match (av0.value, av1.value) with
+    if shared_borrow_mask_union_pair span ctx owned_regions original_owners av0 av1 then
+      (* The result owns both disjoint source masks. Keep an exact original
+         node and its same-side marker, without invoking the complementary
+         branch callback, which would erase that marker. *)
+      Some av0
+    else match (av0.value, av1.value) with
     | ALoan c0, ALoan c1 -> try_merge_aloan_contents av0.ty c0 av1.ty c1
     | ABorrow c0, ABorrow c1 -> try_merge_aborrow_contents av0.ty c0 av1.ty c1
     | ASymbolic (pm0, proj0), ASymbolic (pm1, proj1) ->
@@ -2155,6 +2420,7 @@ let merge_abs_conts (span : Meta.span) (ctx : eval_ctx) ~(with_abs_conts : bool)
 let merge_abstractions (span : Meta.span) (abs_kind : abs_kind)
     ~(can_end : bool) (merge_funs : merge_duplicates_funcs option)
     ~(with_abs_conts : bool) (ctx : eval_ctx) (abs0 : abs) (abs1 : abs) : abs =
+  let original_abs0 = abs0 and original_abs1 = abs1 in
   [%ltrace
     "- abs0:\n"
     ^ abs_to_string span ctx abs0
@@ -2243,8 +2509,9 @@ let merge_abstractions (span : Meta.span) (abs_kind : abs_kind)
     match merge_funs with
     | None -> avalues
     | Some merge_funs ->
-        merge_abstractions_merge_markers span merge_funs ctx regions.owned
-          avalues
+        merge_abstractions_merge_markers
+          ~original_owners:[original_abs0;original_abs1]
+          span merge_funs ctx regions.owned avalues
   in
   [%ldebug
     "avalues after removing markers:\n"
@@ -2275,8 +2542,18 @@ let merge_abstractions (span : Meta.span) (abs_kind : abs_kind)
 
   [%ltrace "resulting abs:\n" ^ abs_to_string span ctx abs];
 
-  (* Sanity check *)
-  [%sanity_check] span (abs_is_destructured span true ctx abs);
+  (* Keep the original inputs visible if repeated destructuring changes the
+     result. The diagnostic is evaluated only on failure and edits no owner. *)
+  [%classert] span (abs_is_destructured span true ctx abs)
+    (lazy (let repeated = destructure_abs span abs.kind ~can_end:abs.can_end
+             ~destructure_shared_values:true ctx abs in
+      "Legacy merge result is not stable under destructuring\nsource left:\n"
+      ^ abs_to_string span ~with_ended:true ctx original_abs0
+      ^ "\nsource right:\n" ^ abs_to_string span ~with_ended:true ctx original_abs1
+      ^ "\nresult:\n" ^ abs_to_string span ~with_ended:true ctx abs
+      ^ "\nrepeated destructuring:\n" ^ abs_to_string span ~with_ended:true ctx repeated
+      ^ "\nexact result: " ^ Values.show_abs abs
+      ^ "\nexact repeated result: " ^ Values.show_abs repeated));
   (* Return *)
   abs
 
@@ -2334,6 +2611,70 @@ let merge_into_first_abstraction_legacy (span : Meta.span) (abs_kind : abs_kind)
   in
   Invariants.opt_type_check_abs span ctx nabs;
 
+  (* Native merge_abstractions has already constructed a union of the two
+     owned sets and composed the original continuations. Its later global
+     quotient is an extra normalization. In the mixed concrete/symbolic
+     shared case it can make
+     a symbolic projection use a concrete leaf's region, whose lifetime may
+     already be ended in another branch joined later. Preserve the native
+     union whenever this exact shared interface is present, after checking
+     every original A/E mask. The native continuation already records each
+     input's original owned scope in its let bindings. Nothing in the context
+     is renamed, no projection is widened, and no ended region is revived. *)
+  let mask_united value =
+    List.exists (fun other ->
+      shared_borrow_mask_union_pair span ctx nabs.regions.owned [abs0;abs1] value other
+      && List.length (List.filter (fun root -> equal_tavalue value root) nabs.avalues) = 1
+      && List.exists (fun root -> root == value || root == other) nabs.avalues)
+      (abs0.avalues @ abs1.avalues) in
+  let retain_native_regions =
+    if Sys.getenv_opt "AENEAS_TRACE_NATIVE_SHARED_UNION" = Some "1" then
+      Printf.eprintf "NATIVE_SHARED_UNION_INPUT owner=%s owned=%s ended=%s raw=%s\n%!"
+        (AbsId.to_string nabs.abs_id) (RegionId.Set.to_string None nabs.regions.owned)
+        (RegionId.Set.to_string None ctx.ended_regions) (show_abs nabs);
+    if not (InterpPacketRouting.enabled ())
+      || RegionId.Set.cardinal nabs.regions.owned <= 1
+    then false else
+      let has_symbolic=ref false and has_concrete=ref false in
+      let flat_shared (value:tavalue) = match value.value with
+        | ASymbolic (_, (AProjLoans {consumed=[];borrows=[];_}
+            | AProjBorrows {loans=[];_})) ->
+            has_symbolic:=true;
+            not (TypesUtils.ty_has_mut_borrow_for_region_in_set
+              ctx.type_ctx.type_infos nabs.regions.owned value.ty)
+            && RegionId.Set.is_empty (RegionId.Set.inter ctx.ended_regions
+              (RegionId.Set.inter nabs.regions.owned (TypesUtils.ty_regions value.ty)))
+        | ABorrow (ASharedBorrow _) ->
+            has_concrete:=true;
+            (match value.ty with
+            | TRef(_,referent,RShared) ->
+                not (TypesUtils.ty_has_borrows (Some span) ctx.type_ctx.type_infos referent)
+            | _ -> false)
+        | ALoan (ASharedLoan(_,_,shared,child)) ->
+            has_concrete:=true;
+            is_aignored child.value
+            && not (TypesUtils.ty_has_borrows (Some span) ctx.type_ctx.type_infos shared.ty)
+            && not (tvalue_has_loans_or_borrows (Some span) ctx shared)
+        | _ -> false in
+      if List.for_all flat_shared nabs.avalues && !has_symbolic && !has_concrete then begin
+        let module P=InterpPacketInterface in
+        let pc=P.context_of_eval ctx in
+        (try List.iter (fun owner ->
+          (* Only the original two masks explicitly united above may grow.
+             The output must contain exactly one of those original nodes;
+             every unselected A/E node still gets the ordinary union check. *)
+          let retained = {owner with avalues=List.filter (fun value -> not (mask_united value)) owner.avalues} in
+          ignore (InterpPacketMerge.check_union_masks pc (P.describe_owner pc retained)
+            nabs.regions.owned)) [abs0;abs1]
+         with InterpPacketMerge.Unsupported message ->
+           InterpPacketRouting.reject span ("native shared union: " ^ message));
+        true
+      end else false in
+
+  [%cassert] span
+    (retain_native_regions || not (List.exists mask_united (abs0.avalues @ abs1.avalues)))
+    "Shared borrow mask union requires preserving the native owned-region union";
+
   (* Update the environment: replace the abstraction 0 with the result of the merge,
      remove the abstraction 1 *)
   let ctx = fst (ctx_subst_abs span ctx abs_id0 nabs) in
@@ -2350,7 +2691,7 @@ let merge_into_first_abstraction_legacy (span : Meta.span) (abs_kind : abs_kind)
     (* Pick the first region id (this is the smallest) *)
     let rid = RegionId.Set.min_elt regions in
     (* If there is only one region, do nothing *)
-    if RegionId.Set.cardinal regions = 1 then ctx
+    if retain_native_regions || RegionId.Set.cardinal regions = 1 then ctx
     else
       let rids = RegionId.Set.remove rid regions in
       ctx_merge_regions ctx rid rids
@@ -2358,21 +2699,103 @@ let merge_into_first_abstraction_legacy (span : Meta.span) (abs_kind : abs_kind)
 
   (* End the loans in the region abstraction which don't have corresponding borrows anymore *)
   let ctx = end_endable_shared_loans_at_abs span ctx nabs.abs_id in
+  if retain_native_regions then begin
+    (* A native join temporarily retains both marked copies of a shared-borrow
+       ID. Global borrow-ID uniqueness applies after collapse eliminates those
+       markers (InterpJoin.join_one), not after each intermediate merge. Keep
+       all local mask/type/owner checks above and the original full invariant
+       at the completed-collapse boundary; check immediately if already unmarked. *)
+    let marked = List.exists (function
+      | EAbs owner -> abs_has_markers owner
+      | EBinding _ | EFrame -> false) ctx.env in
+    if not marked then
+      Invariants.check_invariants
+        ~shared_borrow_type_lookup:(InterpSharedPacketSignature.lookup_retained_shared_type_for_typing span ctx)
+        ~mut_borrow_type_lookup:(InterpSharedPacketSignature.lookup_retained_mut_borrow_type span ctx)
+        span ctx;
+    if Sys.getenv_opt "AENEAS_TRACE_NATIVE_SHARED_UNION" = Some "1" then
+      Printf.eprintf "NATIVE_SHARED_UNION_RETAINED owner=%s regions=%s ended=%s\n%!"
+        (AbsId.to_string nabs.abs_id) (RegionId.Set.to_string None nabs.regions.owned)
+        (RegionId.Set.to_string None (RegionId.Set.inter nabs.regions.owned ctx.ended_regions))
+  end;
 
   (* Return *)
   (ctx, nabs.abs_id)
+
+(** A packet merge can expose complementary ordinary borrow roots while
+    keeping structured histories intact. Reuse the native duplicate callback
+    only for complete equal projections with empty histories or the native
+    borrow-free concrete shared pair. Every other root,
+    including its marker and nested metadata, remains the original object.
+    Equality of the full normalized masks under the already checked region
+    union makes the callback's choice of either original type immaterial; no
+    region coalescing or marker splitting is performed. *)
+let merge_packet_borrow_markers span ctx merge_funs owned avalues =
+  let module R = InterpPacketRouting in
+  let complementary left right =
+    (left=PLeft && right=PRight) || (left=PRight && right=PLeft) in
+  let try_merge (value : tavalue) (previous : tavalue) =
+    match value.value,previous.value with
+    | ABorrow (ASharedBorrow (pm,bid,sid)),
+      ABorrow (ASharedBorrow (other_pm,other_bid,other_sid))
+      when bid=other_bid && complementary pm other_pm ->
+        let shared_type ty=match ty with
+          | TRef (_,referent,RShared) ->
+              not (TypesUtils.ty_has_borrows (Some span) ctx.type_ctx.type_infos referent)
+          | _ -> false in
+        let normalized=normalize_proj_ty owned value.ty in
+        R.require span (shared_type value.ty && shared_type previous.ty
+          && equal_ty normalized (normalize_proj_ty owned previous.ty))
+          "marked duplicate concrete shared borrows have different complete masks";
+        let merged=merge_funs.merge_ashared_borrows bid value.ty pm sid
+          previous.ty other_pm other_sid in
+        R.require span (match merged.value with
+          | ABorrow (ASharedBorrow (PNone,result_bid,result_sid)) ->
+              result_bid=bid && result_sid<>sid && result_sid<>other_sid
+              && equal_ty normalized (normalize_proj_ty owned merged.ty)
+          | _ -> false)
+          "native concrete shared duplicate callback changed its permission";
+        Some merged
+    | ASymbolic (pm,AProjBorrows proj),ASymbolic (other_pm,AProjBorrows other)
+      when proj.proj.sv_id=other.proj.sv_id && complementary pm other_pm ->
+        R.require span (proj.loans=[] && other.loans=[])
+          "marked duplicate packet borrows require empty histories";
+        let normalized=normalize_proj_ty owned proj.proj.proj_ty in
+        R.require span (equal_ty normalized (normalize_proj_ty owned other.proj.proj_ty))
+          "marked duplicate packet borrows have different full projection masks";
+        R.require span (equal_ty value.ty proj.proj.proj_ty
+          && equal_ty previous.ty other.proj.proj_ty)
+          "marked duplicate packet borrow wrapper differs from its original type";
+        let merged = merge_funs.merge_aborrow_projs value.ty pm proj
+          previous.ty other_pm other in
+        R.require span (match merged.value with
+          | ASymbolic (PNone,AProjBorrows result) ->
+              result.loans=[] && result.proj.sv_id=proj.proj.sv_id
+              && equal_ty merged.ty result.proj.proj_ty
+              && equal_ty normalized (normalize_proj_ty owned result.proj.proj_ty)
+          | _ -> false)
+          "native duplicate borrow merge changed its complete projection";
+        Some merged
+    | _ -> None in
+  List.fold_left (fun previous value ->
+    let rec insert = function
+      | [] -> [value]
+      | head::tail -> (match try_merge value head with
+          | Some merged -> merged::tail
+          | None -> head::insert tail) in
+    insert previous) [] avalues
 
 (** All public merge routes share this dispatch. A packet rejection must never
     fall through to destructuring/coalescing. The fixed set is required from the
     actual caller; legacy direct/recorded callers that omit it remain explicitly
     unsupported for packets, rather than guessing a frozen set. *)
-let merge_into_first_abstraction ?packet_fixed_abs_ids (span : Meta.span)
+let merge_into_first_abstraction ?packet_fixed_abs_ids ?packet_replay (span : Meta.span)
     (abs_kind : abs_kind) ~(can_end : bool) ~(with_abs_conts : bool)
     (merge_funs : merge_duplicates_funcs option) (ctx : eval_ctx)
     (abs_id0 : AbsId.id) (abs_id1 : AbsId.id) : eval_ctx * AbsId.id =
   let left = ctx_lookup_abs ctx abs_id0 and right = ctx_lookup_abs ctx abs_id1 in
   let packet_dispatch = InterpPacketRouting.enabled ()
-     && (InterpPacketRouting.requires_merge left || InterpPacketRouting.requires_merge right) in
+     && (Option.is_some packet_replay || InterpPacketRouting.requires_merge left || InterpPacketRouting.requires_merge right) in
   InterpPacketRouting.trace_route left right packet_dispatch;
   if packet_dispatch then begin
     let module R = InterpPacketRouting in
@@ -2381,8 +2804,11 @@ let merge_into_first_abstraction ?packet_fixed_abs_ids (span : Meta.span)
       | Some x -> x
       | None -> R.reject span "packet direct/recorded merge lacks original fixed-owner set"
     in
-    R.require span (Option.is_none merge_funs)
-      "packet marker/duplicate merge policy is not supported (coalescing assumptions retained)";
+    let allow_marked = Option.is_some merge_funs in
+    Option.iter (fun action ->
+      R.require span (not allow_marked && with_abs_conts)
+        "recorded packet replay requires unmarked synthesis";
+      R.validate_merge_replay span ctx action left right) packet_replay;
     R.require span can_end "packet result must remain endable";
     R.require span (Sys.getenv_opt "AENEAS_EXPERIMENTAL_ALL_FRAME_PARENTS" = Some "1")
       "packet commit requires the reviewed all-frame parent-update path";
@@ -2394,10 +2820,36 @@ let merge_into_first_abstraction ?packet_fixed_abs_ids (span : Meta.span)
       if AbsId.Set.mem a.abs_id fixed_aids then
         R.require span (AbsId.Set.is_empty (AbsId.Set.inter a.parents targets))
           "packet commit would rewrite a fixed owner's parent set") ctx.env;
-    let ld = R.validate_owner span ctx left and bd = R.validate_owner span ctx right in
+    let ld = R.validate_owner ~allow_marked span ctx left
+    and bd = R.validate_owner ~allow_marked span ctx right in
+    let duplicate_interface=if allow_marked && Option.is_none packet_replay then
+      R.shared_duplicate_interface ~allow_residual_loans:(not with_abs_conts)
+        span ctx left right else None in
     let edited_left, edited_right, owned, parents, trace_prefix, trace_detail =
-      match R.shared_edge span ld bd with
-      | Some (_loan, borrow, bid, sid) ->
+      match packet_replay, R.shared_edge ~allow_marked
+        ~allow_symbolic_pair:(not allow_marked && Option.is_none packet_replay) span ld bd with
+      | Some ((R.VanishedLeftShared _ | R.VanishedLeftInterface _) as action), _ ->
+          (* The recorded edge was on the discarded side. No current edge is
+             consumed here: concatenate the exact original projected trees and
+             compose their actual continuations, as projection of that merge. *)
+          List.iter (fun (owner:abs) ->
+            R.require span (owner.can_end
+              && (match action with R.VanishedLeftShared _ -> Option.is_some owner.cont | _ -> true)
+              && AbsLevelSet.is_empty owner.ended_subabs
+              && not (AbsId.Set.mem owner.abs_id fixed_aids))
+              "vanished-left composition has a fixed or incomplete owner") [left;right];
+          R.require span (left.abs_id<>right.abs_id)
+            "vanished-left composition needs distinct original owners";
+          let owned=RegionId.Set.union left.regions.owned right.regions.owned in
+          let pc=P.context_of_eval ctx in
+          let checks=try InterpPacketMerge.check_union_masks pc ld owned
+              + InterpPacketMerge.check_union_masks pc bd owned
+            with InterpPacketMerge.Unsupported reason -> R.reject span reason in
+          let parents=AbsId.Set.diff (AbsId.Set.union left.parents right.parents) targets in
+          left,right,owned,parents,"PROJECTED_PACKET_COMPOSITION_COMMITTED",
+            " " ^ R.recorded_description action
+              ^ " mask_checks=" ^ string_of_int checks
+      | _, Some (loan, borrow, bid, sid) ->
           (* This is the native concrete shared-edge rule: remove only the
              matching right borrow, retain the left loan and every symbolic
              permission/history, and compose the ORIGINAL continuations. *)
@@ -2409,68 +2861,218 @@ let merge_into_first_abstraction ?packet_fixed_abs_ids (span : Meta.span)
             if with_abs_conts then
               R.require span (Option.is_some owner.cont)
                 "concrete shared synthesis merge is missing a continuation") [left; right];
-          R.require span (RegionId.Set.is_empty
-            (RegionId.Set.inter left.regions.owned right.regions.owned))
-            "concrete shared merge has overlapping owned regions";
-          (match ctx_lookup_loan span ek_all bid ctx with
-          | AbsId aid, Abstract (ASharedLoan (PNone, actual_bid, _, _)) ->
-              R.require span (aid = left.abs_id && actual_bid = bid)
-                "concrete shared merge selected the wrong native loan owner"
-          | _ -> R.reject span "concrete shared merge has no native shared loan");
-          let avalues = List.filter (fun value -> value != borrow) right.avalues in
-          R.require span (List.length avalues + 1 = List.length right.avalues)
+          R.require span (left.abs_id<>right.abs_id)
+            "concrete shared root merge needs distinct owners";
+          (* As in marked ordinary packet cancellation, two joined branches
+             can retain the same native region. Owned sets are projection
+             masks, not permission IDs. The exact same-marker root edge is
+             already selected; check_union_masks below still checks every
+             retained A/E node before the native union can be committed. *)
+          R.require span (allow_marked
+            || (match packet_replay with Some (R.RightShared _) -> true | _ -> false)
+            || RegionId.Set.is_empty
+              (RegionId.Set.inter left.regions.owned right.regions.owned))
+            "unmarked concrete shared merge has overlapping owned regions";
+          (match loan.value with
+          | ALoan (ASharedLoan (marker, actual_bid, shared, _)) ->
+              R.require span (actual_bid=bid)
+                "concrete shared merge selected a different loan ID";
+              if allow_marked then begin
+                R.require span (marker<>PNone)
+                  "concrete shared collapse requires an explicit same-marker edge";
+                (* Observe the unique current loan through the same bounded
+                   marker-aware reader used by transient invariants. Native
+                   lookup cannot traverse other marked leaves during a join.
+                   The actual A root and its payload stay unchanged. *)
+                let actual=InterpSharedPacketSignature.lookup_retained_shared_value
+                    span ctx marker bid in
+                R.require span (actual==shared)
+                  "marked concrete shared merge selected another current loan payload"
+              end else
+                (match ctx_lookup_loan span ek_all bid ctx with
+                | AbsId aid, Abstract (ASharedLoan (PNone, actual_bid, _, _)) ->
+                    R.require span (aid = left.abs_id && actual_bid = bid)
+                      "concrete shared merge selected the wrong native loan owner"
+                | _ -> R.reject span "concrete shared merge has no native shared loan")
+          | _ -> R.reject span "concrete shared merge selected a non-shared loan");
+          (* Native ordinary reduction can expose both a concrete shared edge
+             and an independent ordinary symbolic pair between these owners.
+             Prepare the symbolic cancellation against the complete ORIGINAL
+             environment, then remove precisely the original concrete borrow.
+             The original concrete loan and all other typed nodes remain. *)
+          let symbolic_pairs=List.concat_map (fun (loan:P.packet) ->
+            if loan.polarity<>P.Loan then [] else
+            List.filter_map (fun (borrow:P.packet) ->
+              if borrow.polarity=P.Borrow && loan.marker=borrow.marker
+                && loan.sid=borrow.sid && equal_ty loan.typ.normalized borrow.typ.normalized
+              then Some(loan,borrow) else None) (R.roots bd)) (R.roots ld) in
+          let edited_left,borrow_owner,symbolic_detail=match symbolic_pairs with
+            | [] -> left,right,""
+            | [symbolic_loan,symbolic_borrow] ->
+                R.require span (not allow_marked && Option.is_none packet_replay
+                  && symbolic_loan.marker=PNone && symbolic_borrow.marker=PNone
+                  && not symbolic_loan.typ.owned_mutable && not symbolic_borrow.typ.owned_mutable)
+                  "mixed shared merge requires one unmarked ordinary shared packet";
+                (match P.original_ap symbolic_loan,P.original_ap symbolic_borrow with
+                | AProjLoans {consumed=[];borrows=[];_},AProjBorrows {loans=[];_} -> ()
+                | _ -> R.reject span "mixed shared merge selected symbolic history");
+                let prepared=try InterpPacketMerge.prepare ~with_abs_conts span
+                    ~native_type_ctx:ctx.type_ctx (P.context_of_eval ctx)
+                    ~current_env:ctx.env ~supplied_env:ctx.env ~fixed_aids
+                    ~loan_owner:left ~loan_path:symbolic_loan.at.path
+                    ~borrow_owner:right ~borrow_path:symbolic_borrow.at.path
+                  with InterpPacketMerge.Unsupported message -> R.reject span message in
+                prepared.loan_owner,prepared.borrow_owner,
+                  " symbolic_sid=" ^ SymbolicValueId.to_string(Option.get symbolic_loan.sid)
+            | _ -> R.reject span "mixed shared merge has multiple symbolic pairs" in
+          let avalues = List.filter (fun value -> value != borrow) borrow_owner.avalues in
+          R.require span (List.length avalues + 1 = List.length borrow_owner.avalues)
             "concrete shared merge did not remove exactly one borrow root";
-          let edited_right = { right with avalues } in
+          let edited_right = { borrow_owner with avalues } in
           let owned = RegionId.Set.union left.regions.owned right.regions.owned in
           let pc = P.context_of_eval ctx in
           let rd = P.describe_owner pc edited_right in
           let mask_checks =
-            try InterpPacketMerge.check_union_masks pc ld owned
+            try InterpPacketMerge.check_union_masks pc (P.describe_owner pc edited_left) owned
               + InterpPacketMerge.check_union_masks pc rd owned
             with InterpPacketMerge.Unsupported reason -> R.reject span reason in
           let parents = AbsId.Set.diff (AbsId.Set.union left.parents right.parents) targets in
           let detail = " shared_loan=" ^ BorrowId.to_string bid
             ^ " shared_borrow=" ^ SharedBorrowId.to_string sid
-            ^ " mask_checks=" ^ string_of_int mask_checks in
-          left, edited_right, owned, parents, "PACKET_SHARED_MERGE_COMMITTED", detail
-      | None ->
-          let loan, borrow = R.unique_pair span ld bd in
-          let prepared =
-            try InterpPacketMerge.prepare ~with_abs_conts span ~native_type_ctx:ctx.type_ctx
+            ^ " mask_checks=" ^ string_of_int mask_checks
+            ^ " overlapping_regions=" ^ RegionId.Set.to_string None
+                (RegionId.Set.inter left.regions.owned right.regions.owned) in
+          edited_left, edited_right, owned, parents, "PACKET_SHARED_MERGE_COMMITTED", detail ^ symbolic_detail
+      | _, None when Option.is_some duplicate_interface ->
+          let left_history,right_history,left_live,right_live,flat,same_key,marker=
+            Option.get duplicate_interface in
+          R.require span (left.abs_id<>right.abs_id)
+            "shared duplicate branch merge needs distinct original owners";
+          List.iter (fun (owner:abs) ->
+            R.require span (owner.can_end && not(AbsId.Set.mem owner.abs_id fixed_aids)
+              && AbsLevelSet.is_empty owner.ended_subabs)
+              "shared duplicate branch merge has a fixed or ended owner") [left;right];
+          (* Follow merge_abs_conts exactly: a branch analysis can have an
+             explicit join continuation on only one side. The native helper
+             returns None when either input is absent, and composes both
+             original scoped expressions only when both are present. *)
+          let owned=RegionId.Set.union left.regions.owned right.regions.owned in
+          let pc=P.context_of_eval ctx in
+          let checks=try InterpPacketMerge.check_union_masks pc ld owned
+              + InterpPacketMerge.check_union_masks pc bd owned
+            with InterpPacketMerge.Unsupported message -> R.reject span message in
+          let paired=List.filter (fun original -> List.exists (same_key original) right_live) left_live in
+          let retained=List.filter (fun original -> not(List.exists (same_key original) right_live)) left_live
+            @ List.filter (fun original -> not(List.exists (same_key original) left_live)) right_live in
+          R.require span (retained=[] || not with_abs_conts)
+            "partial shared duplicate interface is analysis-only";
+          let merged=merge_abstractions_merge_markers span (Option.get merge_funs)
+              ctx owned (left_live@right_live) in
+          let preserved = if retained=[] then
+              List.length merged=List.length left_live
+              && List.for_all2 (fun original value -> flat value && same_key original value
+                && marker value=Some PNone) left_live merged
+            else List.length merged=List.length paired+List.length retained
+              && List.for_all (fun original ->
+                match List.filter (same_key original) merged with
+                | [value] -> flat value && marker value=Some PNone
+                    && equal_ty original.ty value.ty
+                | _ -> false) paired
+              && List.for_all (fun original ->
+                List.length(List.filter (fun value -> value==original) merged)=1) retained in
+          R.require span preserved
+            "native duplicate callback changed a shared input or retained output";
+          let edited_left={left with avalues=merged@left_history@right_history}
+          and edited_right={right with avalues=[]} in
+          let parents=AbsId.Set.diff (AbsId.Set.union left.parents right.parents) targets in
+          edited_left,edited_right,owned,parents,"PACKET_DUPLICATE_MERGE_COMMITTED",
+            " roots=" ^ string_of_int(List.length merged)
+              ^ " mask_checks=" ^ string_of_int checks
+      | _, None ->
+          let pairs =
+            try R.complementary_pairs ~allow_marked span ld bd with error ->
+              let backtrace=Printexc.get_raw_backtrace () in
+              Printf.eprintf "PACKET_PAIR_SELECTION_REJECTED marked=%b synthesis=%b\nleft:\n%s\nright:\n%s\n%!"
+                allow_marked with_abs_conts
+                (abs_to_string span ~with_ended:true ctx left)
+                (abs_to_string span ~with_ended:true ctx right);
+              Printexc.raise_with_backtrace error backtrace in
+          (* Each independent edge is prepared against the original complete
+             context, never against a fabricated intermediate environment. *)
+          let prepared = List.map (fun ((loan:P.packet),(borrow:P.packet)) ->
+            R.require span (not allow_marked || loan.marker<>PNone)
+              "packet collapse requires an explicit same-marker cancellation edge";
+            try InterpPacketMerge.prepare ~with_abs_conts ~allow_marked span ~native_type_ctx:ctx.type_ctx
               (P.context_of_eval ctx) ~current_env:ctx.env ~supplied_env:ctx.env
               ~fixed_aids ~loan_owner:left ~loan_path:loan.at.path
               ~borrow_owner:right ~borrow_path:borrow.at.path
-            with InterpPacketMerge.Unsupported reason -> R.reject span reason in
-          let detail = " root=" ^ String.concat "/" loan.at.path
-            ^ " / " ^ String.concat "/" borrow.at.path
-            ^ " mask_checks=" ^ string_of_int prepared.regular_mask_checks
-            ^ " child_e_checks=" ^ string_of_int prepared.child_e_checks
-            ^ " removed_nodes=" ^ string_of_int
-                (List.length prepared.removed_loan_nodes + List.length prepared.removed_borrow_nodes)
-            ^ " ignored_root_metadata=" ^ string_of_int (List.length prepared.ignored_root_metadata) in
-          prepared.loan_owner, prepared.borrow_owner, prepared.owned, prepared.parents,
-          "PACKET_MERGE_COMMITTED", detail
+            with InterpPacketMerge.Unsupported reason ->
+              R.reject span (reason ^ "\nselected loan: " ^ String.concat "/" loan.at.path
+                ^ "\n" ^ abs_to_string span ~with_ended:true ctx left
+                ^ "\nselected borrow: " ^ String.concat "/" borrow.at.path
+                ^ "\n" ^ abs_to_string span ~with_ended:true ctx right)) pairs in
+          let first=List.hd prepared in
+          let pc=P.context_of_eval ctx in
+          let edited_left,edited_right,final_mask_checks = match prepared with
+            | [one] -> one.loan_owner,one.borrow_owner,0
+            | _ ->
+                (* Distinct history-free SIDs ensure disjoint selected paths.
+                   Each replacement requires the original node/marker identity
+                   and verifies preservation relative to the preceding tree;
+                   every unrelated wrapper, level and metadata object survives. *)
+                let edit owner selected = List.fold_left (fun owner (packet:P.packet) ->
+                  let before=P.describe_owner pc owner in
+                  let changed=InterpPacketMerge.replace_root owner packet in
+                  InterpPacketMerge.check_conservation before
+                    (P.describe_owner pc changed) packet.at.path;
+                  changed) owner selected in
+                (try
+                  let l=edit left (List.map fst pairs)
+                  and r=edit right (List.map snd pairs) in
+                  let checks=InterpPacketMerge.check_union_masks pc (P.describe_owner pc l) first.owned
+                    + InterpPacketMerge.check_union_masks pc (P.describe_owner pc r) first.owned in
+                  l,r,checks
+                with InterpPacketMerge.Unsupported reason -> R.reject span reason) in
+          let sum f = List.fold_left (fun total p -> total+f p) 0 prepared in
+          let detail = " roots=" ^ String.concat ";" (List.map (fun ((loan:P.packet),(borrow:P.packet)) ->
+                String.concat "/" loan.at.path ^ " / " ^ String.concat "/" borrow.at.path) pairs)
+            ^ " mask_checks=" ^ string_of_int (final_mask_checks + sum (fun p->p.regular_mask_checks))
+            ^ " child_e_checks=" ^ string_of_int (sum (fun p->p.child_e_checks))
+            ^ " removed_nodes=" ^ string_of_int (sum (fun p->
+                List.length p.removed_loan_nodes + List.length p.removed_borrow_nodes))
+            ^ " ignored_root_metadata=" ^ string_of_int (sum (fun p->List.length p.ignored_root_metadata)) in
+          edited_left,edited_right,first.owned,first.parents,"PACKET_MERGE_COMMITTED",detail
     in
     R.check_parent_commit span ctx left right parents;
     (* Exactly the existing analysis/synthesis split: analysis creates no E
        continuation, synthesis composes the two ORIGINAL owners through the real
        helper, preserving its calls, bindings, effects and failures. *)
     let cont = merge_abs_conts span ctx ~with_abs_conts left right in
+    let avalues = edited_left.avalues @ edited_right.avalues in
+    let avalues = match merge_funs with
+      | None -> avalues
+      | Some merge_funs -> merge_packet_borrow_markers span ctx merge_funs owned avalues in
     let nabs = {
       abs_id = ctx.fresh_abs_id (); kind = abs_kind; can_end;
       parents; ended_subabs = AbsLevelSet.empty;
-      regions = { owned };
-      avalues = edited_left.avalues @ edited_right.avalues;
-      cont;
+      regions = { owned }; avalues; cont;
     } in
-    ignore (R.validate_owner span ctx nabs);
+    ignore (R.validate_owner ~allow_marked span ctx nabs);
     Invariants.opt_type_check_abs span ctx nabs;
     (* The standard substitution/removal updates current-frame parent edges.
        No region coalescing, history flattening or implicit loan ending occurs. *)
     let nctx = fst (ctx_subst_abs span ctx abs_id0 nabs) in
     let nctx = R.remap_borrower_parents abs_id1 nabs.abs_id nctx in
     let nctx = fst (ctx_remove_abs span nctx abs_id1) in
-    Invariants.check_invariants span nctx;
+    (* As in the native merger, intermediate join contexts may retain both
+       marked copies of one shared-borrow ID. The closure, conservation, union
+       masks and complete local typing checks above apply now; global uniqueness
+       is checked at the original completed-collapse boundary. Never interpret
+       a pair of branch copies as a single available runtime permission. *)
+    let marked=List.exists (function
+      | EAbs owner -> abs_has_markers owner
+      | EBinding _ | EFrame -> false) nctx.env in
+    if not marked then Invariants.check_invariants span nctx;
     if Sys.getenv_opt "AENEAS_TRACE_PACKET_MERGE" = Some "1" then
       prerr_endline (trace_prefix ^ " loan=" ^ AbsId.to_string abs_id0
         ^ " borrow=" ^ AbsId.to_string abs_id1 ^ " result=" ^ AbsId.to_string nabs.abs_id
@@ -2670,13 +3272,13 @@ let reorder_loans_borrows_in_fresh_abs (span : Meta.span) (allow_markers : bool)
     else if InterpPacketRouting.enabled () && InterpPacketRouting.has_history abs then (
       (* Keep every ordered wrapper/history/given-back branch. Global owner
          ordering below remains unchanged; no legacy avalue filter is applied. *)
-      ignore (InterpPacketRouting.validate_owner span ctx abs);
+      ignore (InterpPacketRouting.validate_owner ~allow_marked:allow_markers span ctx abs);
       abs)
     else if InterpPacketRouting.enabled () && InterpPacketRouting.has_empty abs then (
-      InterpPacketRouting.validate_empty_order span ctx abs;
+      InterpPacketRouting.validate_empty_order ~allow_marked:allow_markers span ctx abs;
       abs)
     else if InterpPacketRouting.enabled () && InterpPacketRouting.needs_packet abs then (
-      ignore (InterpPacketRouting.validate_owner span ctx abs);
+      ignore (InterpPacketRouting.validate_owner ~allow_marked:allow_markers span ctx abs);
       abs)
     else reorder_in_fresh_abs abs
   in
@@ -3014,19 +3616,22 @@ let add_abs_cont_to_abs_legacy span (ctx : eval_ctx) (abs : abs) (abs_fun : abs_
   { abs with cont }
 
 
-(** Only the reviewed multi-exit output constructor opts in. The original A
-    object tree is the signature witness; it is not destructured or filtered.
-    The caller keeps the original break owner/continuation for real Pure
-    translation. This creates only the separate output-context ELoop reference. *)
+(** Multi-exit entry/output and branch constructors opt in for a checked shared-only
+    interface. The original A tree is the signature witness; it is not
+    destructured or filtered. Check every native sublevel before registering
+    the empty mutable ELoop/EJoin interface, retaining all history and metadata. *)
 let add_abs_cont_to_abs ?(shared_packet_signature = false) span
     (ctx : eval_ctx) (abs : abs) (abs_fun : abs_fun) : abs =
   if shared_packet_signature && InterpSharedPacketSignature.enabled ()
      && InterpSharedPacketSignature.needs_explicit_signature abs then begin
     (match abs_fun with
-    | ELoop (id, _) when id = abs.abs_id -> ()
+    | ELoop (id, _) | EJoin id when id = abs.abs_id -> ()
     | _ -> InterpSharedPacketSignature.reject span
-        "output constructor requires this owner's ELoop");
+        "shared constructor requires this owner's ELoop or EJoin");
     let signature = InterpSharedPacketSignature.check span ctx abs in
+    InterpSharedPacketSignature.require span
+      (List.for_all (InterpSharedHistory.empty_native_interface span ctx abs) abs.avalues)
+      "loop signature has a mutable interface at an original native sublevel";
     let output = mk_etuple ~borrow_proj:true [] in
     let input : tevalue = {value=EApp(abs_fun,[[]]);ty=output.ty} in
     {signature.owner with cont=Some {output=Some output;input=Some input}}

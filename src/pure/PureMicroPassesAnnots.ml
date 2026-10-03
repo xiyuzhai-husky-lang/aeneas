@@ -61,6 +61,17 @@ let add_type_annotations_to_fun_decl (trans_ctx : trans_ctx)
   let rec visit (ty : ty) (e : texpr) : texpr =
     [%ldebug "visit:\n- ty: " ^ ty_to_string ty ^ "\n- e: " ^ texpr_to_string e];
     match e.e with
+    | Qualif { id = AdtCons _; _ }
+      when Config.backend () = Lean && ty <> e.ty -> (
+        (* A nullary generic constructor has no fields from which Lean can
+           recover its implicit type parameters.  In particular, [none] passed
+           to a polymorphic function must keep the original Pure type when the
+           surrounding signature still contains holes. *)
+        match e.ty with
+        | TAdt (_, generics)
+          when generics.types <> [] || generics.const_generics <> [] ->
+            mk_type_annot e
+        | _ -> e)
     | FVar _ | CVar _ | Const _ | EError _ | Qualif _ -> e
     | BVar _ -> [%internal_error] span
     | App _ -> visit_App ty e
@@ -204,7 +215,7 @@ let add_type_annotations_to_fun_decl (trans_ctx : trans_ctx)
                     { types = [ hole ]; const_generics; trait_refs = [] } )
               in
               (known_f_ty, [ collection_ty; TLiteral (TUInt Usize) ], false)
-          | ResultUnwrapMut -> (hole, mk_holes (), false)
+          | ResultUnwrapMut | OptionExpectMut | ResultAndThenMutCapture -> (hole, mk_holes (), false)
           | SliceZipNext | SliceZipFold | SliceVecZipNext | SliceVecZipFold | VecSliceZipNext | VecSliceZipFold -> (f.ty, mk_known (), false)
           | GetTarget -> (f.ty, mk_known (), false)
           | TargetFeatureEnabled -> (f.ty, mk_known (), false)

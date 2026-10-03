@@ -33,6 +33,7 @@ type original =
 type node = { path : path; surface : surface; level : int; original : original }
 type packet = {
   at : node;
+  marker : proj_marker;
   polarity : polarity;
   phase : phase;
   sid : symbolic_value_id option;
@@ -91,9 +92,9 @@ let describe_owner ctx (owner : abs) : descriptor =
   let concrete_metadata = ref [] and bindings = ref [] and unresolved = ref [] and shared_reborrows=ref [] in
   let node surface level path original =
     let n = { path; surface; level; original } in nodes := n :: !nodes; n in
-  let packet surface level path original polarity phase sid typ type_origin =
+  let packet surface level path original marker polarity phase sid typ type_origin =
     let at = node surface level path original in
-    packets := {at; polarity; phase; sid;typ=view_type ctx owner typ;type_origin} :: !packets in
+    packets := {at; marker; polarity; phase; sid;typ=view_type ctx owner typ;type_origin} :: !packets in
   let meta surface level path (m : mconsumed_symb) =
     let at=node surface level path (ConsumedMetadata m) in
     metadata := {at;sid=m.sv_id;typ=view_type ctx owner m.proj_ty} :: !metadata in
@@ -104,11 +105,11 @@ let describe_owner ctx (owner : abs) : descriptor =
     let at=node surface level path (ConcreteMetadata value) in
     concrete_metadata := {at;value} :: !concrete_metadata;
     unresolved:=ConcreteMetadataDependency at::!unresolved in
-  let rec ah level path inherited p =
-    let save polarity phase sid ty origin = packet A level path (APacket p) polarity phase sid ty origin in
+  let rec ah marker level path inherited p =
+    let save polarity phase sid ty origin = packet A level path (APacket p) marker polarity phase sid ty origin in
     let history channel xs = List.iteri (fun i (m,c) ->
       let edge=path@[channel;string_of_int i] in meta A level (edge@["metadata"]) m;
-      ah (level+1) (edge@["child"]) inherited c) xs in
+      ah marker (level+1) (edge@["child"]) inherited c) xs in
     match p with
     | AProjBorrows p -> save Borrow Live (Some p.proj.sv_id) p.proj.proj_ty ProjectorType; history "loans" p.loans
     | AProjLoans p -> save Loan Live (Some p.proj.sv_id) p.proj.proj_ty ProjectorType; history "consumed" p.consumed; history "borrows" p.borrows
@@ -116,11 +117,11 @@ let describe_owner ctx (owner : abs) : descriptor =
     | AEndedProjBorrows p -> save Borrow Ended (Some p.mvalues.consumed) p.proj_ty EndedProjectorType;
       sym A level (path@["given_back"]) p.mvalues.given_back; history "loans" p.loans
     | AEmpty -> save Empty Ended None inherited EnclosingType
-  and eh surface level path inherited p =
-    let save polarity phase sid ty origin = packet surface level path (EPacket p) polarity phase sid ty origin in
+  and eh marker surface level path inherited p =
+    let save polarity phase sid ty origin = packet surface level path (EPacket p) marker polarity phase sid ty origin in
     let history channel xs = List.iteri (fun i (m,c) ->
       let edge=path@[channel;string_of_int i] in meta surface level (edge@["metadata"]) m;
-      eh surface (level+1) (edge@["child"]) inherited c) xs in
+      eh marker surface (level+1) (edge@["child"]) inherited c) xs in
     match p with
     | EProjBorrows p -> save Borrow Live (Some p.proj.sv_id) p.proj.proj_ty ProjectorType; history "loans" p.loans
     | EProjLoans p -> save Loan Live (Some p.proj.sv_id) p.proj.proj_ty ProjectorType; history "consumed" p.consumed; history "borrows" p.borrows
@@ -133,7 +134,7 @@ let describe_owner ctx (owner : abs) : descriptor =
     let child = av level (path@["child"]) and given = av (level+1) (path@["given_back"]) in
     match v.value with
     | AAdt a -> List.iteri(fun i c -> av level (path@["field";string_of_int i]) c)a.fields
-    | ASymbolic (pm,p) -> require(pm=PNone)"marked A packet"; ah level (path@["packet"]) v.ty p
+    | ASymbolic (pm,p) -> ah pm level (path@["packet"]) v.ty p
     | AIgnored m -> Option.iter (concrete A level (path@["ignored_meta"])) m
     | ABorrow b -> (match b with
       | AEndedIgnoredMutBorrow b -> child b.child; given b.given_back; sym A level (path@["given_back_meta"]) b.given_back_meta
@@ -154,7 +155,7 @@ let describe_owner ctx (owner : abs) : descriptor =
     let child = ev surface level (path@["child"]) and given = ev surface (level+1) (path@["given_back"]) in
     match v.value with
     | EAdt a -> List.iteri(fun i c -> ev surface level (path@["field";string_of_int i])c)a.fields
-    | ESymbolic (pm,p) -> require(pm=PNone)"marked E packet"; eh surface level (path@["packet"])v.ty p
+    | ESymbolic (pm,p) -> eh pm surface level (path@["packet"])v.ty p
     | EValue (snapshot,value) | EIgnored (Some(snapshot,value)) -> captures:={at;snapshot;value}::!captures; unresolved:=CaptureBinding at::!unresolved
     | EIgnored None -> ()
     | EFVar f -> unresolved:=FreeVariableBinding(at,f)::!unresolved
@@ -242,37 +243,69 @@ let find_packet (d : descriptor) path =
 let active (p : packet) polarity = require(p.phase=Live && p.polarity=polarity)"wrong live polarity"
 let original_ap (p : packet) = match p.at.original with APacket p->p |_->unsupported "not A packet"
 let prefix a b = let rec f a b=match a,b with [],_->true|x::xs,y::ys when x=y->f xs ys|_->false in f a b
-let plan_dual (ctx : context) ~fixed_aids ~(loan_owner : abs) ~loan_path ~(borrow_owner : abs) ~borrow_path =
+let plan_dual ?(allow_marked=false) (ctx : context) ~fixed_aids ~(loan_owner : abs) ~loan_path ~(borrow_owner : abs) ~borrow_path =
   require(loan_owner.abs_id<>borrow_owner.abs_id)"identical owners";
   List.iter(fun a -> require(a.can_end && not(AbsId.Set.mem a.abs_id fixed_aids))"fixed/non-endable owner") [loan_owner;borrow_owner];
   let ld=describe_owner ctx loan_owner and bd=describe_owner ctx borrow_owner in
   let l=find_packet ld loan_path and b=find_packet bd borrow_path in
   active l Loan;active b Borrow;
+  require(l.marker=b.marker && (allow_marked || l.marker=PNone))
+    "selected cancellation markers disagree or marked cancellation is disabled";
   require(l.at.level=0 && b.at.level=0)"parent packet is not level zero";
   require(l.sid=b.sid)"parent SID mismatch";
   require(equal_ty l.typ.normalized b.typ.normalized)"parent owned projection mismatch";
   let region_correspondence=compare_native_regions ctx loan_owner borrow_owner l.typ.full b.typ.full in
-  let lm,bm = match original_ap l, original_ap b with
-    | AProjLoans {consumed=[];borrows=[m,AProjBorrows {loans=[];_}];_},
-      AProjBorrows {loans=[n,AProjLoans {consumed=[];borrows=[];_}];_}->m,n
-    | _ -> unsupported "expected one reciprocal child and no consumed/extra history" in
-  let lc=find_packet ld (loan_path@["borrows";"0";"child"])
-  and bc=find_packet bd (borrow_path@["loans";"0";"child"]) in
-  active lc Borrow;active bc Loan;
-  require(lc.at.level=1 && bc.at.level=1)"child level mismatch";
-  require(lc.sid=bc.sid && lc.sid<>l.sid)"child SID mismatch or same parent SID";
-  require(equal_ty lc.typ.normalized bc.typ.normalized)"child owned projection mismatch";
-  require(Some lm.sv_id=lc.sid && Some bm.sv_id=bc.sid)"history metadata SID mismatch";
-  (* Original instantiations may differ across owners. The loan-owner history
-     records the borrow-owner's newly returned value, not the active old type. *)
-  require(equal_ty lm.proj_ty bc.typ.full && equal_ty bm.proj_ty bc.typ.full)"history metadata full type mismatch";
-  require(equal_ty l.typ.full lc.typ.full && equal_ty b.typ.full bc.typ.full)"unexpected per-owner type change";
-  let selected=[loan_owner,l;loan_owner,lc;borrow_owner,b;borrow_owner,bc] in
+  (* Native returns append ordered reciprocal histories and may return again
+     inside a previous child. Pair the whole finite tree, preserving each
+     original level, branch marker, SID, full type and metadata edge. No
+     consumed/ended or unmatched child is admitted. *)
+  let seen = ref SymbolicValueId.Set.empty in
+  let rec pair (left : packet) (right : packet) =
+    require(left.phase=Live && right.phase=Live
+      && ((left.polarity=Loan && right.polarity=Borrow)
+          || (left.polarity=Borrow && right.polarity=Loan)))
+      "reciprocal history is not a live opposite-polarity pair";
+    require(left.marker=l.marker && right.marker=b.marker)
+      "reciprocal history changed its enclosing branch marker";
+    require(left.at.level=right.at.level) "reciprocal history level mismatch";
+    require(left.sid=right.sid) "reciprocal history SID mismatch";
+    let sid=match left.sid with Some sid->sid
+      | None->unsupported "reciprocal history has no SID" in
+    require(not(SymbolicValueId.Set.mem sid !seen))
+      "reciprocal history repeats a SID";
+    seen:=SymbolicValueId.Set.add sid !seen;
+    require(equal_ty left.typ.normalized right.typ.normalized)
+      "reciprocal history owned projection mismatch";
+    require(equal_ty l.typ.full left.typ.full && equal_ty b.typ.full right.typ.full)
+      "unexpected per-owner history type change";
+    let children p = match original_ap p with
+      | AProjLoans {consumed=[];borrows;_} -> "borrows",borrows
+      | AProjBorrows {loans;_} -> "loans",loans
+      | _ -> unsupported "reciprocal history has consumed or ended content" in
+    let left_channel,left_children=children left
+    and right_channel,right_children=children right in
+    require(List.length left_children=List.length right_children)
+      "reciprocal history has unmatched child count";
+    let descendants=List.mapi (fun i (((lm:mconsumed_symb),_),((rm:mconsumed_symb),_)) ->
+      let suffix channel=[channel;string_of_int i;"child"] in
+      let lc=find_packet ld (left.at.path@suffix left_channel)
+      and rc=find_packet bd (right.at.path@suffix right_channel) in
+      require(lc.at.level=left.at.level+1 && rc.at.level=right.at.level+1)
+        "history child did not preserve its native sublevel";
+      require(Some lm.sv_id=lc.sid && Some rm.sv_id=rc.sid)
+        "history metadata SID mismatch";
+      let returned_type=if lc.polarity=Loan then lc.typ.full else rc.typ.full in
+      require(equal_ty lm.proj_ty returned_type && equal_ty rm.proj_ty returned_type)
+        "history metadata full returned type mismatch";
+      pair lc rc) (List.combine left_children right_children) in
+    (left,right)::List.concat descendants in
+  let paired=pair l b in
+  let selected=List.concat_map(fun (left,right)->[loan_owner,left;borrow_owner,right])paired in
   List.iter(fun (owner,(p : packet)) ->
     require(p.type_origin=ProjectorType)"selected packet has only inherited type evidence";
     require(not p.typ.owned_mutable)"mutable owned projection unsupported by dual planner";
     require(not(AbsLevelSet.mem p.at.level owner.ended_subabs))"selected level recorded ended";
-    require(RegionId.Set.is_empty(RegionId.Set.inter owner.regions.owned ctx.ended_regions))"selected owned region ended";
+    require(RegionId.Set.is_empty(RegionId.Set.inter owner.regions.owned p.typ.ended_regions))"selected projected owned region ended";
     (* An earlier concrete merge may retain unrelated owned regions. Only
        regions visible in this packet participate in its projection; the full
        native correspondence above compares their ownership pointwise. Keep
@@ -287,12 +320,12 @@ let plan_dual (ctx : context) ~fixed_aids ~(loan_owner : abs) ~loan_path ~(borro
     end in check#visit_ty () p.typ.full) selected;
   let unique (d : descriptor) (p : packet) =
     require(not(List.exists(fun(r:shared_reborrow)->match r.proj with Some x->Some x.sv_id=p.sid|None->false)d.shared_reborrows))"selected SID has additional shared reborrow occurrence";
-    require(List.length(List.filter(fun (q : packet)->q.at.surface=A && q.phase=Live && q.sid=p.sid)d.packets)=1)"duplicate live SID occurrence in owner" in
-  List.iter(unique ld)[l;lc];List.iter(unique bd)[b;bc];
+    require(List.length(List.filter(fun (q : packet)->q.at.surface=A && q.phase=Live && q.marker=p.marker && q.sid=p.sid)d.packets)=1)"duplicate live SID occurrence in owner" in
+  List.iter(fun (left,right)->unique ld left;unique bd right)paired;
   (* Exclude only selected packet subtrees from the residual VIEW. Owners,
      enclosing wrappers, E nodes, metadata and captures stay original objects. *)
   let residual d path = List.filter(fun n->n.surface<>A || not(prefix path n.path))d.nodes in
-  {loan_descriptor=ld;borrow_descriptor=bd;paired=[l,b;lc,bc];region_correspondence;
+  {loan_descriptor=ld;borrow_descriptor=bd;paired;region_correspondence;
    retained_loan_nodes=residual ld loan_path;retained_borrow_nodes=residual bd borrow_path;
    obligations=[UncommittedOnly;OrderedContinuationComposition;CaptureAndBinderValidation;
     RecursiveInterfaceBinding;EffectPreservation;ExternalPermissionClosure;ContinuationLayoutValidation]}

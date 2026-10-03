@@ -386,6 +386,38 @@ let eval_operand_no_reorganize (config : config) (span : Meta.span)
               [%craise] span
                 ("Unsupported type for scalar constant: "
                ^ ty_to_string ctx cv.ty))
+      | CRef (({kind=CArray elements;
+          ty=TArray ((TScalar (TInteger (Unsigned U8)) as element_ty),length,None)}
+          as constant), None) ->
+          (* A constant byte-array reference denotes immutable static storage,
+             just like a string literal below. Its backing loan must not be
+             put in a local whose StorageDead would invalidate an escaping
+             reference. Keep the exact array bytes in the symbolic AST and
+             use the existing static-constant dummy-loan representation. *)
+          [%cassert] span (not !Config.use_static) "Unimplemented";
+          (match cv.ty with
+          | TRef ((RStatic | RErased),referent,RShared) ->
+              [%sanity_check] span (equal_ty referent constant.ty)
+          | _ -> [%craise] span "Malformed constant byte-array reference");
+          let expected_length=Scalars.get_val (TypesUtils.constant_expr_as_integer length) in
+          [%sanity_check] span
+            (equal_ty length.ty TypesUtils.mk_usize_ty
+             && Z.of_int(List.length elements)=expected_length);
+          let fields=List.map (fun (element : constant_expr) ->
+            [%sanity_check] span (equal_ty element.ty element_ty);
+            literal_to_tvalue span (TInteger (Unsigned U8))
+              (TypesUtils.constant_expr_as_literal element) ctx) elements in
+          let original : tvalue = {
+            value=VAdt {variant_id=None;fields};ty=constant.ty} in
+          let sv=mk_fresh_symbolic_value span ctx constant.ty in
+          let symbolic=mk_tvalue_from_symbolic_value sv in
+          let bid=ctx.fresh_borrow_id () and sid=ctx.fresh_shared_borrow_id () in
+          let loan : tvalue={value=VLoan(VSharedLoan(bid,symbolic));ty=constant.ty} in
+          let borrow : tvalue={value=VBorrow(VSharedBorrow(bid,sid));
+            ty=TRef(RErased,constant.ty,RShared)} in
+          let ctx=ctx_push_dummy_var ctx (ctx.fresh_dummy_var_id ()) loan in
+          let cc e=SA.IntroSymbolic(ctx,None,sv,VaSingleValue original,e) in
+          (borrow,ctx,cc)
       | CStr v -> (
           [%ldebug "string constant"];
           (* FIXME: the str type is not in [scalar_type] *)
@@ -782,6 +814,91 @@ let cast_unsize_to_modified_fields (span : Meta.span) (ctx : eval_ctx)
           snd last_field ))
     else [%craise] span (mk_msg ())
 
+(** Preserve the actual symbolic reference regions through the native boxed
+    array-to-slice coercion. The cast changes the container shape, so its fresh
+    symbolic identity needs an ordinary input/output permission abstraction;
+    copying the erased LLBC destination type would lose both regions and loans.
+    This exact case has no mutable backward interface. *)
+let shared_box_array_unsize (span : Meta.span) (unop : unop) (op : operand)
+    (ctx : eval_ctx) (value : tvalue) =
+  if Sys.getenv_opt "AENEAS_EXPERIMENTAL_SYMBOLIC_REGION_HIERARCHY" <> Some "1" then None
+  else match unop,value.value with
+  | Cast (CastUnsize ((TAdt source as source_ty),(TAdt target as target_ty),_)),
+    VAdt {variant_id=None;fields=[{value=VSymbolic original;ty=array_ety}]}
+    when source.builtin=Some TBox && target.builtin=Some TBox ->
+      (match source.generics.types,target.generics.types,original.sv_ty with
+      | [TArray (source_element,length,None)],[TSlice (target_element,None)],
+        TArray (element,actual_length,None)
+        when equal_ty source_element target_element
+          && equal_ty (Substitute.erase_regions element) source_element
+          && length = actual_length
+          && equal_ty array_ety (Substitute.erase_regions original.sv_ty)
+          && equal_ty value.ty source_ty ->
+          let info=TypesAnalysis.analyze_ty (Some span) ctx.type_ctx.type_infos original.sv_ty in
+          (* A closed element type can contain immutable 'static fields (for
+             example PrintTask::Bytes) without carrying any current regional
+             permission. Leave that case on the ordinary native unsize path;
+             the bridge below is only needed to transport live free regions. *)
+          let static_only =
+            info.contains_static && not info.contains_mut_borrow
+            && not info.contains_nested_borrows && ty_is_rty original.sv_ty
+            && RegionId.Set.is_empty (ty_regions original.sv_ty)
+          in
+          if not info.contains_borrow || static_only then None else (
+            [%cassert] span
+              (not info.contains_mut_borrow && not info.contains_static
+               && not info.contains_nested_borrows && ty_is_rty original.sv_ty
+               && not (symbolic_value_has_ended_regions ctx.ended_regions original))
+              ("Boxed shared array coercion has an unsupported permission interface: type="
+               ^ ty_to_string ctx original.sv_ty
+               ^ "; mutable=" ^ string_of_bool info.contains_mut_borrow
+               ^ "; static=" ^ string_of_bool info.contains_static
+               ^ "; nested=" ^ string_of_bool info.contains_nested_borrows
+               ^ "; runtime_type=" ^ string_of_bool (ty_is_rty original.sv_ty)
+               ^ "; ended=" ^ string_of_bool
+                   (symbolic_value_has_ended_regions ctx.ended_regions original));
+            [%cassert] span (cast_unsize_to_modified_fields span ctx source_ty target_ty=None)
+              "Boxed shared array coercion is not the native array-to-slice case";
+            let regions,array_ty=ty_refresh_regions (Some span) ctx.fresh_region_id original.sv_ty in
+            let element=match array_ty with TArray(element,_,None)->element
+              | _ -> [%internal_error] span in
+            let input_ty=TAdt {source with generics={source.generics with types=[array_ty]}} in
+            let output_ty=TAdt {target with generics={target.generics with types=[TSlice(element,None)]}} in
+            [%cassert] span
+              (equal_ty (Substitute.erase_regions input_ty) source_ty
+               && equal_ty (Substitute.erase_regions output_ty) target_ty)
+              "Boxed shared array coercion changed the native erased types";
+            let signature:LlbcAst.bound_fun_sig={
+              item_binder_params={empty_generic_params with regions=List.map
+                (fun index->{index;name=None;variance=VaUnknown;mutability=LtUnknown}) regions};
+              item_binder_value={is_unsafe=false;abi=AbiRust;is_variadic=false;
+                inputs=[input_ty];output=output_ty}} in
+            let groups=RegionsHierarchy.compute_regions_hierarchy_for_sig (Some span) ctx.crate signature in
+            [%cassert] span (RegionId.Set.equal (RegionId.Set.of_list regions)
+              (RegionId.Set.of_list (List.concat_map (fun (g:region_var_group)->g.regions) groups)))
+              "Boxed shared array coercion lost a native lifetime group";
+            let ids=RegionGroupId.Map.of_list (List.map (fun (g:region_var_group)->g.id,ctx.fresh_abs_id ()) groups) in
+            let output=mk_fresh_symbolic_value span ctx output_ty in
+            let owners=List.map (fun (g:region_var_group)->
+              let owned=RegionId.Set.of_list g.regions in
+              let borrowed=InterpProjectors.apply_proj_borrows span true ctx owned value input_ty in
+              let loan:tavalue={ty=output_ty;value=ASymbolic(PNone,AProjLoans{
+                proj={sv_id=output.sv_id;proj_ty=output_ty};consumed=[];borrows=[]})} in
+              let owner={abs_id=RegionGroupId.Map.find g.id ids;kind=Identity;can_end=true;
+                parents=AbsId.Set.of_list(List.map (fun parent->RegionGroupId.Map.find parent ids) g.parents);
+                regions={owned};ended_subabs=AbsLevelSet.empty;avalues=[borrowed;loan];
+                cont=Some{input=Some(mk_etuple ~borrow_proj:false []);
+                  output=Some(mk_etuple ~borrow_proj:true [])}} in
+              Invariants.opt_type_check_abs span ctx owner;
+              owner) groups in
+            let ctx={ctx with env=List.map (fun owner->EAbs owner) owners @ ctx.env} in
+            let result=mk_tvalue_from_symbolic_value output in
+            let cc=synthesize_unary_op span ctx unop value
+              (mk_opt_place_from_op span op ctx) output None in
+            Some(result,ctx,cc))
+      | _ -> None)
+  | _ -> None
+
 let eval_unary_op_symbolic (config : config) (span : Meta.span) (unop : unop)
     (op : operand) (ctx : eval_ctx) :
     (tvalue, eval_error) result
@@ -789,6 +906,9 @@ let eval_unary_op_symbolic (config : config) (span : Meta.span) (unop : unop)
     * (SymbolicAst.expr -> SymbolicAst.expr) =
   (* Evaluate the operand *)
   let v, ctx, cc = eval_operand config span op ctx in
+  match shared_box_array_unsize span unop op ctx v with
+  | Some (result,ctx,cast_cc) -> (Ok result,ctx,cc_comp cc cast_cc)
+  | None ->
   (* There is a special case for casts which convert dyn traits (for instance:
      [Box<...>] to [Box<dyn ...>]) *)
   match unop with
@@ -989,6 +1109,15 @@ let eval_unary_op_symbolic (config : config) (span : Meta.span) (unop : unop)
             (* If the following function succeeds, then it means the cast is well-formed
            (otherwise it throws an exception) *)
             let _ = cast_unsize_to_modified_fields span ctx ty0 ty1 in
+            let erased = ref false in
+            let visitor = object
+              inherit [_] Types.iter_ty
+              method! visit_region () r = if r = RErased then erased := true
+            end in
+            visitor#visit_ty () ty1;
+            if !erased then
+              Printf.eprintf "UNSIZE_ERASED_RESULT source=%s\ntarget=%s\ninput=%s\n%!"
+                (Types.show_ty ty0) (Types.show_ty ty1) (Values.show_tvalue v);
             ty1
         | Cast (CastRawPtr (_, tgt_ty)), _ -> tgt_ty
         | _ ->

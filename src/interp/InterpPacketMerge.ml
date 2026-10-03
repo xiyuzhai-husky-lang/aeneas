@@ -17,42 +17,42 @@ let update_at i f xs = List.mapi (fun j x -> if i=j then f x else x) xs
 
 (** Following one explicit path preserves all untouched sibling and metadata
     objects. In particular, an ended ignored wrapper is not flattened. *)
-let rec replace_value path original (value:tavalue) : tavalue =
+let rec replace_value path marker original (value:tavalue) : tavalue =
   let changed = match path,value.value with
     | ["packet"],ASymbolic(pm,p) ->
-        require(pm=PNone && p==original)"selected projector identity/marker changed";
-        ASymbolic(pm,AEmpty)
+        require(pm=marker && p==original)"selected projector identity/marker changed";
+        ASymbolic(PNone,AEmpty)
     | "field"::n::tail,AAdt a ->
         let i=index n (List.length a.fields) in
-        AAdt {a with fields=update_at i (replace_value tail original) a.fields}
+        AAdt {a with fields=update_at i (replace_value tail marker original) a.fields}
     | "child"::tail,ABorrow(AMutBorrow(pm,id,c)) ->
-        ABorrow(AMutBorrow(pm,id,replace_value tail original c))
+        ABorrow(AMutBorrow(pm,id,replace_value tail marker original c))
     | "child"::tail,ABorrow(AIgnoredMutBorrow(id,c)) ->
-        ABorrow(AIgnoredMutBorrow(id,replace_value tail original c))
+        ABorrow(AIgnoredMutBorrow(id,replace_value tail marker original c))
     | "child"::tail,ABorrow(AEndedMutBorrow(m,c)) ->
-        ABorrow(AEndedMutBorrow(m,replace_value tail original c))
+        ABorrow(AEndedMutBorrow(m,replace_value tail marker original c))
     | "child"::tail,ABorrow(AEndedIgnoredMutBorrow b) ->
-        ABorrow(AEndedIgnoredMutBorrow {b with child=replace_value tail original b.child})
+        ABorrow(AEndedIgnoredMutBorrow {b with child=replace_value tail marker original b.child})
     | "given_back"::tail,ABorrow(AEndedIgnoredMutBorrow b) ->
-        ABorrow(AEndedIgnoredMutBorrow {b with given_back=replace_value tail original b.given_back})
+        ABorrow(AEndedIgnoredMutBorrow {b with given_back=replace_value tail marker original b.given_back})
     | "child"::tail,ALoan(AMutLoan(pm,id,c)) ->
-        ALoan(AMutLoan(pm,id,replace_value tail original c))
+        ALoan(AMutLoan(pm,id,replace_value tail marker original c))
     | "child"::tail,ALoan(ASharedLoan(pm,id,v,c)) ->
-        ALoan(ASharedLoan(pm,id,v,replace_value tail original c))
+        ALoan(ASharedLoan(pm,id,v,replace_value tail marker original c))
     | "child"::tail,ALoan(AIgnoredMutLoan(id,c)) ->
-        ALoan(AIgnoredMutLoan(id,replace_value tail original c))
+        ALoan(AIgnoredMutLoan(id,replace_value tail marker original c))
     | "child"::tail,ALoan(AIgnoredSharedLoan c) ->
-        ALoan(AIgnoredSharedLoan(replace_value tail original c))
+        ALoan(AIgnoredSharedLoan(replace_value tail marker original c))
     | "child"::tail,ALoan(AEndedSharedLoan(v,c)) ->
-        ALoan(AEndedSharedLoan(v,replace_value tail original c))
+        ALoan(AEndedSharedLoan(v,replace_value tail marker original c))
     | "child"::tail,ALoan(AEndedMutLoan b) ->
-        ALoan(AEndedMutLoan {b with child=replace_value tail original b.child})
+        ALoan(AEndedMutLoan {b with child=replace_value tail marker original b.child})
     | "given_back"::tail,ALoan(AEndedMutLoan b) ->
-        ALoan(AEndedMutLoan {b with given_back=replace_value tail original b.given_back})
+        ALoan(AEndedMutLoan {b with given_back=replace_value tail marker original b.given_back})
     | "child"::tail,ALoan(AEndedIgnoredMutLoan b) ->
-        ALoan(AEndedIgnoredMutLoan {b with child=replace_value tail original b.child})
+        ALoan(AEndedIgnoredMutLoan {b with child=replace_value tail marker original b.child})
     | "given_back"::tail,ALoan(AEndedIgnoredMutLoan b) ->
-        ALoan(AEndedIgnoredMutLoan {b with given_back=replace_value tail original b.given_back})
+        ALoan(AEndedIgnoredMutLoan {b with given_back=replace_value tail marker original b.given_back})
     | _ -> fail "selected path is not a typed projector root"
   in {value with value=changed}
 
@@ -60,7 +60,7 @@ let replace_root (owner:abs) (selected:P.packet) =
   match selected.at.surface,selected.at.path,selected.at.original with
   | P.A,"avalue"::n::tail,P.APacket original ->
       let i=index n (List.length owner.avalues) in
-      {owner with avalues=update_at i (replace_value tail original) owner.avalues}
+      {owner with avalues=update_at i (replace_value tail selected.marker original) owner.avalues}
   | _ -> fail "selected packet is not an owner A root"
 
 let same_original left right = match left,right with
@@ -128,10 +128,10 @@ let check_union_masks ctx (d:P.descriptor) owned =
     are used only to resolve the actual captured value; unrelated historical
     bindings are not promoted to current interfaces. This is a conservative
     admission check, not a proof of continuation effects. *)
-let check_child_e_boundary span ctx owners child_sid =
+let check_child_e_boundary ?current_env span ctx owners child_sid =
   let checks=ref 0 in
   let ignored_roots=ref [] in
-  let rec concrete snapshot ancestors bids (value:tvalue) =
+  let rec concrete snapshot marker ancestors bids (value:tvalue) =
     require(not(List.exists(fun x->x==value)ancestors))
       "cyclic captured value in child E boundary";
     let ancestors=value::ancestors in
@@ -140,15 +140,22 @@ let check_child_e_boundary span ctx owners child_sid =
         incr checks;
         require(s.sv_id<>child_sid)"cancelled child has a captured E value"
     | VLiteral _ | VBottom | VLoan(VMutLoan _) -> ()
-    | VAdt a -> List.iter(concrete snapshot ancestors bids)a.fields
+    | VAdt a -> List.iter(concrete snapshot marker ancestors bids)a.fields
     | VBorrow(VMutBorrow(_,v)) | VLoan(VSharedLoan(_,v)) ->
-        concrete snapshot ancestors bids v
+        concrete snapshot marker ancestors bids v
     | VBorrow(VSharedBorrow(bid,_) | VReservedMutBorrow(bid,_)) ->
         require(not(BorrowId.Set.mem bid bids))"cyclic captured shared borrow";
         let saved=match snapshot with Some env->env
           | None->fail "shared concrete metadata has no captured environment" in
-        let v=InterpBorrowsCore.lookup_shared_value span saved bid in
-        concrete snapshot ancestors (BorrowId.Set.add bid bids) v
+        let borrowed=match marker with
+          | None -> [None,InterpBorrowsCore.lookup_shared_value span saved bid]
+          | Some marker ->
+              InterpSharedPacketSignature.lookup_retained_shared_values_for_inventory_in_env
+                span ~type_infos:ctx.P.type_ctx.type_infos ~ended_regions:ctx.ended_regions
+                saved marker bid
+              |> List.map (fun (marker,value)->Some marker,value) in
+        List.iter (fun (marker,v)->
+          concrete snapshot marker ancestors (BorrowId.Set.add bid bids) v) borrowed
   in
   List.iter(fun owner ->
     let d=P.describe_owner ctx owner in
@@ -161,7 +168,7 @@ let check_child_e_boundary span ctx owners child_sid =
       require(m.sid<>child_sid)"cancelled child has current E history metadata"
     end)d.metadata;
     List.iter(fun (c:P.capture)->
-      concrete (Some c.snapshot) [] BorrowId.Set.empty c.value)d.captures;
+      concrete (Some c.snapshot) None [] BorrowId.Set.empty c.value)d.captures;
     (* These fields are opaque to generic visitors, but some ended-loan
        given-back values are consumed by the real Pure translation. Unlike
        captures, they carry no saved environment for shared dereferencing. *)
@@ -178,11 +185,43 @@ let check_child_e_boundary span ctx owners child_sid =
          wrapper and root position are preserved by this merge. This exemption
          does NOT cover ignored ADT fields or any ended-loan given-back value.
          Corresponding E captures, when present, are checked above. *)
-      if unused_root then ignored_roots:=m::!ignored_roots else
-      try concrete None [] BorrowId.Set.empty m.value
+      let unused_ignored_loan =
+        List.exists (fun (n:P.node) ->
+          n.surface=P.A && m.at.surface=P.A && n.level=m.at.level
+          && m.at.path=n.path@["given_back_meta"]
+          && match n.original with
+             | P.AValue {value=ALoan(AEndedIgnoredMutLoan ended);_} ->
+                 ended.given_back_meta==m.value
+             | _ -> false) d.nodes in
+      (* The native consumed and given-back translations of exactly
+         AEndedIgnoredMutLoan both ignore this metadata and traverse its two
+         child trees at their own levels (SymbolicToPureValues). Retain the
+         original field; do not resolve its historical shared borrows using
+         today's environment. Owned AEndedMutLoan metadata and every E capture
+         remain checked, as do all metadata nodes inside either child tree. *)
+      (* A current ASharedLoan payload is a runtime value, even though the
+         descriptor groups it with opaque concrete fields. Resolve only this
+         exact original payload in the complete current environment, retaining
+         every marked branch. Historical ended-loan fields still require their
+         own captured provenance and never fall back to today's environment. *)
+      let current_marker=List.find_map (fun (n:P.node)->
+        if n.surface=P.A && m.at.surface=P.A && n.level=m.at.level
+          && m.at.path=n.path@["shared_value"] then
+          match n.original with
+          | P.AValue {value=ALoan(ASharedLoan(marker,_,payload,_));_}
+            when payload==m.value -> Some marker
+          | _ -> None
+        else None) d.nodes in
+      if unused_root then ignored_roots:=m::!ignored_roots
+      else if unused_ignored_loan then ()
+      else
+      try (match current_marker,current_env with
+        | Some marker,Some env -> concrete (Some env) (Some marker) [] BorrowId.Set.empty m.value
+        | _ -> concrete None None [] BorrowId.Set.empty m.value)
       with Unsupported reason ->
         fail("owner"^AbsId.to_string owner.abs_id^"/"^
-          String.concat "/" m.at.path^": "^reason))d.concrete_metadata) owners;
+          String.concat "/" m.at.path^": "^reason
+          ^ "\noriginal concrete metadata: " ^ show_tvalue m.value))d.concrete_metadata) owners;
   !checks,List.rev !ignored_roots
 
 type prepared = {
@@ -205,11 +244,30 @@ type prepared = {
   removed_borrow_nodes : P.node list;
 }
 
-let prepare ?(with_abs_conts=true) span ~native_type_ctx (ctx:P.context) ~current_env ~supplied_env
+let prepare ?(with_abs_conts=true) ?(allow_marked=false) span ~native_type_ctx (ctx:P.context) ~current_env ~supplied_env
     ~fixed_aids ~loan_owner ~loan_path ~borrow_owner ~borrow_path =
-  let closure=C.check span ~native_type_ctx ctx ~current_env ~supplied_env
+  let closure=C.check ~allow_marked span ~native_type_ctx ctx ~current_env ~supplied_env
     ~fixed_aids ~loan_owner ~loan_path ~borrow_owner ~borrow_path in
-  require closure.closed_in_supplied_current_environment "external packet permission closure failed";
+  if not closure.closed_in_supplied_current_environment then begin
+    let occurrence (o:C.occurrence) =
+      "owner" ^ AbsId.to_string o.owner.abs_id ^ "/" ^ String.concat "/" o.path
+      ^ " level=" ^ string_of_int o.level
+      ^ " sid=" ^ SymbolicValueId.to_string o.sid
+      ^ " polarity=" ^ (match o.polarity with P.Loan->"loan"|P.Borrow->"borrow"|P.Empty->"empty")
+      ^ " owned=" ^ RegionId.Set.to_string None o.owner.regions.owned
+      ^ "\n" ^ show_ty o.ty in
+    let selected_root (owner:abs) path =
+      "owner" ^ AbsId.to_string owner.abs_id ^ "/" ^ String.concat "/" path
+      ^ "\n" ^ show_aproj (P.original_ap (P.find_packet (P.describe_owner ctx owner) path)) in
+    fail ("external packet permission closure failed\nissues:\n"
+      ^ String.concat "\n" closure.issues
+      ^ "\nrequested loan: " ^ selected_root loan_owner loan_path
+      ^ "\nrequested borrow: " ^ selected_root borrow_owner borrow_path
+      ^ "\nselected occurrences:\n" ^ String.concat "\n" (List.map occurrence closure.selected)
+      ^ "\nexternal occurrences:\n" ^ String.concat "\n" (List.map occurrence closure.external_permissions)
+      ^ "\nruntime dependencies:\n" ^ String.concat "\n"
+          (List.map (fun (r:C.runtime)->r.path ^ "\n" ^ show_tvalue r.value) closure.runtime_dependencies))
+  end;
   let plan=match closure.plan with Some x->x | None->fail "missing recomputed packet plan" in
   List.iter(fun (owner:abs)->
     require(AbsLevelSet.is_empty owner.ended_subabs)"owner has recorded ended sublevels";
@@ -219,13 +277,27 @@ let prepare ?(with_abs_conts=true) span ~native_type_ctx (ctx:P.context) ~curren
     if with_abs_conts then
       require(Option.is_some owner.cont)"packet synthesis merge requires both original continuations")
     [loan_owner;borrow_owner];
-  require(RegionId.Set.is_empty(RegionId.Set.inter loan_owner.regions.owned borrow_owner.regions.owned))
-    "merged owners have overlapping native owned regions";
-  let (left,right),(child,_) = match plan.paired with [p;c] -> p,c
-    | _->fail "not a two-level complementary packet" in
-  let child_sid=match child.sid with Some x->x | None->fail "child has no SID" in
-  let child_e_checks,ignored_root_metadata=
-    check_child_e_boundary span ctx closure.owners child_sid in
+  let marked_shared_packet = allow_marked && plan.paired<>[]
+    && List.for_all (fun ((left:P.packet),(right:P.packet)) ->
+      left.marker<>PNone && left.marker=right.marker
+      && not left.typ.owned_mutable && not right.typ.owned_mutable) plan.paired in
+  (* The checked planner admits an ordinary edge or its complete ordered
+     reciprocal history tree. Each endpoint retains its branch identity;
+     closure covers every selected SID. Owned sets are masks, so the native union is allowed
+     only after checking every retained A/E mask below. *)
+  require(RegionId.Set.is_empty(RegionId.Set.inter loan_owner.regions.owned borrow_owner.regions.owned)
+    || marked_shared_packet)
+    "merged owners have overlapping native owned regions outside marked shared cancellation";
+  let (left,right),children = match plan.paired with
+    | parent::children -> parent,children
+    | []->fail "empty complementary packet" in
+  let child_e_checks,ignored_root_metadata =
+    List.fold_left (fun (checks,ignored) ((child:P.packet),_) ->
+      let child_sid=match child.sid with Some x->x | None->fail "child has no SID" in
+      let more,metadata=check_child_e_boundary ~current_env span ctx closure.owners child_sid in
+      checks+more,List.fold_left (fun kept m ->
+        if List.exists (fun original -> original==m) kept then kept else kept@[m])
+        ignored metadata) (0,[]) children in
   let edited_left=replace_root loan_owner left and edited_right=replace_root borrow_owner right in
   let ld=P.describe_owner ctx edited_left and bd=P.describe_owner ctx edited_right in
   check_conservation plan.loan_descriptor ld loan_path;

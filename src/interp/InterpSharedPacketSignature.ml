@@ -33,9 +33,106 @@ let needs_explicit_signature (owner : abs) =
     method! visit_AProjSharedBorrow () borrows =
       if borrows <> [] then needed := true;
       super#visit_AProjSharedBorrow () borrows
+    method! visit_AIgnoredMutBorrow () bid child =
+      if Option.is_some bid then needed := true;
+      super#visit_AIgnoredMutBorrow () bid child
+    method! visit_aloan_content () loan =
+      (match loan with AEndedIgnoredMutLoan _ | AIgnoredMutLoan (Some _,_) -> needed := true | _ -> ());
+      super#visit_aloan_content () loan
   end in
   List.iter (visitor#visit_tavalue ()) owner.avalues;
   !needed
+
+(** Ended ignored mutable loans retain two distinct sub-abstraction levels.
+    This traversal locates only concrete leaves under their original ADT fields;
+    it never visits synthesis metadata or turns the two levels into one edge. *)
+let retained_ended_shared_leaf_location (owner : abs) path level (value : tavalue) =
+  let rec visit current current_level origin (v : tavalue) =
+    if current = path && current_level = level && v = value then
+      match v.value with
+      | ALoan (ASharedLoan _ | AEndedSharedLoan _)
+      | ABorrow (ASharedBorrow _ | AEndedSharedBorrow) -> origin
+      | _ -> None
+    else
+      match v.value with
+      | AAdt a ->
+          List.find_map (fun (i, field) ->
+            visit (current @ ["field"; string_of_int i]) current_level origin field)
+            (List.mapi (fun i field -> (i, field)) a.fields)
+      | ALoan (AEndedIgnoredMutLoan ended) ->
+          (match visit (current @ ["child"]) current_level
+                   (Some (current, current_level, false)) ended.child with
+          | Some _ as found -> found
+          | None -> visit (current @ ["given_back"]) (current_level + 1)
+              (Some (current, current_level, true)) ended.given_back)
+      | _ -> None
+  in
+  List.find_map (fun (i, root) -> visit ["avalue"; string_of_int i] 0 None root)
+    (List.mapi (fun i root -> (i, root)) owner.avalues)
+
+let has_retained_ended_mut_loan (owner : abs) =
+  let found = ref false in
+  let visitor = object
+    inherit [_] iter_tavalue as super
+    method! visit_aloan_content () loan =
+      (match loan with AEndedIgnoredMutLoan _ -> found := true | _ -> ());
+      super#visit_aloan_content () loan
+  end in
+  List.iter (visitor#visit_tavalue ()) owner.avalues;
+  !found
+
+(** Keep a tracked parent-return subscription even after its child becomes
+    empty. It is not itself a cancellable borrow permission. *)
+let has_retained_ignored_mut_wrapper (owner : abs) =
+  let found = ref false in
+  let visitor = object
+    inherit [_] iter_tavalue as super
+    method! visit_AIgnoredMutBorrow () bid child =
+      if Option.is_some bid then found := true;
+      super#visit_AIgnoredMutBorrow () bid child
+    method! visit_AIgnoredMutLoan () bid child =
+      if Option.is_some bid then found := true;
+      super#visit_AIgnoredMutLoan () bid child
+  end in
+  List.iter (visitor#visit_tavalue ()) owner.avalues;
+  !found
+
+(** Locate an intact native shared-loan leaf through native ADT fields and
+    at most one ignored shared-loan wrapper. Both preserve the native level;
+    the ignored outer reference carries no concrete permission of its own.
+    Never traverse another loan/borrow wrapper or synthesis metadata. *)
+let retained_adt_shared_loan_root (owner : abs) path level (value : tavalue) =
+  let rec contains current ignored_wrapper (v : tavalue) =
+    if current = path && v == value then
+      (match v.value with ALoan (ASharedLoan _ | AEndedSharedLoan _) -> true | _ -> false)
+    else match v.value with
+      | AAdt adt -> List.exists (fun (i, field) ->
+          contains (current @ ["field"; string_of_int i]) ignored_wrapper field)
+          (List.mapi (fun i field -> i,field) adt.fields)
+      | ALoan (AIgnoredSharedLoan child) when not ignored_wrapper ->
+          contains (current @ ["child"]) true child
+      | _ -> false
+  in
+  if level <> 0 then None
+  else List.find_map (fun (i, (root : tavalue)) -> match root.value with
+    | AAdt _ | ALoan (AIgnoredSharedLoan _) ->
+        if contains ["avalue"; string_of_int i] false root then Some root else None
+    | _ -> None) (List.mapi (fun i root -> i,root) owner.avalues)
+
+let retained_shared_leaf_path span ctx (owner : abs) path level value =
+  match path with
+  | ["avalue"; _] -> level = 0
+  | _ ->
+      if Option.is_some (retained_ended_shared_leaf_location owner path level value) then true
+      else match retained_adt_shared_loan_root owner path level value with
+        | None -> false
+        | Some root ->
+            (* Check the complete original wrapper tree, including its native
+               variant, ignored reference and every field. The leaf's permission and
+               referent checks still run in the caller; no node is rewritten. *)
+            (Invariants.check_typing_invariant_visitor span ctx false)#visit_abs None
+              {owner with avalues=[root];cont=None};
+            true
 
 (** The native declaration/type-analysis universe is the immutable universe of
     the executing compiler. This is the existing native/opaque-library trust
@@ -137,65 +234,387 @@ let check_shared_reborrow span (ctx : eval_ctx) (owner : abs) level
   require span (not info.contains_nested_mut)
     "nested mutable shared reborrow is unsupported"
 
+(** Inspection-only loan lookup in a join context. Native operational lookup
+    rejects every marked loan it traverses, even an unrelated one. Inventory
+    current A/concrete loans with their own marker and native sublevel instead;
+    metadata and E continuations are deliberately not current loan sources. *)
+let collect_retained_shared_values ?(include_both_markers=false) span ~type_infos ~ended_regions env marker bid =
+  let candidates = ref [] in
+  let remember (owner,level,_) loan_marker lid (shared : tvalue option) =
+    if lid=bid && (loan_marker=marker || loan_marker=PNone
+      || (include_both_markers && marker=PNone)) then begin
+      Option.iter (fun (owner:abs) ->
+        require span (not (AbsLevelSet.mem level owner.ended_subabs))
+          "retained shared borrow resolves to a loan at an ended level";
+        (* Native concrete shared permission is represented by its loan ID.
+           A branch union can mark the ghost outer region ended on the other
+           side. Borrow-free payloads contain no symbolic region permission;
+           borrowed referents retain the stricter existing lifetime boundary. *)
+        let borrow_free=match shared with
+          | Some value -> not (TypesUtils.ty_has_borrows (Some span) type_infos value.ty)
+          | None -> false in
+        require span (borrow_free || RegionId.Set.is_empty
+          (RegionId.Set.inter owner.regions.owned ended_regions))
+          "retained borrowed shared value resolves to ended owned regions") owner;
+      candidates := (loan_marker,shared) :: !candidates
+    end
+  in
+  let visitor = object (self)
+    inherit [_] InterpBorrowsCore.iter_tavalue_with_levels as super
+    method incr_level (owner,level,marker) = owner,level+1,marker
+    method! visit_AMutLoan state loan_marker lid child =
+      remember state loan_marker lid None;
+      self#visit_tavalue state child
+    method! visit_ASharedLoan ((owner,level,_) as state) loan_marker lid shared child =
+      remember state loan_marker lid (Some shared);
+      self#visit_tvalue (owner,level,loan_marker) shared;
+      self#visit_tavalue state child
+    method! visit_VMutLoan ((_,_,loan_marker) as state) lid =
+      remember state loan_marker lid None
+    method! visit_VSharedLoan ((_,_,loan_marker) as state) lid shared =
+      remember state loan_marker lid (Some shared);
+      super#visit_VSharedLoan state lid shared
+  end in
+  List.iter (function
+    | EAbs owner ->
+        List.iter (visitor#visit_tavalue (Some owner,0,PNone)) owner.avalues
+    | EBinding (_,value) -> visitor#visit_tvalue (None,0,PNone) value
+    | EFrame -> ()) env;
+  !candidates
+
+let lookup_retained_shared_value_in_env ?(allow_joined_typing=false) span
+    ~type_infos ~ended_regions env marker bid =
+  let candidates=collect_retained_shared_values ~include_both_markers:allow_joined_typing
+    span ~type_infos ~ended_regions env marker bid in
+  match candidates with
+  | [loan_marker,Some shared] when loan_marker=marker || loan_marker=PNone -> shared
+  | [(PLeft,Some left);(PRight,Some right)]
+  | [(PRight,Some right);(PLeft,Some left)]
+    when allow_joined_typing && marker=PNone && equal_tvalue left right -> left
+  | _ ->
+      let all=collect_retained_shared_values ~include_both_markers:true
+        span ~type_infos ~ended_regions env PNone bid in
+      let describe (marker,payload)=show_proj_marker marker ^ ": "
+        ^ (match payload with None -> "mutable loan" | Some value -> show_tvalue value) in
+      reject span ("retained shared borrow needs one compatible current shared loan: marker="
+        ^ show_proj_marker marker ^ " loan=" ^ BorrowId.to_string bid
+        ^ " candidates=" ^ string_of_int (List.length candidates)
+        ^ "\nall original current loan candidates:\n" ^ String.concat "\n" (List.map describe all))
+
+(** Complete read-only dependency inventory during a native join. An
+    unmarked concrete borrow can refer to the original shared value on each
+    branch. Return both original values with their branch identity; unlike a
+    typing reader, this API must not select a representative and hide the
+    other branch's runtime dependencies. Every candidate retains the same
+    native owner/sublevel checks as the strict single-value lookup. *)
+let lookup_retained_shared_values_for_inventory_in_env span
+    ~type_infos ~ended_regions env marker bid =
+  let candidates=collect_retained_shared_values ~include_both_markers:true
+    span ~type_infos ~ended_regions env marker bid in
+  match candidates with
+  | [loan_marker,Some shared] when loan_marker=marker || loan_marker=PNone ->
+      [marker,shared]
+  | [(PLeft,Some left);(PRight,Some right)]
+  | [(PRight,Some right);(PLeft,Some left)]
+    when marker=PNone && equal_ty left.ty right.ty
+      && not (TypesUtils.ty_has_borrows (Some span) type_infos left.ty) ->
+      [PLeft,left;PRight,right]
+  | _ ->
+      (* Preserve the strict reader's exact failure for every other shape. *)
+      [marker,lookup_retained_shared_value_in_env span
+        ~type_infos ~ended_regions env marker bid]
+
+let lookup_retained_shared_value span (ctx : eval_ctx) marker bid =
+  lookup_retained_shared_value_in_env span ~type_infos:ctx.type_ctx.type_infos
+    ~ended_regions:ctx.ended_regions ctx.env marker bid
+
+(** A borrowed shared referent can stay symbolic when its live shared regions
+    belong entirely outside this owner. Keep its original SID and full native
+    type: runtime inventory still observes it, and union-mask checks see the
+    same regions in the enclosing reference type. No hidden permission becomes
+    an ordinary packet root or is silently expanded/copied here. *)
+let check_retained_shared_referent ~marker span (ctx : eval_ctx) (owner : abs)
+    referent (shared : tvalue) =
+  if TypesUtils.ty_has_borrows (Some span) ctx.type_ctx.type_infos referent then (
+    let checked condition message =
+      if not condition then reject span
+        (message ^ "\nreferent: " ^ InterpUtils.ty_to_string ctx referent
+         ^ "\nshared payload: " ^ InterpUtils.tvalue_to_string ctx shared
+         ^ "\n" ^ InterpUtils.abs_to_string span ~with_ended:true ctx owner)
+    in
+    checked (equal_ty shared.ty (Substitute.erase_regions referent))
+      "borrowed shared referent has a different erased type";
+    check_type span ctx owner referent;
+    let info = TypesAnalysis.analyze_ty (Some span) ctx.type_ctx.type_infos referent in
+    checked (not (info.contains_mut_borrow || info.contains_static))
+      "borrowed shared referent is not entirely shared and nonstatic";
+    let regions = TypesUtils.ty_regions referent in
+    checked (RegionId.Set.is_empty (RegionId.Set.inter regions ctx.ended_regions))
+      "borrowed shared referent contains an ended region";
+    checked (RegionId.Set.is_empty (RegionId.Set.inter regions owner.regions.owned))
+      "borrowed shared referent contains an owner region";
+    match shared.value,referent with
+    | VSymbolic symbolic,_ ->
+        checked (equal_ty symbolic.sv_ty referent)
+          "borrowed shared symbolic referent has a different full native type"
+    | VBorrow(VSharedBorrow(bid,_)),TRef(RVar(Free _),target,RShared) ->
+        (* This is a real current permission, not ignored metadata. Its
+           original ID is indexed under the enclosing loan's marker; runtime
+           closure follows this very borrow to its original current payload. *)
+        checked (not (TypesUtils.ty_has_borrows (Some span) ctx.type_ctx.type_infos target))
+          "retained shared-reference payload has a nested target";
+        let borrowed=lookup_retained_shared_values_for_inventory_in_env span
+          ~type_infos:ctx.type_ctx.type_infos ~ended_regions:ctx.ended_regions
+          ctx.env marker bid in
+        (* After joining the outer loan, its unmarked payload can still have
+           both original inner loan branches. Inspect every original value;
+           never choose a representative or weaken operational lookup. *)
+        List.iter (fun (_,(borrowed:tvalue)) ->
+          checked (equal_ty borrowed.ty (Substitute.erase_regions target))
+            "retained shared-reference payload disagrees with its current loan";
+          checked (not (InterpUtils.tvalue_has_loans_or_borrows (Some span) ctx borrowed))
+            "retained shared-reference target contains concrete permissions") borrowed
+    | _ -> checked false "borrowed shared referent is neither exact symbolic nor a direct shared reference")
+
+let retained_shared_payload_has_only_checked_permission (shared:tvalue) =
+  match shared.value with VBorrow(VSharedBorrow _) -> true | _ -> false
+
+(** Read-only typing of a current concrete binding during a native join.
+    An unmarked runtime borrow can have one original loan on each branch.
+    Admit only the complete, unique Left/Right pair with exactly equal full
+    payloads and types; the collector checks each original owner and level.
+    No single marked loan, mutable loan, or additional occurrence is accepted.
+    Operational/inventory callers retain the strict lookup above. *)
+let lookup_retained_shared_value_for_typing span (ctx : eval_ctx) marker bid =
+  lookup_retained_shared_value_in_env ~allow_joined_typing:true span
+    ~type_infos:ctx.type_ctx.type_infos ~ended_regions:ctx.ended_regions
+    ctx.env marker bid
+
+(** Type-only inspection of the complete native join relation. A current
+    unmarked borrow may refer to different branch values (for example Nil and
+    Cons). For a unique Left/Right pair, only their common borrow-free type is
+    returned. No payload is selected, joined, or made available to the caller;
+    ordinary permission lookup and native value joining remain unchanged. *)
+let lookup_retained_shared_type_for_typing span (ctx : eval_ctx) marker bid : ty =
+  let candidates=collect_retained_shared_values ~include_both_markers:true span
+    ~type_infos:ctx.type_ctx.type_infos ~ended_regions:ctx.ended_regions
+    ctx.env marker bid in
+  match candidates with
+  | [loan_marker,Some shared] when loan_marker=marker || loan_marker=PNone -> shared.ty
+  | [(PLeft,Some left);(PRight,Some right)]
+  | [(PRight,Some right);(PLeft,Some left)]
+    when marker=PNone && equal_ty left.ty right.ty
+      && not (TypesUtils.ty_has_borrows (Some span) ctx.type_ctx.type_infos left.ty) -> left.ty
+  | _ ->
+      reject span ("typing needs one compatible shared loan or a complete borrow-free branch pair: marker="
+        ^ show_proj_marker marker ^ " loan=" ^ BorrowId.to_string bid
+        ^ " candidates=" ^ string_of_int (List.length candidates))
+
+(** Exact UMut lookup for transient invariant checking. Unrelated marked
+    shared borrows are traversed as ordinary current nodes, never mistaken for
+    the requested mutable permission. The returned type is taken from its
+    original payload; metadata/captured environments are not candidate sources. *)
+let lookup_retained_mut_borrow_type span (ctx : eval_ctx) marker bid =
+  let candidates = ref [] in
+  let remember (owner,level,_) borrow_marker id ty =
+    if id=bid && (borrow_marker=marker || borrow_marker=PNone) then begin
+      Option.iter (fun (owner:abs) ->
+        require span (not (AbsLevelSet.mem level owner.ended_subabs))
+          "mutable loan resolves to a borrow at an ended level";
+        require span (RegionId.Set.is_empty
+          (RegionId.Set.inter owner.regions.owned ctx.ended_regions))
+          "mutable loan resolves to a borrow with ended owned regions") owner;
+      candidates := ty :: !candidates
+    end in
+  let visitor = object (self)
+    inherit [_] InterpBorrowsCore.iter_tavalue_with_levels as super
+    method incr_level (owner,level,marker) = owner,level+1,marker
+    method! visit_AMutBorrow state borrow_marker id (child : tavalue) =
+      remember state borrow_marker id (Substitute.erase_regions child.ty);
+      self#visit_tavalue state child
+    method! visit_ASharedLoan ((owner,level,_) as state) loan_marker _ shared child =
+      self#visit_tvalue (owner,level,loan_marker) shared;
+      self#visit_tavalue state child
+    method! visit_VMutBorrow ((_,_,borrow_marker) as state) id (child : tvalue) =
+      remember state borrow_marker id child.ty;
+      super#visit_VMutBorrow state id child
+  end in
+  List.iter (function
+    | EAbs owner -> List.iter (visitor#visit_tavalue (Some owner,0,PNone)) owner.avalues
+    | EBinding (_,value) -> visitor#visit_tvalue (None,0,PNone) value
+    | EFrame -> ()) ctx.env;
+  match !candidates with
+  | [ty] -> ty
+  | _ -> reject span ("mutable loan needs one compatible current UMut borrow: marker="
+      ^ show_proj_marker marker ^ " borrow=" ^ BorrowId.to_string bid
+      ^ " candidates=" ^ string_of_int (List.length !candidates))
+
 (** Retain an ordinary shared borrow independently of symbolic packet roots.
-    The initial supported case has no borrowed data inside its referent; the
-    native loan lookup and the original shared-borrow ID remain authoritative. *)
-let check_retained_shared_borrow span (ctx : eval_ctx) (owner : abs) level
+    Borrowed referents remain exact symbolic values over other live shared
+    regions; native loan lookup and the shared-borrow ID stay authoritative. *)
+let check_retained_shared_borrow ?(allow_marked=false) span (ctx : eval_ctx) (owner : abs) level
     (value : tavalue) =
-  require span (level = 0 && not (AbsLevelSet.mem level owner.ended_subabs))
-    "retained concrete shared borrow is not at a live root level";
-  require span
-    (RegionId.Set.is_empty (RegionId.Set.inter owner.regions.owned ctx.ended_regions))
-    "retained concrete shared borrow has an ended owned region";
+  require span (not (AbsLevelSet.mem level owner.ended_subabs))
+    "retained concrete shared borrow is not at a live sub-abstraction level";
   match value.value, value.ty with
-  | ABorrow (ASharedBorrow (PNone, bid, _)),
-    TRef (RVar (Free region), referent, RShared) ->
+  | ABorrow (ASharedBorrow (marker, bid, _)),
+    TRef (RVar (Free region), referent, RShared) when allow_marked || marker=PNone ->
       require span (RegionId.Set.mem region owner.regions.owned)
         "retained shared borrow does not own its reference region";
+      (* For a borrow-free referent, native current concrete IDs and the
+         unended sublevel determine the permission. The outer region is ghost
+         type evidence and can be ended in the other joined branch. *)
+      require span (not (TypesUtils.ty_has_borrows (Some span) ctx.type_ctx.type_infos referent)
+        || RegionId.Set.is_empty (RegionId.Set.inter owner.regions.owned ctx.ended_regions))
+        "retained borrowed shared referent has an ended owned region";
       check_type span ctx owner value.ty;
-      require span
-        (not (TypesUtils.ty_has_borrows (Some span) ctx.type_ctx.type_infos referent))
-        "retained shared borrow has borrowed data in its referent";
-      let shared = InterpBorrowsCore.lookup_shared_value span ctx.env bid in
+      let shared =
+        if allow_marked then lookup_retained_shared_value span ctx marker bid
+        else InterpBorrowsCore.lookup_shared_value span ctx.env bid in
+      check_retained_shared_referent ~marker span ctx owner referent shared;
       require span (equal_ty shared.ty (Substitute.erase_regions referent))
         "retained shared borrow disagrees with its native loan type";
-      require span (not (InterpUtils.tvalue_has_loans_or_borrows (Some span) ctx shared))
+      require span (retained_shared_payload_has_only_checked_permission shared
+        || not (InterpUtils.tvalue_has_loans_or_borrows (Some span) ctx shared))
         "retained shared borrow referent has concrete permissions";
-      (Invariants.check_typing_invariant_visitor span ctx true)#visit_abs None
+      (* The only optional native lookup on this leaf is the same erased-type
+         check above. Avoid repeating its marker-blind lookup during inspection;
+         all native local typing/ownership checks still run on the original leaf. *)
+      (Invariants.check_typing_invariant_visitor span ctx (not allow_marked))#visit_abs None
         { owner with avalues = [value]; cont = None }
   | _ -> reject span "retained concrete borrow is not an unmarked shared reference"
 
 (** Concrete shared loans in a packet owner remain ordinary native loans.
-    Restrict the retained leaf to borrow-free data and an ignored child. *)
-let check_retained_shared_loan span (ctx : eval_ctx) (owner : abs) level
+    Retain an ignored child and either borrow-free data or the exact external
+    symbolic shared referent admitted above. *)
+let check_retained_shared_loan ?(allow_marked=false) span (ctx : eval_ctx) (owner : abs) level
     (value : tavalue) =
-  require span (level = 0 && not (AbsLevelSet.mem level owner.ended_subabs))
-    "retained concrete shared loan is not at a live root level";
-  require span
-    (RegionId.Set.is_empty (RegionId.Set.inter owner.regions.owned ctx.ended_regions))
-    "retained concrete shared loan has an ended owned region";
+  require span (not (AbsLevelSet.mem level owner.ended_subabs))
+    "retained concrete shared loan is not at a live sub-abstraction level";
   match value.value, value.ty with
-  | ALoan (ASharedLoan (PNone, _, shared, child)),
-    TRef (RVar (Free region), referent, RShared) ->
+  | ALoan (ASharedLoan (marker, _, shared, child)),
+    TRef (RVar (Free region), referent, RShared) when allow_marked || marker=PNone ->
       require span (RegionId.Set.mem region owner.regions.owned)
         "retained shared loan does not own its reference region";
+      (* For a borrow-free referent, native current concrete IDs and the
+         unended sublevel determine the permission. The outer region is ghost
+         type evidence and can be ended in the other joined branch. *)
+      require span (not (TypesUtils.ty_has_borrows (Some span) ctx.type_ctx.type_infos referent)
+        || RegionId.Set.is_empty (RegionId.Set.inter owner.regions.owned ctx.ended_regions))
+        "retained borrowed shared referent has an ended owned region";
       check_type span ctx owner value.ty;
-      require span
-        (not (TypesUtils.ty_has_borrows (Some span) ctx.type_ctx.type_infos referent))
-        "retained shared loan has borrowed data in its referent";
+      check_retained_shared_referent ~marker span ctx owner referent shared;
       require span (equal_ty shared.ty (Substitute.erase_regions referent)
         && equal_ty child.ty referent)
         "retained shared loan payload type mismatch";
       require span (match child.value with AIgnored _ -> true | _ -> false)
         "retained concrete shared loan has a nonignored child";
-      require span (not (InterpUtils.tvalue_has_loans_or_borrows (Some span) ctx shared))
+      require span (retained_shared_payload_has_only_checked_permission shared
+        || not (InterpUtils.tvalue_has_loans_or_borrows (Some span) ctx shared))
         "retained shared loan referent has concrete permissions";
-      (Invariants.check_typing_invariant_visitor span ctx true)#visit_abs None
+      (* The strict read-only lookup above checks the inner permission in
+         marked contexts; repeat all native local type checks on the real tree. *)
+      (Invariants.check_typing_invariant_visitor span ctx (not allow_marked))#visit_abs None
         { owner with avalues = [value]; cont = None }
   | _ -> reject span "retained concrete loan is not an unmarked shared reference"
 
-let check span (ctx : eval_ctx) (owner : abs) : certificate =
+(** Some bid is the native parent-return notification from apply_proj_borrows,
+    not another UMut borrow. Validate the original parent permission and loan;
+    retain the ID, wrapper and parent edges for give_back_value's A/E transition. *)
+let check_tracked_ignored_mut ?(allow_marked=false) ~is_borrow span (ctx : eval_ctx)
+    (owner : abs) level bid ty child_ty =
+  let checked condition message = require span condition
+      (message ^ " (tracked reference=" ^ BorrowId.to_string bid
+       ^ ", owner=" ^ AbsId.to_string owner.abs_id ^ ")") in
+  let outer, target = match ty with
+    | TRef (RVar (Free outer), target, RMut) -> outer,target
+    | _ -> reject span "tracked ignored reference needs its native mutable-reference type" in
+  check_type span ctx owner ty;
+  checked (equal_ty target child_ty) "tracked ignored reference child type changed";
+  checked (not (RegionId.Set.mem outer owner.regions.owned))
+    "tracked ignored reference owns its outer region";
+  checked (TypesUtils.ty_has_regions_in_set owner.regions.owned target)
+    "tracked ignored reference referent has no owned projection";
+  checked (not (AbsLevelSet.mem level owner.ended_subabs)
+    && RegionId.Set.is_empty (RegionId.Set.inter (TypesUtils.ty_regions ty) ctx.ended_regions))
+    "tracked ignored reference contains an ended level or region";
+  let rec ancestors seen pending = match pending with
+    | [] -> seen
+    | id::rest when AbsId.Set.mem id seen -> ancestors seen rest
+    | id::rest ->
+        let parent = match ctx_lookup_abs_opt ctx id with
+          | Some parent -> parent | None -> reject span "tracked ignored reference parent is absent" in
+        ancestors (AbsId.Set.add id seen) (AbsId.Set.elements parent.parents @ rest) in
+  let ancestors = ancestors AbsId.Set.empty (AbsId.Set.elements owner.parents) in
+  let parents = ref [] in
+  AbsId.Set.iter (fun id ->
+    let parent=ctx_lookup_abs ctx id in
+    let visitor=object
+      inherit [_] InterpBorrowsCore.iter_tavalue_with_levels as super
+      method incr_level level = level+1
+      method! visit_tavalue level (value : tavalue) =
+        (match value.value with
+        | ABorrow (AMutBorrow (marker,id,_)) when is_borrow && id=bid ->
+            checked (allow_marked || marker=PNone) "marked parent borrow is unsupported";
+            checked (equal_ty value.ty ty && RegionId.Set.mem outer parent.regions.owned
+              && not (AbsLevelSet.mem level parent.ended_subabs))
+              "tracked ignored reference disagrees with its live parent permission";
+            parents := marker :: !parents
+        | ALoan (AMutLoan (marker,id,_)) when not is_borrow && id=bid ->
+            checked (allow_marked || marker=PNone) "marked parent loan is unsupported";
+            checked (equal_ty value.ty ty && RegionId.Set.mem outer parent.regions.owned
+              && not (AbsLevelSet.mem level parent.ended_subabs))
+              "tracked ignored loan disagrees with its live parent permission";
+            parents := marker :: !parents
+        | _ -> ());
+        super#visit_tavalue level value
+    end in List.iter (visitor#visit_tavalue 0) parent.avalues) ancestors;
+  let marker=match !parents with
+    | [marker] -> marker
+    | _ -> reject span ("tracked ignored reference needs one original parent mutable permission: "
+        ^ BorrowId.to_string bid ^ "\n" ^ InterpUtils.abs_to_string span ~with_ended:true ctx owner) in
+  let loans=ref 0 in
+  let remember (loan_owner,level) loan_marker id loan_ty =
+    if id=bid && (loan_marker=marker || loan_marker=PNone) then begin
+      checked (equal_ty loan_ty (Substitute.erase_regions target))
+        "tracked ignored reference disagrees with its mutable counterpart type";
+      Option.iter (fun (loan_owner:abs) ->
+        checked (not (AbsLevelSet.mem level loan_owner.ended_subabs)
+          && RegionId.Set.is_empty (RegionId.Set.inter loan_owner.regions.owned ctx.ended_regions))
+          "tracked ignored reference resolves to an ended mutable counterpart") loan_owner;
+      incr loans
+    end in
+  let visitor=object
+    inherit [_] InterpBorrowsCore.iter_tavalue_with_levels as super
+    method incr_level (owner,level) = owner,level+1
+    method! visit_AMutLoan state marker id (child:tavalue) =
+      if is_borrow then remember state marker id (Substitute.erase_regions child.ty);
+      super#visit_AMutLoan state marker id child
+    method! visit_AMutBorrow state marker id (child:tavalue) =
+      if not is_borrow then remember state marker id (Substitute.erase_regions child.ty);
+      super#visit_AMutBorrow state marker id child
+    method! visit_tvalue state (value:tvalue) =
+      (match value.value with
+      | VLoan (VMutLoan id) when is_borrow -> remember state PNone id value.ty
+      | VBorrow (VMutBorrow (id,child)) when not is_borrow -> remember state PNone id child.ty
+      | _ -> ());
+      super#visit_tvalue state value
+  end in
+  List.iter (function
+    | EAbs abs -> List.iter (visitor#visit_tavalue (Some abs,0)) abs.avalues
+    | EBinding (_,value) -> visitor#visit_tvalue (None,0) value
+    | EFrame -> ()) ctx.env;
+  checked (!loans=1) "tracked ignored reference needs one current mutable counterpart"
+
+let check_tracked_ignored_mut_borrow ?allow_marked =
+  check_tracked_ignored_mut ?allow_marked ~is_borrow:true
+
+let check_tracked_ignored_mut_loan ?allow_marked =
+  check_tracked_ignored_mut ?allow_marked ~is_borrow:false
+
+let check ?(allow_marked=false) span (ctx : eval_ctx) (owner : abs) : certificate =
   let slots = ref [] in
+  let current_value = ref None in
   (* Preserve the native classifier's per-top-root, per-level mixed-polarity
      rejection without calling a Pure module from the interpreter. *)
   let polarities = ref [] in
@@ -226,12 +645,13 @@ let check span (ctx : eval_ctx) (owner : abs) : certificate =
     let i = TypesAnalysis.analyze_ty (Some span) ctx.type_ctx.type_infos ty in
     require span (not i.contains_nested_mut) "nested mutable symbolic projection is unsupported"
   in
-  let live level =
+  let live level ty =
     require span (not (AbsLevelSet.mem level owner.ended_subabs))
       "active projector occurs at an ended level";
     require span
-      (RegionId.Set.is_empty (RegionId.Set.inter owner.regions.owned ctx.ended_regions))
-      "active projector has an ended owned region"
+      (RegionId.Set.is_empty (RegionId.Set.inter
+        (RegionId.Set.inter owner.regions.owned (TypesUtils.ty_regions ty)) ctx.ended_regions))
+      "active projector type has an ended owned region"
   in
   let rec history path level entries =
     List.iteri (fun i ((m : mconsumed_symb), child) ->
@@ -250,14 +670,14 @@ let check span (ctx : eval_ctx) (owner : abs) : certificate =
     match p with
     | AProjLoans p ->
         polarity level false;
-        own "live-loan-own-type" p.proj.sv_id p.proj.proj_ty; live level;
+        own "live-loan-own-type" p.proj.sv_id p.proj.proj_ty; live level p.proj.proj_ty;
         require span (TypesUtils.ty_has_regions_in_set owner.regions.owned p.proj.proj_ty)
           "active loan projector type contains no owned region";
         history (path @ ["consumed"]) level p.consumed;
         history (path @ ["borrows"]) level p.borrows
     | AProjBorrows p ->
         polarity level true;
-        own "live-borrow-own-type" p.proj.sv_id p.proj.proj_ty; live level;
+        own "live-borrow-own-type" p.proj.sv_id p.proj.proj_ty; live level p.proj.proj_ty;
         require span (TypesUtils.ty_has_free_regions p.proj.proj_ty)
           "active borrow projector type contains no free region";
         history (path @ ["loans"]) level p.loans
@@ -274,6 +694,7 @@ let check span (ctx : eval_ctx) (owner : abs) : certificate =
         history (path @ ["loans"]) level p.loans
     | AEmpty -> ()
   and avalue path level (v : tavalue) =
+    current_value := Some (path,level,v);
     typed path level "typed-wrapper" v.ty;
     match v.value with
     | AAdt a ->
@@ -281,18 +702,75 @@ let check span (ctx : eval_ctx) (owner : abs) : certificate =
            projected field representation, not a filtered Pure tuple. *)
         List.iteri (fun i f -> avalue (path @ ["field";string_of_int i]) level f) a.fields
     | AIgnored None -> ()
+    | AIgnored (Some ({value=VBorrow(VSharedBorrow _);_} as metadata))
+      when level=0 && (match path with ["avalue";_]->true|_->false) ->
+        (match v.ty with
+        | TRef (RVar(Free outer),referent,RShared) ->
+            require span (not (RegionId.Set.mem outer owner.regions.owned)
+              && not (TypesUtils.ty_has_borrows (Some span) ctx.type_ctx.type_infos referent))
+              "ignored root shared metadata contains an owned or nested reference"
+        | _ -> reject span "ignored shared metadata lost its full shared reference type");
+        require span (equal_ty metadata.ty (Substitute.erase_regions v.ty))
+          "ignored shared metadata disagrees with its native erased type";
+        (Invariants.check_typing_invariant_visitor span ctx false)#visit_tvalue None metadata;
+        (* Native top-root consumption uses filter=true, so AIgnored does not
+           read this historical borrow. Keep the original typed metadata; do
+           not perform a current-loan lookup or register it as a permission.
+           This rule deliberately excludes nested ADT fields, whose metadata
+           can be consumed with filter=false. *)
+        slots := {path=path@["ignored_metadata"];level;
+          role="ignored-root-shared-metadata";ty=metadata.ty} :: !slots
+    | AIgnored (Some metadata)
+      when not (TypesUtils.ty_has_borrows (Some span) ctx.type_ctx.type_infos v.ty) ->
+        require span (equal_ty metadata.ty (Substitute.erase_regions v.ty))
+          "ignored metadata disagrees with its native erased type";
+        (match metadata.value with
+        | VSymbolic symbolic ->
+            require span (equal_ty symbolic.sv_ty v.ty)
+              "ignored symbolic metadata disagrees with its full native type"
+        | _ -> ());
+        require span (not (InterpUtils.tvalue_has_loans_or_borrows (Some span) ctx metadata))
+          "ignored metadata contains current borrow/loan permissions";
+        (Invariants.check_typing_invariant_visitor span ctx false)#visit_tvalue None metadata;
+        (* Retain the original metadata as synthesis data, never a new current
+           permission or symbolic binding. The enclosing typed tree is unchanged. *)
+        slots := { path = path @ ["ignored_metadata"]; level;
+                   role = "ignored-concrete-metadata"; ty = metadata.ty } :: !slots
     | ASymbolic (pm,p) ->
-        require span (pm = PNone) "marked A projector is unsupported";
+        require span (allow_marked || pm = PNone) "marked A projector is unsupported";
         no_nested_mut v.ty;
         projector (path @ ["packet"]) level (Some v.ty) p
     | ALoan (ASharedLoan _) ->
-        require span (match path with ["avalue"; _] -> true | _ -> false)
-          "retained concrete shared loan must be a top-level root";
-        check_retained_shared_loan span ctx owner level v
+        require span (retained_shared_leaf_path span ctx owner path level v)
+          "retained concrete shared loan is outside a supported typed root";
+        check_retained_shared_loan ~allow_marked span ctx owner level v
     | ABorrow (ASharedBorrow _) ->
-        require span (match path with ["avalue"; _] -> true | _ -> false)
-          "retained concrete shared borrow must be a top-level root";
-        check_retained_shared_borrow span ctx owner level v
+        require span (retained_shared_leaf_path span ctx owner path level v)
+          "retained concrete shared borrow is outside a supported typed root";
+        check_retained_shared_borrow ~allow_marked span ctx owner level v
+    | ABorrow AEndedSharedBorrow ->
+        require span (retained_shared_leaf_path span ctx owner path level v)
+          "ended shared borrow is outside a supported typed root";
+        (match v.ty with
+        | TRef (RVar (Free region), _, RShared) ->
+            require span (RegionId.Set.mem region owner.regions.owned)
+              "ended shared borrow does not own its original reference region"
+        | _ -> reject span "ended shared borrow lost its native reference type")
+    | ALoan (AEndedSharedLoan (shared,child)) ->
+        require span (retained_shared_leaf_path span ctx owner path level v)
+          "ended shared loan is outside a supported typed root";
+        (match v.ty with
+        | TRef (RVar (Free region), referent, RShared) ->
+            require span (RegionId.Set.mem region owner.regions.owned)
+              "ended shared loan does not own its original reference region";
+            require span (equal_ty shared.ty (Substitute.erase_regions referent)
+              && equal_ty child.ty referent
+              && (match child.value with AIgnored _ -> true | _ -> false))
+              "ended shared loan changed its original payload or child type";
+            require span (not (TypesUtils.ty_has_borrows (Some span) ctx.type_ctx.type_infos referent)
+              && not (InterpUtils.tvalue_has_loans_or_borrows (Some span) ctx shared))
+              "ended retained shared loan has a borrowed referent"
+        | _ -> reject span "ended shared loan lost its native reference type")
     | ABorrow (AProjSharedBorrow borrows) ->
         (match v.ty with
         | TRef (RVar (Free outer), _, RShared) ->
@@ -319,9 +797,32 @@ let check span (ctx : eval_ctx) (owner : abs) : certificate =
           b.given_back_meta.sv_id b.given_back_meta.sv_ty;
         avalue (path @ ["child"]) level b.child;
         avalue (path @ ["given_back"]) (level + 1) b.given_back
+    | ABorrow (AIgnoredMutBorrow (Some bid,child)) ->
+        check_tracked_ignored_mut_borrow ~allow_marked span ctx owner level bid v.ty child.ty;
+        polarity level true;
+        avalue (path @ ["child"]) level child
     | ABorrow (AIgnoredMutBorrow (None,child)) ->
         polarity level true;
         avalue (path @ ["child"]) level child
+    | ALoan (AEndedIgnoredMutLoan ended) ->
+        polarity level false;
+        (match v.ty with
+        | TRef (RVar (Free outer), target, RMut) ->
+            require span (not (RegionId.Set.mem outer owner.regions.owned))
+              "ended ignored mutable loan owns its outer region";
+            require span (equal_ty target ended.child.ty && equal_ty target ended.given_back.ty)
+              "ended ignored mutable loan child type mismatch";
+            require span (equal_ty (Substitute.erase_regions target) ended.given_back_meta.ty)
+              "ended ignored mutable loan metadata type mismatch"
+        | _ -> reject span "ended ignored mutable loan is not a native mutable reference");
+        (* The concrete value is historical synthesis data, not a current
+           borrow/loan occurrence. Validate its own type without live lookups. *)
+        (Invariants.check_typing_invariant_visitor span ctx false)#visit_tvalue None
+          ended.given_back_meta;
+        slots := { path = path @ ["given_back_metadata"]; level;
+                   role = "given-back-concrete-metadata"; ty = ended.given_back_meta.ty } :: !slots;
+        avalue (path @ ["child"]) level ended.child;
+        avalue (path @ ["given_back"]) (level + 1) ended.given_back
     | ALoan (AIgnoredSharedLoan child) ->
         polarity level false;
         (match v.ty with
@@ -332,17 +833,42 @@ let check span (ctx : eval_ctx) (owner : abs) : certificate =
               "ignored shared-loan wrapper child type mismatch"
         | _ -> reject span "ignored shared-loan wrapper is not a shared reference");
         avalue (path @ ["child"]) level child
+    | ALoan (AIgnoredMutLoan (Some bid,child)) ->
+        check_tracked_ignored_mut_loan ~allow_marked span ctx owner level bid v.ty child.ty;
+        polarity level false;
+        avalue (path @ ["child"]) level child
     | ALoan (AIgnoredMutLoan (None,child)) ->
         polarity level false;
         avalue (path @ ["child"]) level child
     | AIgnored (Some _) | ABorrow _ | ALoan _ ->
-        reject span "concrete, tracked, or unsupported A wrapper needs separate admission"
+        let metadata = match v.value with
+          | AIgnored (Some value) -> "\nignored metadata: "
+              ^ InterpUtils.tvalue_to_string ctx value
+              ^ " : " ^ InterpUtils.ty_to_string ctx value.ty
+          | _ -> "" in
+        reject span ("concrete, tracked, or unsupported A wrapper at "
+          ^ String.concat "/" path ^ " level=" ^ string_of_int level ^ ": "
+          ^ InterpUtils.tavalue_to_string ~with_ended:true ctx v ^ metadata
+          ^ "\n" ^ InterpUtils.abs_to_string span ~with_ended:true ctx owner)
   in
-  List.iteri (fun i v ->
-    polarities := [];
-    avalue ["avalue";string_of_int i] 0 v) owner.avalues;
-  (* Call the visitor directly: opt_type_check_abs and the Config.sanity_checks
-     switch are deliberately NOT used. This supplements, not replaces, the
-     explicit own-history-type and metadata checks above. *)
-  (Invariants.check_typing_invariant_visitor span ctx false)#visit_abs None owner;
-  {owner; slots=List.rev !slots}
+  try
+    List.iteri (fun i v ->
+      polarities := [];
+      avalue ["avalue";string_of_int i] 0 v) owner.avalues;
+    (* Call the visitor directly: opt_type_check_abs and the Config.sanity_checks
+       switch are deliberately NOT used. This supplements, not replaces, the
+       explicit own-history-type and metadata checks above. *)
+    current_value := None;
+    (Invariants.check_typing_invariant_visitor span ctx false)#visit_abs None owner;
+    {owner; slots=List.rev !slots}
+  with error ->
+    let backtrace=Printexc.get_raw_backtrace () in
+    let leaf=match !current_value with
+      | Some(path,level,value) ->
+          "at " ^ String.concat "/" path ^ " level=" ^ string_of_int level
+          ^ "\noriginal typed value: " ^ show_tavalue value
+      | None -> "at final native owner typing check" in
+    Printf.eprintf "SHARED_PACKET_SIGNATURE_REJECTED %s\noriginal owner:\n%s\n%!"
+      leaf (InterpUtils.abs_to_string span ~with_ended:true ctx owner);
+    (* Keep the original guard, exception, source location, and backtrace. *)
+    Printexc.raise_with_backtrace error backtrace

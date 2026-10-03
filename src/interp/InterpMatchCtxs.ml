@@ -38,15 +38,41 @@ let validate_symbolic_hierarchy_type (span : Meta.span)
     | RVar (Free rid) when RegionId.Set.mem rid !all_regions -> ()
     | _ -> fail "predicate region outside the exact type regions"
   in
+  let literal_array_length (length : constant_expr) =
+    match length.kind, length.ty with
+    | CInteger (UnsignedInteger (Usize, _)),
+      TScalar (TInteger (Unsigned Usize)) ->
+        Invariants.check_literal_type span
+          (TypesUtils.constant_expr_as_literal length) (TInteger (Unsigned Usize))
+    | _ -> fail "array iterator length is not a literal usize" in
+  let canonical_array_iter (id : TypeDeclId.id) (args : generic_args) =
+    match TypeDeclId.Map.find_opt id crate.type_decls with
+    | Some decl when AppliedBuiltins.path decl.item_meta ["core";"array";"iter";"IntoIter"]
+        && AppliedBuiltins.args_fit decl.generics args
+        && args.regions=[] && List.length args.types=1
+        && List.length args.const_generics=1 && args.trait_refs=[]
+        && decl.generics.regions=[] && List.length decl.generics.types=1
+        && List.length decl.generics.const_generics=1 ->
+        let parameter=List.hd decl.generics.const_generics in
+        if not (Types.equal_ty parameter.ty TypesUtils.mk_usize_ty) then
+          fail "array iterator has a non-usize constant parameter";
+        List.iter literal_array_length args.const_generics;
+        true
+    | _ -> false in
   let rec check active ty =
     if List.exists (Types.equal_ty ty) active then
       fail "recursive instantiated type predicate";
     let active = ty :: active in
     let () = match ty with
     | TScalar _ | TNever -> ()
+    | TSlice (element, None) -> check active element
+    | TArray (element, length, None) ->
+        literal_array_length length; check active element
     | TRef (r, referent, RShared) -> check_region r; check active referent
     | TAdt { id; generics; builtin } ->
-        if generics.const_generics <> [] || generics.trait_refs <> [] then
+        let array_iter = builtin=None && canonical_array_iter id generics in
+        if (generics.const_generics <> [] && not array_iter)
+          || generics.trait_refs <> [] then
           fail "constant or trait arguments";
         List.iter check_region generics.regions;
         List.iter (check active) generics.types;
@@ -65,7 +91,7 @@ let validate_symbolic_hierarchy_type (span : Meta.span)
              if decl.item_meta.has_errors then fail "erroneous ADT declaration";
              if decl.generics.trait_clauses <> []
                 || decl.generics.trait_type_constraints <> []
-                || decl.generics.const_generics <> [] then
+                || (decl.generics.const_generics <> [] && not array_iter) then
                fail "ADT trait, associated-type or constant constraints";
              let subst = [%add_loc] Substitute.make_subst_from_generics
                (Some span) decl.generics generics Self in
@@ -86,6 +112,72 @@ let validate_symbolic_hierarchy_type (span : Meta.span)
   in
   check [] ty;
   !all_regions
+
+(** A closed type containing only immutable static references has no dynamic
+    region permission to project at a join. Inspect instantiated fields too:
+    an enum can hide a static reference without any lifetime parameter. Keep
+    the original full type; this is not region erasure or region unification. *)
+let closed_static_shared_type (span : Meta.span) (ctx : eval_ctx) (ty : ty) =
+  let infos = ctx.type_ctx.type_infos in
+  let rec check active ty =
+    if List.exists (Types.equal_ty ty) active then false else
+    let active = ty :: active in
+    let info = TypesAnalysis.analyze_ty (Some span) infos ty in
+    not info.contains_mut_borrow &&
+    match ty with
+    | TScalar _ | TNever -> true
+    | TSlice (element, None) -> check active element
+    | TArray (element, length, None) ->
+        (match length.kind, length.ty with
+         | CInteger (UnsignedInteger (Usize, _)),
+           TScalar (TInteger (Unsigned Usize)) -> check active element
+         | _ -> false)
+    | TRef (RStatic, referent, RShared) ->
+        not (ty_has_borrows (Some span) infos referent)
+        && check active referent
+    | TAdt ({builtin=Some TTuple;generics;_} as tuple) ->
+        equal_ty ty (mk_tuple_ty generics.types)
+        && List.for_all (check active) tuple.generics.types
+    | TAdt {builtin=None;id;generics} ->
+        generics.regions=[] && generics.const_generics=[]
+        && generics.trait_refs=[]
+        && List.for_all (check active) generics.types
+        && (match TypeDeclId.Map.find_opt id ctx.crate.type_decls with
+            | Some decl when not decl.item_meta.has_errors
+                && decl.src=NormalType
+                && AppliedBuiltins.args_fit decl.generics generics
+                && decl.generics.regions=[]
+                && decl.generics.const_generics=[]
+                && decl.generics.trait_clauses=[]
+                && decl.generics.regions_outlive=[]
+                && decl.generics.types_outlive=[]
+                && decl.generics.trait_type_constraints=[] ->
+                (match decl.kind with
+                 | Struct _ | Enum _ ->
+                     Substitute.type_decl_get_instantiated_variants_fields_types
+                       span decl generics
+                     |> List.for_all (fun (_,fields) ->
+                          List.for_all (check active) fields)
+                 | Opaque ->
+                     (* The registered allocator-free Vec model exposes all
+                        borrowed contents through T, with no hidden region. *)
+                     AppliedBuiltins.path decl.item_meta ["alloc";"vec";"Vec"]
+                     && InterpExternalPermissions.supported_opaque decl
+                     && (match TypeDeclId.Map.find_opt id infos with
+                         | Some native ->
+                             native.borrows_info=TypesAnalysis.type_borrows_info_init
+                             && not native.has_regions
+                             && RegionId.Set.is_empty native.mut_regions
+                             && (match native.param_infos with
+                                 | [p] -> not (p.under_borrow || p.under_mut_borrow)
+                                 | _ -> false)
+                         | None -> false)
+                 | _ -> false)
+            | _ -> false)
+    | _ -> false
+  in
+  let info = TypesAnalysis.analyze_ty (Some span) infos ty in
+  info.contains_static && check [] ty
 
 (** Derive fresh-region parents from native ADT well-formedness predicates using
     the same hierarchy machinery as instantiated function signatures. *)
@@ -263,6 +355,61 @@ let identical_ignored_shared_projector (ctx0 : eval_ctx) (ctx1 : eval_ctx)
            else None)
   | _ -> None
 
+(** An ended ignored mutable loan can retain its child loan at level n and
+    the corresponding returned shared borrow at n+1. Keep both incidence keys;
+    only native sub-abstraction ending may consume this internal relation.
+    Join markers do not change its levels: compare the exact same marker on
+    both leaves, without unmarking either node or deleting an incidence key. *)
+let retained_cross_level_shared_self_edge span (ctx : eval_ctx) abs_id (pm, bid) =
+  if not (InterpPacketRouting.enabled ())
+     || not (InterpSharedPacketSignature.enabled ()) then false
+  else
+    let owner = ctx_lookup_abs ctx abs_id in
+    if not (InterpSharedPacketSignature.has_retained_ended_mut_loan owner) then false
+    else
+      let descriptor = InterpPacketRouting.validate_owner ~allow_marked:true span ctx owner in
+      let loans, borrows = List.fold_left
+        (fun (loans, borrows) (node : InterpPacketInterface.node) ->
+          match node.original with
+          | InterpPacketInterface.AValue
+              ({ value = ALoan (ASharedLoan (marker, lid, _, _)); _ } as value)
+              when marker = pm && lid = bid -> ((node, value) :: loans, borrows)
+          | InterpPacketInterface.AValue
+              ({ value = ABorrow (ASharedBorrow (marker, lid, _)); _ } as value)
+              when marker = pm && lid = bid -> (loans, (node, value) :: borrows)
+          | _ -> (loans, borrows)) ([], []) descriptor.nodes in
+      match loans, borrows with
+      | [(loan, value)], _ :: _ ->
+          let returned_under wrapper level = List.for_all
+            (fun ((borrow : InterpPacketInterface.node), value) ->
+              borrow.level = level + 1
+              && InterpSharedPacketSignature.retained_ended_shared_leaf_location
+                   owner borrow.path borrow.level value = Some (wrapper, level, true))
+            borrows in
+          let internal =
+            match InterpSharedPacketSignature.retained_ended_shared_leaf_location
+                    owner loan.path loan.level value with
+            | Some (wrapper, level, false) when loan.level = level ->
+                returned_under wrapper level
+            | None when loan.level = 0 ->
+                (* Native list_values can lift a nested shared loan out of the
+                   retained child payload to a level-zero root. Its returned
+                   borrow stays in the original wrapper at level one. Keep
+                   that internal relation fully indexed, just as before the
+                   native payload decomposition; do not self-merge it. *)
+                (match loan.path, borrows with
+                | ["avalue"; _], (borrow, value) :: _ ->
+                    (match InterpSharedPacketSignature.retained_ended_shared_leaf_location
+                             owner borrow.path borrow.level value with
+                    | Some (wrapper, 0, true) -> returned_under wrapper 0
+                    | _ -> false)
+                | _ -> false)
+            | _ -> false in
+          if internal then
+            ignore (InterpSharedPacketSignature.check ~allow_marked:true span ctx owner);
+          internal
+      | _ -> false
+
 let compute_abs_borrows_loans_maps (span : Meta.span) (explore : abs -> bool)
     (ctx : eval_ctx) (env : env) : abs_borrows_loans_maps =
   let abs_ids = ref [] in
@@ -390,6 +537,29 @@ let compute_abs_borrows_loans_maps (span : Meta.span) (explore : abs -> bool)
     let proj : marked_norm_symb_proj =
       { pm; sv_id = proj.sv_id; norm_proj_ty }
     in
+    (match MarkedNormSymbProj.Map.find_opt proj !borrow_proj_to_abs with
+    | None -> ()
+    | Some previous ->
+        Printf.eprintf "DUPLICATE_BORROW_PROJECTION sid=%s new_owner=%s previous=%s\n%!"
+          (SymbolicValueId.to_string proj.sv_id) (AbsId.to_string abs.abs_id)
+          (AbsId.Set.show previous);
+        List.iter (function
+          | EAbs owner ->
+              let contains = ref false in
+              let visitor = object
+                inherit [_] iter_tavalue as super
+                method! visit_aproj () packet =
+                  (match packet with
+                   | AProjLoans {proj = p; _} | AProjBorrows {proj = p; _}
+                     when p.sv_id = proj.sv_id -> contains := true
+                   | _ -> ());
+                  super#visit_aproj () packet
+              end in
+              List.iter (visitor#visit_tavalue ()) owner.avalues;
+              if !contains || owner.abs_id = abs.abs_id
+                 || AbsId.Set.mem owner.abs_id previous then
+                Printf.eprintf "%s\n%!" (abs_to_string span ~with_ended:true ctx owner)
+          | _ -> ()) ctx.env);
     RAbsSymbProj.register_mapping
       (binding_to_string abs_id_to_string borrow_proj_to_string)
       false abs_to_borrow_projs abs.abs_id proj;
@@ -428,7 +598,13 @@ let compute_abs_borrows_loans_maps (span : Meta.span) (explore : abs -> bool)
         | ASharedLoan (npm, lid, sv, child) ->
             (* Add the current marker when visiting the loan ids and the shared value *)
             self#visit_loan_id (abs, npm) lid;
-            self#visit_tvalue (abs, npm) sv;
+            (match sv.value with
+             | VBorrow(VSharedBorrow(bid,sid))
+               when InterpSharedPacketSignature.enabled () ->
+                 (* A direct retained reference is a current concrete borrow,
+                    with the enclosing shared loan's original branch identity. *)
+                 register_borrow_id abs npm bid (Some sid)
+             | _ -> self#visit_tvalue (abs, npm) sv);
             (* Recurse with the old marker *)
             self#visit_tavalue (abs, pm) child
         | AIgnoredMutLoan (_, child)
@@ -511,14 +687,14 @@ let compute_abs_borrows_loans_maps (span : Meta.span) (explore : abs -> bool)
           (* Selection index only: the complete ordered recursive descriptor is
              validated independently. Child histories and shared reborrows stay
              distinct permissions; neither becomes a flat cancellation key. *)
-          let descriptor = InterpPacketRouting.validate_owner span ctx abs in
+          let descriptor = InterpPacketRouting.validate_owner ~allow_marked:true span ctx abs in
           List.iter
             (fun (packet : InterpPacketInterface.packet) ->
               match packet.at.original with
               | InterpPacketInterface.APacket (AProjLoans { proj; _ }) ->
-                  register_loan_proj abs PNone proj
+                  register_loan_proj abs packet.marker proj
               | InterpPacketInterface.APacket (AProjBorrows { proj; _ }) ->
-                  register_borrow_proj abs PNone proj
+                  register_borrow_proj abs packet.marker proj
               | _ -> [%craise] span "Packet selection root is not an active A projector")
             (InterpPacketRouting.roots descriptor);
           (* Retained concrete shared leaves keep their native incidence keys,
@@ -530,8 +706,15 @@ let compute_abs_borrows_loans_maps (span : Meta.span) (explore : abs -> bool)
                 { value = ABorrow (ASharedBorrow (pm, bid, sid)); _ } ->
                 register_borrow_id abs pm bid (Some sid)
             | InterpPacketInterface.AValue
-                { value = ALoan (ASharedLoan (pm, bid, _, _)); _ } ->
-                register_loan_id abs pm bid
+                { value = ALoan (ASharedLoan (pm, bid, shared, _)); _ } ->
+                register_loan_id abs pm bid;
+                (* This direct payload permission stays inside the original
+                   shared loan. Use the same inherited marker as native
+                   explore_abs, including its unique shared-borrow ID. *)
+                (match shared.value with
+                 | VBorrow(VSharedBorrow(inner_bid,sid)) ->
+                     register_borrow_id abs pm inner_bid (Some sid)
+                 | _ -> ())
             | _ -> ()) descriptor.nodes)
         else List.iter (explore_abs#visit_tavalue (abs, PNone)) abs.avalues)
       else ())
@@ -654,6 +837,64 @@ let rec match_types (span : Meta.span) ~(recover : bool) (ctx0 : eval_ctx)
       let ty = match_rec ty0 ty1 in
       TPtrMetadata ty
   | _ -> match_distinct_types ty0 ty1
+
+(** The final application matcher may observe the same direct shared
+    reference inside a loan after the native join refreshed its shared-borrow
+    ID. All ordinary type, borrow-ID and shared-ID callbacks have already run;
+    only that shared-ID may differ here. The complete ignored child metadata
+    and both original loan/referent types are retained and checked. *)
+let identical_shared_reference_payload span ctx0 ctx1 (v0:tavalue) (v1:tavalue)
+    (matched:tvalue) =
+  if not (InterpSharedPacketSignature.enabled () && equal_ty v0.ty v1.ty) then false
+  else match v0.value,v1.value,v0.ty,matched.value with
+    | ALoan(ASharedLoan(PNone,lid0,({value=VBorrow(VSharedBorrow(bid0,_));_} as shared0),child0)),
+      ALoan(ASharedLoan(PNone,lid1,({value=VBorrow(VSharedBorrow(bid1,_));_} as shared1),child1)),
+      TRef(RVar(Free _),(TRef(RVar(Free _),target,RShared) as referent),RShared),
+      VBorrow(VSharedBorrow(matched_bid,_))
+      when lid0=lid1 && bid0=bid1 && bid0=matched_bid
+        && equal_ty shared0.ty shared1.ty
+        && equal_ty shared0.ty (Substitute.erase_regions referent)
+        && equal_ty matched.ty shared0.ty && equal_ty child0.ty referent
+        && InterpSharedHistory.same_complete_value child0 child1
+        && (match child0.value with AIgnored _->true|_->false) ->
+        let valid ctx =
+          not (ty_has_borrows (Some span) ctx.type_ctx.type_infos target)
+          && RegionId.Set.is_empty (RegionId.Set.inter (ty_regions v0.ty) ctx.ended_regions)
+          && let original=InterpSharedPacketSignature.lookup_retained_shared_value span ctx PNone bid0 in
+             equal_ty original.ty (Substitute.erase_regions target)
+             && not (tvalue_has_loans_or_borrows (Some span) ctx original) in
+        valid ctx0 && valid ctx1
+    | _ -> false
+
+(** The final read-only matcher has already matched the complete outer/inner
+    reference types, the child, the shared borrow IDs and the values behind
+    those IDs. An alpha-renamed direct shared reference is therefore admissible
+    just like the identical case above. This does not enable joining values:
+    only the final application matcher calls this rule. *)
+let mapped_shared_reference_payload span ctx0 ctx1 (v0:tavalue) (v1:tavalue)
+    (matched_ty:ty) (matched:tvalue) (matched_child:tavalue) =
+  let valid ctx (value:tavalue) = match value.ty,value.value with
+    | TRef(RVar(Free _),(TRef(RVar(Free _),target,RShared) as referent),RShared),
+      ALoan(ASharedLoan(PNone,_,({value=VBorrow(VSharedBorrow(bid,_));_} as shared),
+        {value=AIgnored None;ty=child_ty})) ->
+        equal_ty child_ty referent
+        && equal_ty shared.ty (Substitute.erase_regions referent)
+        && not (ty_has_borrows (Some span) ctx.type_ctx.type_infos target)
+        && RegionId.Set.is_empty (RegionId.Set.inter (ty_regions value.ty) ctx.ended_regions)
+        && let original=InterpSharedPacketSignature.lookup_retained_shared_value
+             span ctx PNone bid in
+           equal_ty original.ty (Substitute.erase_regions target)
+           && not (tvalue_has_loans_or_borrows (Some span) ctx original)
+    | _ -> false in
+  InterpSharedPacketSignature.enabled ()
+  && valid ctx0 v0 && valid ctx1 v1
+  && equal_ty matched_ty v1.ty
+  && (match v1.value,matched.value,matched_child.value with
+    | ALoan(ASharedLoan(PNone,_,shared1,child1)),
+      VBorrow(VSharedBorrow(bid,_)),AIgnored None ->
+        equal_ty matched.ty shared1.ty && equal_ty matched_child.ty child1.ty
+        && (match shared1.value with VBorrow(VSharedBorrow(expected,_))->bid=expected|_->false)
+    | _ -> false)
 
 module MakeMatcher (M : PrimMatcher) : Matcher = struct
   let span = M.span
@@ -858,6 +1099,9 @@ module MakeMatcher (M : PrimMatcher) : Matcher = struct
             let av = match_arec av0 av1 in
             [%sanity_check_recover] M.recover M.span
               (not (value_has_borrows sv.value)
+               || (M.supports_identical_shared_reference_payload
+                   && (identical_shared_reference_payload M.span ctx0 ctx1 v0 v1 sv
+                       || mapped_shared_reference_payload M.span ctx0 ctx1 v0 v1 ty sv av))
                || (Sys.getenv_opt "AENEAS_EXPERIMENTAL_IDENTICAL_SHARED_REFERENT" = Some "1"
                    && match identical_shared_symbolic_referent ctx0 ctx1
                         v0.ty pm0 id0 sv0 av0 v1.ty pm1 id1 sv1 av1 ty sv av with
@@ -892,6 +1136,31 @@ module MakeMatcher (M : PrimMatcher) : Matcher = struct
                | Some (sv, regions) ->
                    M.ignored_shared_projector_mappings sv regions);
             { value = ALoan (AIgnoredSharedLoan child); ty }
+        | AIgnoredSharedLoan child0, AIgnoredSharedLoan child1
+          when M.supports_identical_shared_reference_payload
+            && InterpSharedPacketSignature.enabled ()
+            && InterpSharedHistory.same_complete_value v0 v1
+            && (match v0.ty,child0.value,child0.ty with
+              | TRef(RVar(Free _),referent,RShared),
+                ALoan(ASharedLoan(PNone,_,shared,child)),
+                TRef(RVar(Free _),target,RShared) ->
+                  equal_ty referent child0.ty
+                  && equal_ty child.ty target
+                  && equal_ty shared.ty (Substitute.erase_regions target)
+                  && is_aignored child.value
+                  && List.for_all (fun ctx ->
+                    not (ty_has_borrows (Some M.span) ctx.type_ctx.type_infos target)
+                    && not (tvalue_has_loans_or_borrows (Some M.span) ctx shared)
+                    && RegionId.Set.is_empty (RegionId.Set.inter
+                      (ty_regions child0.ty) ctx.ended_regions)) [ctx0;ctx1]
+              | _ -> false) ->
+            (* The ignored outer reference has no current ID of its own.
+               Its outer ghost lifetime may already be ended; liveness is
+               required for the actual inner loan and its complete referent.
+               Match its complete original type and the real inner loan by
+               the ordinary recursive callbacks, retaining the wrapper. *)
+            let child=match_arec child0 child1 in
+            {value=ALoan(AIgnoredSharedLoan child);ty}
         | AIgnoredMutLoan _, AIgnoredMutLoan _
         | AIgnoredSharedLoan _, AIgnoredSharedLoan _ ->
             (* Those should have been filtered when destructuring the abstractions -
@@ -1007,7 +1276,40 @@ module MakeJoinMatcher (S : MatchJoinState) : PrimMatcher = struct
     (* Introduce a fresh symbolic value for the join *)
     let sv = add_fresh_symbolic_value ctx0 ty_with_regions v0 v1 in
     let sv_s = tvalue_as_symbolic span sv in
+    let trace_shared_alias_join =
+      Sys.getenv_opt "AENEAS_TRACE_SHARED_ALIAS_JOIN" = Some "1"
+      && List.length fresh_regions > 1
+      && not (ty_has_mut_borrows ctx0.type_ctx.type_infos ty_with_regions)
+    in
+    if trace_shared_alias_join then
+      Printf.eprintf
+        "SHARED_ALIAS_JOIN joined=%s with_abs_conts=%b fresh_ty=%s\nleft=%s\nright=%s\n%!"
+        (SymbolicValueId.to_string sv_s.sv_id) S.with_abs_conts
+        (ty_to_string ctx0 ty_with_regions) (show_tvalue v0) (show_tvalue v1);
 
+    (* A concrete/symbolic join has the same native outlives dependencies as
+       a symbolic/symbolic join. In particular Iter<&T> must retain its
+       interior-to-outer parent edge; independent fresh owners would allow
+       ending the interior permission before its enclosing shared iterator.
+       Derive this from the complete refreshed type and ADT predicates, without
+       quotienting any region or changing the original value projections. *)
+    let hierarchy =
+      let info=TypesAnalysis.analyze_ty (Some span) ctx0.type_ctx.type_infos
+        ty_with_regions in
+      if Sys.getenv_opt "AENEAS_EXPERIMENTAL_SYMBOLIC_REGION_HIERARCHY" <> Some "1"
+        || fresh_regions=[] || not info.contains_borrow
+        || info.contains_mut_borrow || info.contains_static then None
+      else
+        let parents=symbolic_hierarchy_parents span ctx0.crate
+          ctx0.type_ctx.type_infos fresh_regions ty_with_regions in
+        let ids=List.fold_left (fun ids rid ->
+          RegionId.Map.add rid (ctx0.fresh_abs_id ()) ids)
+          RegionId.Map.empty fresh_regions in
+        Some (RegionId.Map.mapi (fun rid rparents ->
+          RegionId.Map.find rid ids,
+          AbsId.Set.of_list (List.map (fun parent -> RegionId.Map.find parent ids) rparents))
+          parents)
+    in
     (* Project the ADTs into different region abstractions *)
     let project (rid : RegionId.id) =
       let regions = RegionId.Set.singleton rid in
@@ -1084,12 +1386,15 @@ module MakeJoinMatcher (S : MatchJoinState) : PrimMatcher = struct
       in
 
       (* Generate the abstraction *)
+      let abs_id,parents=match hierarchy with
+        | None -> ctx0.fresh_abs_id (),AbsId.Set.empty
+        | Some hierarchy -> RegionId.Map.find rid hierarchy in
       let abs =
         {
-          abs_id = ctx0.fresh_abs_id ();
+          abs_id;
           kind = S.fresh_abs_kind;
           can_end = true;
-          parents = AbsId.Set.empty;
+          parents;
           regions = { owned = RegionId.Set.singleton rid };
           ended_subabs = AbsLevelSet.empty;
           avalues = avl0 @ avl1 @ [ av ];
@@ -1097,6 +1402,9 @@ module MakeJoinMatcher (S : MatchJoinState) : PrimMatcher = struct
         }
       in
       [%ldebug "Pushing abs:\n" ^ abs_to_string span ctx0 abs];
+      if trace_shared_alias_join then
+        Printf.eprintf "SHARED_ALIAS_JOIN_OWNER joined=%s\n%s\n%!"
+          (SymbolicValueId.to_string sv_s.sv_id) (abs_to_string span ctx0 abs);
       push_abs abs
     in
     List.iter project fresh_regions;
@@ -1351,8 +1659,84 @@ module MakeJoinMatcher (S : MatchJoinState) : PrimMatcher = struct
       (* Lookup the shared values and match them *)
       let sv0 = ctx_lookup_shared_value span ctx0 bid0 in
       let sv1 = ctx_lookup_shared_value span ctx1 bid1 in
-      let sv = match_rec sv0 sv1 in
+      (* The original outer loans keep their payloads. A recursively joined
+         shared reference is therefore a copy, not a move of the old shared
+         instance. Use the native [copy_value] shared-borrow rule: retain the
+         loan ID and refresh only the shared instance ID. *)
+      let recursive_sv0, recursive_sv1 =
+        match bv_ty, sv0.value, sv1.value with
+        | TRef(RErased,target,RShared), VBorrow(VSharedBorrow(inner0,_)),
+          VBorrow(VSharedBorrow(inner1,_))
+          when InterpSharedPacketSignature.enabled () && kind=RShared
+            && inner0<>inner1 && equal_ty sv0.ty bv_ty && equal_ty sv1.ty bv_ty
+            && not (ty_has_borrows (Some span) ctx0.type_ctx.type_infos target)
+            && not (ty_has_borrows (Some span) ctx1.type_ctx.type_infos target) ->
+            ({sv0 with value=VBorrow(VSharedBorrow(inner0,ctx0.fresh_shared_borrow_id ()))},
+             {sv1 with value=VBorrow(VSharedBorrow(inner1,ctx0.fresh_shared_borrow_id ()))})
+        | _ -> sv0,sv1 in
+      let previous_abstractions = !S.nabs in
+      let sv : tvalue = match_rec recursive_sv0 recursive_sv1 in
 
+      (* In the exact two-level shared case, recursive native joining has
+         already constructed the inner permission interface. Its complete
+         loan type supplies the outer referent type; inventing a region from
+         the erased reference would lose this lifetime relationship. *)
+      let nested_shared =
+        if not (InterpSharedPacketSignature.enabled ()) || ty_is_rty bv_ty
+          || kind<>RShared then None
+        else match bv_ty,recursive_sv0.value,recursive_sv1.value,sv.value with
+        | TRef(RErased,target,RShared),
+          VBorrow(VSharedBorrow(inner0,shared0)),
+          VBorrow(VSharedBorrow(inner1,shared1)),
+          VBorrow(VSharedBorrow(joined,_))
+          when inner0<>inner1 && equal_ty sv0.ty bv_ty && equal_ty sv1.ty bv_ty
+            && equal_ty sv.ty bv_ty
+            && not (ty_has_borrows (Some span) ctx0.type_ctx.type_infos target)
+            && not (ty_has_borrows (Some span) ctx1.type_ctx.type_infos target) ->
+            let fresh=List.filter (fun owner -> not (List.exists
+              (fun previous -> previous==owner) previous_abstractions)) !S.nabs in
+            (match fresh with
+            | [inner] when inner.can_end && inner.kind=S.fresh_abs_kind
+              && AbsId.Set.is_empty inner.parents && AbsLevelSet.is_empty inner.ended_subabs ->
+                (match inner.avalues with
+                | [{value=ABorrow(ASharedBorrow(PLeft,lbid,lsid));ty=lty};
+                   {value=ABorrow(ASharedBorrow(PRight,rbid,rsid));ty=rty};
+                   ({value=ALoan(ASharedLoan(PNone,lid,payload,child));
+                     ty=TRef(RVar(Free region),referent,RShared)} as loan)]
+                  when lbid=inner0 && lsid=shared0 && rbid=inner1 && rsid=shared1
+                    && lid=joined && equal_ty lty loan.ty && equal_ty rty loan.ty
+                    && equal_ty referent target && ty_is_rty loan.ty
+                    && equal_ty payload.ty target && equal_ty child.ty target
+                    && ValuesUtils.is_aignored child.value
+                    && not (tvalue_has_loans_or_borrows (Some span) ctx0 payload)
+                    && RegionId.Set.equal inner.regions.owned (RegionId.Set.singleton region)
+                    && not (RegionId.Set.mem region ctx0.ended_regions)
+                    && not (RegionId.Set.mem region ctx1.ended_regions) -> Some(inner,loan.ty)
+                | _ -> None)
+            | _ -> None)
+        | _ -> None in
+      let bv_ty=match nested_shared with Some(_,referent)->referent | None->bv_ty in
+      let borrow_ty=mk_ref_ty (RVar(Free rid)) bv_ty kind in
+      let borrows=List.map (fun (borrow:tavalue)->{borrow with ty=borrow_ty}) borrows in
+      if not (ty_is_rty bv_ty) then begin
+        let owners ctx bid = List.filter_map (function
+          | EAbs owner ->
+              let found=ref false in
+              let visitor=object
+                inherit [_] iter_abs
+                method! visit_borrow_id () id = if id=bid then found:=true
+                method! visit_loan_id () id = if id=bid then found:=true
+              end in
+              visitor#visit_abs () owner;
+              if !found then Some (abs_to_string span ~with_ended:true ctx owner) else None
+          | _ -> None) ctx.env in
+        Printf.eprintf
+          "SHARED_BORROW_JOIN_NEEDS_FULL_REFERENT left_bid=%s right_bid=%s synthesis=%b\ntype=%s\nleft=%s\nright=%s\nmatched=%s\nleft owners:\n%s\nright owners:\n%s\nnew owners:\n%s\n%!"
+          (BorrowId.to_string bid0) (BorrowId.to_string bid1) S.with_abs_conts
+          (show_ty ty) (show_tvalue sv0) (show_tvalue sv1) (show_tvalue sv)
+          (String.concat "\n" (owners ctx0 bid0)) (String.concat "\n" (owners ctx1 bid1))
+          (String.concat "\n" (List.map (abs_to_string span ~with_ended:true ctx0) !S.nabs))
+      end;
       [%sanity_check_recover] S.recover span (ty_is_rty bv_ty);
       let loan = ASharedLoan (PNone, bid2, sv, mk_aignored span bv_ty None) in
       (* Note that an aloan has a borrow type *)
@@ -1382,6 +1766,16 @@ module MakeJoinMatcher (S : MatchJoinState) : PrimMatcher = struct
           cont;
         }
       in
+      (* Native shared-reference hierarchy: the interior reference outlives
+         the outer reference, so ending the interior abstraction first ends
+         its outer parent. Both concrete permissions and the original inner
+         continuation remain intact. This only updates the abstraction just
+         created by the recursive join above, never an existing input owner. *)
+      Option.iter (fun (inner,_) ->
+        S.nabs := List.map (fun current ->
+          if current==inner then
+            {current with parents=AbsId.Set.add abs.abs_id current.parents}
+          else current) !S.nabs) nested_shared;
       push_abs abs;
 
       (* Return the new borrow *)
@@ -1688,7 +2082,13 @@ module MakeJoinMatcher (S : MatchJoinState) : PrimMatcher = struct
         "Unimplemented";
       [%ldebug "ty: " ^ ty_to_string ctx0 sv0.sv_ty];
       (* If the symbolic values contain regions, we need to introduce abstractions *)
-      if ty_has_borrows (Some span) ctx0.type_ctx.type_infos sv0.sv_ty then (
+      let static_only =
+        Sys.getenv_opt "AENEAS_EXPERIMENTAL_SYMBOLIC_REGION_HIERARCHY" = Some "1"
+        && equal_ty sv0.sv_ty sv1.sv_ty
+        && closed_static_shared_type span ctx0 sv0.sv_ty
+        && closed_static_shared_type span ctx1 sv1.sv_ty in
+      if ty_has_borrows (Some span) ctx0.type_ctx.type_infos sv0.sv_ty
+         && not static_only then (
         (* Let's say we join:
            {[
              s0 : S<'0, '1>
@@ -1730,6 +2130,18 @@ module MakeJoinMatcher (S : MatchJoinState) : PrimMatcher = struct
         let proj_s0 = mk_aproj_borrows PLeft sv0.sv_id proj_ty in
         let proj_s1 = mk_aproj_borrows PRight sv1.sv_id proj_ty in
         let svj = get_symbolic_tvalue span svj in
+        let trace_shared_alias_join =
+          Sys.getenv_opt "AENEAS_TRACE_SHARED_ALIAS_JOIN" = Some "1"
+          && List.length fresh_regions > 1
+          && not (ty_has_mut_borrows ctx0.type_ctx.type_infos proj_ty)
+        in
+        if trace_shared_alias_join then
+          Printf.eprintf
+            "SHARED_ALIAS_SYMBOLIC_JOIN joined=%s with_abs_conts=%b fresh_ty=%s\nleft=%s : %s\nright=%s : %s\n%!"
+            (SymbolicValueId.to_string svj.sv_id) S.with_abs_conts
+            (ty_to_string ctx0 proj_ty)
+            (SymbolicValueId.to_string sv0.sv_id) (ty_to_string ctx0 sv0.sv_ty)
+            (SymbolicValueId.to_string sv1.sv_id) (ty_to_string ctx1 sv1.sv_ty);
         let proj_svj = mk_aproj_loans PNone svj.sv_id proj_ty in
         let avalues = [ proj_s0; proj_s1; proj_svj ] in
         let hierarchy =
@@ -1823,8 +2235,8 @@ module MakeJoinMatcher (S : MatchJoinState) : PrimMatcher = struct
         | None ->
             let sv =
               add_fresh_symbolic_value ctx0 sv0.sv_ty
-                { value = VSymbolic sv0; ty = sv0.sv_ty }
-                { value = VSymbolic sv1; ty = sv1.sv_ty }
+                (mk_tvalue_from_symbolic_value sv0)
+                (mk_tvalue_from_symbolic_value sv1)
             in
             let svj = get_symbolic_tvalue span sv in
             Hashtbl.add joined_sv_cache (id0, id1) svj;
@@ -1885,12 +2297,25 @@ module MakeJoinMatcher (S : MatchJoinState) : PrimMatcher = struct
         mk_bottom span v.ty
 
   let match_shared_loan_with_other (match_rec : tvalue_matcher)
-      (ctx0 : eval_ctx) (_ctx1 : eval_ctx) ~(loan_is_left : bool) (ty : ety)
+      (ctx0 : eval_ctx) (ctx1 : eval_ctx) ~(loan_is_left : bool) (ty : ety)
       (lid : loan_id) (shared_value : tvalue) (other : tvalue) : tvalue =
+    let check condition reason =
+      if not condition then
+        let loan_ctx, other_ctx = if loan_is_left then ctx0, ctx1 else ctx1, ctx0 in
+        [%craise_recover] S.recover span
+          ("Unsupported shared-loan join: " ^ reason
+           ^ "\nloan=" ^ BorrowId.to_string lid
+           ^ " side=" ^ (if loan_is_left then "left" else "right")
+           ^ " with_abs_conts=" ^ string_of_bool S.with_abs_conts
+           ^ "\njoin type: " ^ ty_to_string ctx0 ty
+           ^ "\nshared payload: " ^ tvalue_to_string loan_ctx shared_value
+           ^ "\nother value: " ^ tvalue_to_string other_ctx other
+           ^ "\nexact shared payload: " ^ Values.show_tvalue shared_value
+           ^ "\nexact other value: " ^ Values.show_tvalue other)
+    in
     (* Sanity checks *)
-    [%cassert_recover] S.recover span
-      (not (ety_has_nested_borrows (Some span) ctx0.type_ctx.type_infos ty))
-      "Unimplemented";
+    check (not (ety_has_nested_borrows (Some span) ctx0.type_ctx.type_infos ty))
+      "nested borrowed join type";
     (* A shared referent may contain a loan of one of its fields (for example
        the operand vector of an And node). End that inner loan by the ordinary
        context reorganization protocol before retrying this join. In synthesis,
@@ -1905,16 +2330,70 @@ module MakeJoinMatcher (S : MatchJoinState) : PrimMatcher = struct
                (if loan_is_left then LoanInLeft inner_lid
                 else LoanInRight inner_lid))
       | None -> ());
-    [%cassert_recover] S.recover span
-      (not
+    check (not
          (ValuesUtils.value_has_loans_or_borrows (Some span)
             ctx0.type_ctx.type_infos shared_value.value))
-      "Unimplemented";
-    [%cassert_recover] S.recover span
-      (not
+      "shared payload still contains permissions";
+    (* For shared-only symbolic referents, remove the outer loan through
+       the normal reorganization protocol and retry. The referents need not
+       have the same symbolic id or regions: after native ending, the ordinary
+       symbolic matcher joins their original full types and permissions.
+       Check each value in its own context; ending must still discharge the
+       actual borrowers and synthesis must compose its native continuation.
+       Do not create a flat abstraction using the erased borrowed type below. *)
+    let borrowed_symbolic_pair =
+      match shared_value.value, other.value with
+      | VSymbolic shared_symbolic, VSymbolic other_symbolic
+        when !Config.multi_exit_loops
+             && equal_ty shared_value.ty ty && equal_ty other.ty ty ->
+          let shared_only_live_symbolic (ctx : eval_ctx) (value : tvalue)
+              (symbolic : symbolic_value) =
+            let info =
+              TypesAnalysis.analyze_ty (Some span) ctx.type_ctx.type_infos
+                symbolic.sv_ty
+            in
+            let live_free = ref true in
+            let visitor = object
+              inherit [_] iter_ty
+              method! visit_region () = function
+                | RVar (Free region) ->
+                    if RegionId.Set.mem region ctx.ended_regions then
+                      live_free := false
+                | _ -> live_free := false
+            end in
+            visitor#visit_ty () symbolic.sv_ty;
+            equal_ty value.ty (Substitute.erase_regions symbolic.sv_ty)
+            && symbolic_value_has_borrows (Some span) ctx symbolic
+            && not (info.contains_mut_borrow || info.contains_static)
+            && !live_free
+          in
+          let loan_ctx, other_ctx =
+            if loan_is_left then ctx0, ctx1 else ctx1, ctx0
+          in
+          shared_only_live_symbolic loan_ctx shared_value shared_symbolic
+          && shared_only_live_symbolic other_ctx other other_symbolic
+      | _ -> false
+    in
+    if borrowed_symbolic_pair then (
+      if Sys.getenv_opt "AENEAS_TRACE_DEAD_SHARED_ANALYSIS_PROJECTIONS" = Some "1" then (
+        let loan_ctx, other_ctx = if loan_is_left then ctx0, ctx1 else ctx1, ctx0 in
+        match shared_value.value, other.value with
+        | VSymbolic shared_symbolic, VSymbolic other_symbolic ->
+            Printf.eprintf "SHARED_SYMBOLIC_RETRY loan=%s side=%s payload=%s other=%s\n%!"
+              (BorrowId.to_string lid) (if loan_is_left then "left" else "right")
+              (SymbolicValueId.to_string shared_symbolic.sv_id)
+              (SymbolicValueId.to_string other_symbolic.sv_id);
+            Invariants.trace_symbolic_value span "shared retry original loan side"
+              loan_ctx shared_symbolic.sv_id;
+            Invariants.trace_symbolic_value span "shared retry original other side"
+              other_ctx other_symbolic.sv_id
+        | _ -> ());
+      raise (ValueMatchFailure
+        (if loan_is_left then LoanInLeft lid else LoanInRight lid)));
+    check (not
          (ValuesUtils.value_has_borrows (Some span) ctx0.type_ctx.type_infos
             other.value))
-      "Unimplemented";
+      "other value contains borrows";
 
     (* Join the inner value. *)
     let joined_value =
@@ -2127,6 +2606,7 @@ module MakeJoinMatcher (S : MatchJoinState) : PrimMatcher = struct
 
   (* The join matcher never gains an abstract-value matching path. *)
   let supports_ignored_shared_projector = false
+  let supports_identical_shared_reference_payload = false
 
   let ignored_shared_projector_mappings _ _ = false
 
@@ -2461,6 +2941,7 @@ struct
      recursive match owns sid_to_value_map; outer match_rtys has already
      traversed every region in the exact symbolic referent type. *)
   let supports_ignored_shared_projector = true
+  let supports_identical_shared_reference_payload = S.match_current_interface && not S.check_equiv
 
   let identical_shared_referent_mappings sid regions =
     (match SymbolicValueId.InjSubst.find_opt sid !S.sid_map with
@@ -2606,7 +3087,8 @@ end
 
 let match_ctxs (span : Meta.span) ~(check_equiv : bool)
     ?(check_kind : bool = true) ?(check_can_end : bool = true)
-    ~(recoverable : bool) (fixed_ids : ids_sets)
+    ~(recoverable : bool) ?(diagnose_failure : bool = false)
+    ?(match_current_interface : bool = false) (fixed_ids : ids_sets)
     (lookup_shared_value_in_ctx0 : BorrowId.id -> tvalue)
     (lookup_shared_value_in_ctx1 : BorrowId.id -> tvalue) (ctx0 : eval_ctx)
     (ctx1 : eval_ctx) : ids_maps =
@@ -2616,6 +3098,31 @@ let match_ctxs (span : Meta.span) ~(check_equiv : bool)
     ^ "\n\n- ctx1:\n"
     ^ eval_ctx_to_string ~span:(Some span) ~filter:false ctx1
     ^ "\n"];
+
+  (* Applying a loop only needs the current interface. A composed target
+     continuation can still own historical regions with no occurrence in any
+     current value. Keep those regions and all continuation scopes intact;
+     only omit them from this matching view. Scan the whole environment, not
+     just the candidate abstraction, so external current uses stay visible.
+     The ordinary visitor deliberately excludes synthesis meta-values. *)
+  [%sanity_check] span ((not match_current_interface) || not check_equiv);
+  let interface_regions =
+    if match_current_interface then
+      let collect (ctx : eval_ctx) =
+        let regions = ref RegionId.Set.empty in
+        let visitor = object (self)
+          inherit [_] iter_env
+          method! visit_region_id _ rid =
+            regions := RegionId.Set.add rid !regions
+          method! visit_abs env abs =
+            List.iter (self#visit_tavalue env) abs.avalues
+        end in
+        visitor#visit_env () ctx.env;
+        !regions
+      in
+      Some (collect ctx0, collect ctx1)
+    else None
+  in
 
   (* Initialize the maps and instantiate the matcher *)
   let module IdMap (Id : Identifiers.Id) = struct
@@ -2685,6 +3192,7 @@ let match_ctxs (span : Meta.span) ~(check_equiv : bool)
     let span = span
     let recover = recoverable
     let check_equiv = check_equiv
+    let match_current_interface = match_current_interface
     let rid_map = rid_map
     let blid_map = blid_map
     let borrow_id_map = borrow_id_map
@@ -2703,6 +3211,7 @@ let match_ctxs (span : Meta.span) ~(check_equiv : bool)
     let span = span
     let recover = true
     let check_equiv = check_equiv
+    let match_current_interface = match_current_interface
     let rid_map = rid_map
     let blid_map = blid_map
     let borrow_id_map = borrow_id_map
@@ -2744,6 +3253,10 @@ let match_ctxs (span : Meta.span) ~(check_equiv : bool)
     && SymbolicValueId.Set.subset sids fixed_ids.sids
   in
 
+  (* Keep only a failure location for the final fixed-point diagnostic. This
+     does not participate in matching or in the saved substitution state. *)
+  let abstraction_match_step = ref "start" in
+  let abstraction_match_values : (tavalue * tavalue) option ref = ref None in
   (* Rem.: this function raises exceptions of type [Distinct] or [RFailure]
      (in the latter case: if [recover] is true) *)
   let match_abstractions ~(recover : bool) (abs0 : abs) (abs1 : abs) : unit =
@@ -2790,25 +3303,414 @@ let match_ctxs (span : Meta.span) ~(check_equiv : bool)
       if recover then raise Errors.RFailure else raise (Distinct msg)
     in
 
+    abstraction_match_values := None;
+    abstraction_match_step := "abstraction ID";
     let _ = match_aid abs_id0 abs_id1 in
+    abstraction_match_step := "kind/can_end";
     if check_kind && kind0 <> kind1 then
       raise_distinct "match_abstractions: kind";
     if check_can_end && can_end0 <> can_end1 then
       raise_distinct "match_abstractions: can_end";
+    abstraction_match_step := "parent IDs";
     let _ = match_aids parents0 parents1 in
-    let _ = match_rids regions0 regions1 in
+    let shared_group =
+      if match_current_interface && not check_equiv
+         && not (AbsId.Set.mem abs0.abs_id fixed_ids.aids)
+         && not (AbsId.Set.mem abs1.abs_id fixed_ids.aids) then
+        match InterpSharedInterfaceMatch.view span ctx0 fixed_ids.rids abs0,
+              InterpSharedInterfaceMatch.view span ctx1 fixed_ids.rids abs1 with
+        | Some left,Some right when InterpSharedInterfaceMatch.compatible left right -> Some (left,right)
+        | _ -> None
+      else None in
+    let reference_family =
+      if match_current_interface && not check_equiv
+        && InterpSharedPacketSignature.enabled ()
+        && not(AbsId.Set.mem abs_id0 fixed_ids.aids)
+        && not(AbsId.Set.mem abs_id1 fixed_ids.aids) then
+        match InterpSharedInterfaceMatch.concrete_reference_family span ctx0 fixed_ids.rids abs0,
+              InterpSharedInterfaceMatch.concrete_reference_family span ctx1 fixed_ids.rids abs1 with
+        | Some left,Some right when
+            (left.outer.abs_id=abs_id0)=(right.outer.abs_id=abs_id1)
+            && InterpSharedInterfaceMatch.reference_families_compatible left right ->
+            ignore(match_aid left.outer.abs_id right.outer.abs_id);
+            ignore(match_aid left.inner.abs_id right.inner.abs_id);
+            Some(left,right)
+        | _->None
+      else None in
+    let concrete_ghost_groups=match reference_family with
+      | Some(left,right)->Some(left.ghosts,right.ghosts)
+      | None when match_current_interface && not check_equiv
+          && InterpSharedPacketSignature.enabled ()
+          && not(AbsId.Set.mem abs_id0 fixed_ids.aids)
+          && not(AbsId.Set.mem abs_id1 fixed_ids.aids) ->
+          (match InterpSharedInterfaceMatch.concrete_leaf_group span ctx0 fixed_ids.rids abs0,
+                 InterpSharedInterfaceMatch.concrete_leaf_group span ctx1 fixed_ids.rids abs1 with
+          | Some left,Some right when
+              InterpSharedInterfaceMatch.concrete_leaf_groups_compatible abs0 abs1 -> Some(left,right)
+          | _->None)
+      | None -> None in
+    abstraction_match_step := "owned region IDs";
+    let regions0, regions1 =
+      match interface_regions with
+      | None -> (regions0, regions1)
+      | Some (current0, current1) ->
+          (RegionId.Set.inter regions0 current0,
+           RegionId.Set.inter regions1 current1)
+    in
+    (* The special final shared view binds only owner/SID identities. It never
+       constructs a many-to-one region substitution; original runtime values,
+       parents, scopes and continuations remain available to native synthesis. *)
+    if Option.is_none shared_group then
+      let regions0,regions1=match concrete_ghost_groups with
+        | Some(left,right)->RegionId.Set.diff regions0 left,RegionId.Set.diff regions1 right
+        | None->regions0,regions1 in
+      ignore (match_rids regions0 regions1);
 
+    abstraction_match_step := "ended sub-abstractions";
     if not (AbsLevelSet.equal ended_subabs0 ended_subabs1) then
       raise_distinct
         "Region abstractions with distinct sets of ended sub-abstractions";
 
+    (* Native branch composition retains both complete historical trees. A
+       following right-projection replay can retain another copy of that same
+       immutable history. Compare a read-only view of these exact shared-only
+       histories; their current permissions and mutable Pure interfaces must
+       both be empty at every original level. Actual A/E trees and continuation
+       scopes keep every copy. Current roots retain their original order. *)
+    let history_view =
+      if match_current_interface && not check_equiv
+        && InterpSharedPacketSignature.enabled ()
+        && not(AbsId.Set.mem abs_id0 fixed_ids.aids)
+        && not(AbsId.Set.mem abs_id1 fixed_ids.aids) then
+        let split ctx owner values = List.partition (fun value ->
+          InterpSharedHistory.permission_free_history span ctx value
+          && InterpSharedHistory.empty_native_interface span ctx owner value) values in
+        let history0,live0=split ctx0 abs0 avalues0
+        and history1,live1=split ctx1 abs1 avalues1 in
+        let unique values=List.fold_left (fun seen value ->
+          if List.exists(InterpSharedHistory.same_complete_value value) seen then seen
+          else seen@[value]) [] values in
+        let history0=unique history0 and history1=unique history1 in
+        if history0<>[] && List.length history0=List.length history1
+          && List.for_all (fun value -> List.exists
+            (InterpSharedHistory.same_complete_value value) history1) history0 then
+          let matched=List.map (fun value -> List.find
+            (InterpSharedHistory.same_complete_value value) history1) history0 in
+          Some(live0@history0,live1@matched)
+        else None
+      else None in
+    let avalues0,avalues1=Option.value history_view ~default:(avalues0,avalues1) in
+
     [%ldebug "match_abstractions: matching values"];
-    let _ =
+    abstraction_match_step := "avalue count";
+    let _ = match concrete_ghost_groups with
+    | Some(left_ghosts,right_ghosts) ->
+        let match_rid=if recover then RecoverCEM.match_rid else CEM.match_rid in
+        let match_values=if recover then RecoverM.match_tvalues else M.match_tvalues in
+        let match_loan=if recover then RecoverCEM.match_ashared_loans else CEM.match_ashared_loans in
+        let match_borrow_proj=if recover then RecoverCEM.match_aproj_borrows else CEM.match_aproj_borrows in
+        let match_loan_proj=if recover then RecoverCEM.match_aproj_loans else CEM.match_aproj_loans in
+        let types a b =
+          let regions a b=match a,b with
+            | RVar(Free a),RVar(Free b) ->
+                let a_group=RegionId.Set.mem a left_ghosts
+                and b_group=RegionId.Set.mem b right_ghosts in
+                if a_group<>b_group then raise_distinct "shared concrete lifetime group mismatch";
+                if a_group then RVar(Free b) else RVar(Free(match_rid a b))
+            | RStatic,RStatic -> RStatic
+            | _->raise_distinct "shared concrete lifetime region mismatch" in
+          match_types span ~recover ctx0 ctx1
+            (fun _ _->raise_distinct "shared concrete lifetime type mismatch") regions a b in
+        List.iter2 (fun (a:tavalue) (b:tavalue)->
+          let ty=types a.ty b.ty in
+          match a.value,b.value with
+          | ASymbolic(PNone,AProjBorrows p),ASymbolic(PNone,AProjBorrows q) ->
+              let proj_ty=types p.proj.proj_ty q.proj.proj_ty in
+              ignore(match_borrow_proj (match_values ctx0 ctx1) ctx0 ctx1
+                a.ty PNone p b.ty PNone q ty proj_ty)
+          | ASymbolic(PNone,AProjLoans p),ASymbolic(PNone,AProjLoans q) ->
+              let proj_ty=types p.proj.proj_ty q.proj.proj_ty in
+              ignore(match_loan_proj (match_values ctx0 ctx1) ctx0 ctx1
+                a.ty PNone p b.ty PNone q ty proj_ty)
+          | ALoan(ASharedLoan(PNone,lid,shared,child)),
+            ALoan(ASharedLoan(PNone,lid1,shared1,child1)) ->
+              let payload=match_values ctx0 ctx1 shared shared1 in
+              let child_ty=types child.ty child1.ty in
+              let matched_child={child1 with ty=child_ty} in
+              (match shared.value with
+              | VBorrow(VSharedBorrow _) ->
+                  if not(mapped_shared_reference_payload span ctx0 ctx1 a b ty payload matched_child)
+                  then raise_distinct "checked shared reference payload changed"
+              | VSymbolic _ | VLiteral _ | VAdt _ -> ()
+              | _->raise_distinct "checked shared reference family changed");
+              ignore(match_loan (match_values ctx0 ctx1) ctx0 ctx1
+                a.ty PNone lid shared child b.ty PNone lid1 shared1 child1 ty payload matched_child)
+          | _->raise_distinct "checked shared reference family root changed") avalues0 avalues1;
+        []
+    | None -> match shared_group with
+      | Some (left,right) ->
+          List.iter2 (fun a b -> ignore (match_tavalues ctx0 ctx1 a b))
+            left.fixed_borrows right.fixed_borrows;
+          let match_sid=if recover then RecoverCEM.match_symbolic_value_ids else CEM.match_symbolic_value_ids in
+          List.iter2 (fun (a:InterpSharedInterfaceMatch.endpoint) (b:InterpSharedInterfaceMatch.endpoint) ->
+            ignore (match_sid a.sid b.sid)) left.projectors right.projectors;
+          let match_values=if recover then RecoverM.match_tvalues else M.match_tvalues in
+          let match_shared_loan=if recover then RecoverCEM.match_ashared_loans
+            else CEM.match_ashared_loans in
+          List.iter2 (fun ((a:tavalue),_) ((b:tavalue),_) ->
+            match a.value,b.value with
+            | ALoan(ASharedLoan(pm0,id0,shared0,child0)),
+              ALoan(ASharedLoan(pm1,id1,shared1,child1)) ->
+                (* The final shared-group view already checks the complete
+                   outer reference masks and referent types. Its owned outer
+                   lifetimes end together, so do not reintroduce an injective
+                   RID constraint for those ghost wrappers. Match the actual
+                   payload, child, loan IDs and markers through the original
+                   native callbacks; no context or original type is changed. *)
+                let shared=match_values ctx0 ctx1 shared0 shared1 in
+                let child=match_tavalues ctx0 ctx1 child0 child1 in
+                ignore (match_shared_loan (match_values ctx0 ctx1) ctx0 ctx1
+                  a.ty pm0 id0 shared0 child0 b.ty pm1 id1 shared1 child1
+                  b.ty shared child)
+            | ABorrow(ASharedBorrow(pm0,bid0,sid0)),
+              ABorrow(ASharedBorrow(pm1,bid1,sid1)) ->
+                let match_shared_borrow=if recover then RecoverCEM.match_ashared_borrows
+                  else CEM.match_ashared_borrows in
+                (* The checked final-only view compares the original complete
+                   shared referent and mask. Run the native permission-ID
+                   callback without inventing an injective ghost-RID map. *)
+                ignore(match_shared_borrow (match_values ctx0 ctx1) ctx0 ctx1
+                  a.ty pm0 bid0 sid0 b.ty pm1 bid1 sid1 b.ty)
+            | _ -> [%craise_recover] recover span
+                "Final shared interface lost its checked concrete permission")
+            left.concrete right.concrete;
+          SymbolicValueId.Map.iter (fun sid original ->
+            let actual=SymbolicValueId.Map.find sid right.history_values in
+            ignore (match_values ctx0 ctx1
+              (mk_tvalue_from_symbolic_value original)
+              (mk_tvalue_from_symbolic_value actual))) left.history_values;
+          if Sys.getenv_opt "AENEAS_TRACE_SHARED_INTERFACE_MATCH" = Some "1" then
+            Printf.eprintf "FINAL_SHARED_INTERFACE_MATCH left=%s right=%s\n%!"
+              (AbsId.to_string abs0.abs_id) (AbsId.to_string abs1.abs_id);
+          []
+      | None ->
       if List.length avalues0 <> List.length avalues1 then
         raise_distinct "Region abstractions with not the same number of values"
       else
-        List.map
-          (fun (v0, v1) -> match_tavalues ctx0 ctx1 v0 v1)
+        List.mapi
+          (fun i (v0, v1) ->
+            abstraction_match_step := "avalue/" ^ string_of_int i;
+            abstraction_match_values := Some(v0,v1);
+            let unchanged_shared_symbolic =
+              if not (match_current_interface && not check_equiv
+                && InterpSharedPacketSignature.enabled () && abs_id0=abs_id1
+                && InterpSharedHistory.same_complete_value v0 v1) then None
+              else match v0.value,v1.value with
+                | ALoan(ASharedLoan(PNone,id0,shared0,child0)),
+                  ALoan(ASharedLoan(PNone,id1,shared1,child1)) ->
+                    (match shared0.value,shared1.value,child0.value,child1.value with
+                    | VSymbolic sym0,VSymbolic sym1,AIgnored _,AIgnored _ ->
+                        let shared_live ctx =
+                          let info=TypesAnalysis.analyze_ty (Some span)
+                            ctx.type_ctx.type_infos sym0.sv_ty in
+                          let wrapper_info=TypesAnalysis.analyze_ty (Some span)
+                            ctx.type_ctx.type_infos v0.ty in
+                          info.contains_borrow && not info.contains_mut_borrow
+                          && not info.contains_static
+                          && not wrapper_info.contains_mut_borrow
+                          && not wrapper_info.contains_static
+                          && RegionId.Set.is_empty (RegionId.Set.inter
+                            (ty_regions sym0.sv_ty) ctx.ended_regions)
+                          && not (tvalue_has_loans_or_borrows (Some span) ctx shared0)
+                        in
+                        if shared_live ctx0 && shared_live ctx1 then
+                          Some(id0,shared0,child0,sym0,id1,shared1,child1,sym1)
+                        else None
+                    | _ -> None)
+                | _ -> None
+            in
+            match unchanged_shared_symbolic with
+            | Some(id0,shared0,child0,sym0,id1,shared1,child1,sym1) ->
+                (* The same original loan can carry a symbolic runtime type
+                   whose inner regions differ from its abstract ghost child.
+                   Native typing deliberately relates those by erasure. Check
+                   both original nodes, then run every ordinary callback,
+                   including the runtime type's separate region identities.
+                   This final-call observer edits no node or continuation. *)
+                (Invariants.check_typing_invariant_visitor span ctx0 false)#visit_abs None
+                  {abs0 with avalues=[v0];cont=None};
+                (Invariants.check_typing_invariant_visitor span ctx1 false)#visit_abs None
+                  {abs1 with avalues=[v1];cont=None};
+                let match_types=if recover then RecoverCEM.match_rtys else CEM.match_rtys in
+                let match_values=if recover then RecoverM.match_tvalues else M.match_tvalues in
+                let match_loan=if recover then RecoverCEM.match_ashared_loans
+                  else CEM.match_ashared_loans in
+                let ty=match_types ctx0 ctx1 v0.ty v1.ty in
+                ignore(match_types ctx0 ctx1 sym0.sv_ty sym1.sv_ty);
+                let shared=match_values ctx0 ctx1 shared0 shared1 in
+                let child=match_tavalues ctx0 ctx1 child0 child1 in
+                match_loan (match_values ctx0 ctx1) ctx0 ctx1
+                  v0.ty PNone id0 shared0 child0 v1.ty PNone id1 shared1 child1
+                  ty shared child
+            | None ->
+            let unchanged_shared_wrapper =
+              if not (match_current_interface && not check_equiv
+                && InterpSharedPacketSignature.enabled () && abs_id0=abs_id1
+                && InterpSharedHistory.same_complete_value v0 v1) then None
+              else match v0.value,v1.value with
+                | ALoan(AIgnoredSharedLoan ({value=ASymbolic(PNone,
+                    AProjLoans {consumed=[];borrows=[];_});_} as child0)),
+                  ALoan(AIgnoredSharedLoan child1) ->
+                    let live_shared ctx =
+                      let info=TypesAnalysis.analyze_ty (Some span)
+                        ctx.type_ctx.type_infos v0.ty in
+                      info.contains_borrow && not info.contains_mut_borrow
+                      && not info.contains_static
+                      && RegionId.Set.is_empty (RegionId.Set.inter
+                        (ty_regions v0.ty) ctx.ended_regions) in
+                    if live_shared ctx0 && live_shared ctx1 then Some(child0,child1)
+                    else None
+                | _ -> None in
+            match unchanged_shared_wrapper with
+            | Some(child0,child1) ->
+                (* A native shared reborrow's unchanged interior loan keeps
+                   its ignored outer wrapper. Match the complete original
+                   types and projector through the ordinary callbacks; this
+                   final-only observer neither drops nor reassigns a loan. *)
+                (Invariants.check_typing_invariant_visitor span ctx0 false)#visit_abs None
+                  {abs0 with avalues=[v0];cont=None};
+                (Invariants.check_typing_invariant_visitor span ctx1 false)#visit_abs None
+                  {abs1 with avalues=[v1];cont=None};
+                let match_types=if recover then RecoverCEM.match_rtys else CEM.match_rtys in
+                let ty=match_types ctx0 ctx1 v0.ty v1.ty in
+                let child=match_tavalues ctx0 ctx1 child0 child1 in
+                {ty;value=ALoan(AIgnoredSharedLoan child)}
+            | None ->
+            let unchanged_shared_packet =
+              let shared_type ctx ty =
+                let info=TypesAnalysis.analyze_ty (Some span)
+                  ctx.type_ctx.type_infos ty in
+                not info.contains_mut_borrow && not info.contains_static in
+              let shared_type ty=shared_type ctx0 ty && shared_type ctx1 ty in
+              let rec packet = function
+                | AProjLoans {proj;consumed=[];borrows} ->
+                    shared_type proj.proj_ty && history borrows
+                | AProjBorrows {proj;loans} ->
+                    shared_type proj.proj_ty && history loans
+                | AEndedProjLoans {proj_ty;consumed=[];borrows=[];_} ->
+                    shared_type proj_ty
+                | _ -> false
+              and history entries=List.for_all (fun ((meta:mconsumed_symb),child) ->
+                shared_type meta.proj_ty && packet child) entries in
+              let rec shared_tree (value:tavalue) =
+                shared_type value.ty && match value.value with
+                | ASymbolic(PNone,p) -> packet p
+                | AAdt adt -> List.for_all shared_tree adt.fields
+                | AIgnored None -> true
+                | AIgnored(Some {value=VSymbolic symbolic;ty}) ->
+                    equal_ty ty (Substitute.erase_regions symbolic.sv_ty)
+                    && not(TypesUtils.ty_has_borrows (Some span) ctx0.type_ctx.type_infos symbolic.sv_ty)
+                    && not(TypesUtils.ty_has_borrows (Some span) ctx1.type_ctx.type_infos symbolic.sv_ty)
+                | _ -> false in
+              match_current_interface && not check_equiv
+              && InterpSharedPacketSignature.enabled () && abs_id0=abs_id1
+              && RegionId.Set.equal abs0.regions.owned abs1.regions.owned
+              && InterpSharedHistory.same_complete_value v0 v1
+              && (match v0.value with
+                | ASymbolic(PNone,(AProjLoans {borrows=_::_;_} as p))
+                | ASymbolic(PNone,(AProjBorrows {loans=_::_;_} as p)) ->
+                    shared_type v0.ty && packet p
+                | ABorrow(AEndedIgnoredMutBorrow b) ->
+                    shared_tree b.child && shared_tree b.given_back
+                    && shared_type b.given_back_meta.sv_ty
+                | AAdt _ -> shared_tree v0
+                | _ -> false)
+              && InterpSharedHistory.empty_native_interface span ctx0 abs0 v0
+              && InterpSharedHistory.empty_native_interface span ctx1 abs1 v1 in
+            if unchanged_shared_packet then begin
+              (* A final loop application may retain the very same current
+                 shared projector together with its ancestor-return history.
+                 Compare the complete tree, rather than using the generic
+                 history-free projector matcher. Native typing, owned masks,
+                 sublevels and all original metadata remain checked. This is
+                 only an identity observer: every actual and historical type
+                 and SID goes through the ordinary injective callbacks; no
+                 permission, continuation or history entry is removed. *)
+              ignore (InterpSharedPacketSignature.check span ctx0
+                {abs0 with avalues=[v0];cont=None});
+              ignore (InterpSharedPacketSignature.check span ctx1
+                {abs1 with avalues=[v1];cont=None});
+              let match_types=if recover then RecoverCEM.match_rtys else CEM.match_rtys in
+              let match_sid=if recover then RecoverCEM.match_symbolic_value_ids
+                else CEM.match_symbolic_value_ids in
+              let projection (proj:symbolic_proj) =
+                ignore(match_types ctx0 ctx1 proj.proj_ty proj.proj_ty);
+                ignore(match_sid proj.sv_id proj.sv_id) in
+              let rec packet = function
+                | AProjLoans {proj;consumed=[];borrows} -> projection proj; history borrows
+                | AProjBorrows {proj;loans} -> projection proj; history loans
+                | AEndedProjLoans {proj;proj_ty;consumed=[];borrows=[]} ->
+                    ignore(match_types ctx0 ctx1 proj_ty proj_ty);
+                    ignore(match_sid proj proj)
+                | _ -> [%internal_error] span
+              and history entries=List.iter (fun ((meta:mconsumed_symb),child) ->
+                ignore(match_types ctx0 ctx1 meta.proj_ty meta.proj_ty);
+                ignore(match_sid meta.sv_id meta.sv_id);
+                packet child) entries in
+              ignore(match_types ctx0 ctx1 v0.ty v1.ty);
+              let rec shared_tree (value:tavalue) =
+                ignore(match_types ctx0 ctx1 value.ty value.ty);
+                match value.value with
+                | ASymbolic(PNone,p) -> packet p
+                | AAdt adt -> List.iter shared_tree adt.fields
+                | AIgnored None -> ()
+                | AIgnored(Some ({value=VSymbolic symbolic;_} as value)) ->
+                    ignore(match_types ctx0 ctx1 symbolic.sv_ty symbolic.sv_ty);
+                    let match_values=if recover then RecoverM.match_tvalues else M.match_tvalues in
+                    ignore(match_values ctx0 ctx1 value value)
+                | _ -> [%internal_error] span in
+              (match v0.value with
+                | ASymbolic(PNone,p) -> packet p
+                | AAdt _ -> shared_tree v0
+                | ABorrow(AEndedIgnoredMutBorrow b) ->
+                    (* The outer mutable borrow has already ended. Preserve
+                       its exact child/given-back levels and original return
+                       metadata; only the interior shared permissions remain. *)
+                    ignore(match_types ctx0 ctx1 b.child.ty b.child.ty);
+                    ignore(match_types ctx0 ctx1 b.given_back.ty b.given_back.ty);
+                    ignore(match_types ctx0 ctx1 b.given_back_meta.sv_ty b.given_back_meta.sv_ty);
+                    ignore(match_sid b.given_back_meta.sv_id b.given_back_meta.sv_id);
+                    shared_tree b.child; shared_tree b.given_back
+                | _ -> [%internal_error] span);
+              v0
+            end else
+            if match_current_interface && not check_equiv
+              && InterpSharedPacketSignature.enabled ()
+              && (abs_id0=abs_id1 || Option.is_some history_view)
+              && InterpSharedHistory.same_complete_value v0 v1
+              && InterpSharedHistory.permission_free_history span ctx0 v0
+              && InterpSharedHistory.permission_free_history span ctx1 v1
+              && InterpSharedHistory.empty_native_interface span ctx0 abs0 v0
+              && InterpSharedHistory.empty_native_interface span ctx1 abs1 v1
+            then begin
+              (* This is the same complete preserved historical root,
+                 including all metadata fields and original saved environments.
+                 It has no current permission
+                 or mutable interface at any original sublevel. Establish the
+                 ordinary injective identities and actual symbolic-value input
+                 substitutions; no default mapping or context edit is used. *)
+              let ids,values=InterpUtils.compute_abs_ids
+                {abs0 with avalues=[v0];cont=None} in
+              ignore (match_rids ids.rids ids.rids);
+              let match_sid=if recover then RecoverCEM.match_symbolic_value_ids
+                else CEM.match_symbolic_value_ids in
+              SymbolicValueId.Set.iter (fun sid -> ignore(match_sid sid sid)) ids.sids;
+              let match_values=if recover then RecoverM.match_tvalues else M.match_tvalues in
+              SymbolicValueId.Map.iter (fun _ symbolic ->
+                let value=mk_tvalue_from_symbolic_value symbolic in
+                ignore(match_values ctx0 ctx1 value value)) values.sids_to_values;
+              v0
+            end else match_tavalues ctx0 ctx1 v0 v1)
           (List.combine avalues0 avalues1)
     in
     [%ldebug "match_abstractions: values matched OK"];
@@ -2854,8 +3756,14 @@ let match_ctxs (span : Meta.span) ~(check_equiv : bool)
       ^ abs_to_string span ctx0 abs0
       ^ "\n\nIn environment:\n"
       ^ eval_ctx_to_string { ctx1 with env = List.rev env }];
+    let failed_candidates = ref [] in
     env_pop_binding
       (fun _ ->
+        if InterpSharedPacketSignature.enabled ()
+           && ((not recoverable) || diagnose_failure) then
+          Printf.eprintf "ABSTRACTION_MATCH_FAILED left:\n%s\ncandidates:\n%s\n%!"
+            (abs_to_string span ~with_ended:true ctx0 abs0)
+            (String.concat "\n" (List.rev !failed_candidates));
         raise (Distinct "Could not find a matching abs in right environment"))
       (fun e ->
         match e with
@@ -2868,7 +3776,46 @@ let match_ctxs (span : Meta.span) ~(check_equiv : bool)
                 match_abstractions ~recover:true abs0 abs1;
                 [%ltrace "Found matching abs:\n" ^ abs_to_string span ctx1 abs1];
                 Some abs1
-              with Distinct _ | Errors.RFailure ->
+              with (Distinct _ | Errors.RFailure) as error ->
+                if InterpSharedPacketSignature.enabled ()
+                   && ((not recoverable) || diagnose_failure) then (
+                  let reason = match error with
+                    | Distinct message -> message
+                    | _ -> "recoverable structural/type mismatch" in
+                  let shared_payload_owners ctx (value:tavalue) =
+                    let ids=ref BorrowId.Set.empty in
+                    let gather=object inherit [_] iter_tavalue
+                      method! visit_VSharedBorrow () bid _ =
+                        ids:=BorrowId.Set.add bid !ids
+                    end in
+                    gather#visit_tavalue () value;
+                    if BorrowId.Set.is_empty !ids then "" else
+                    let owners=List.filter_map (function
+                      | EAbs owner ->
+                          let found=ref false in
+                          let scan=object inherit [_] iter_tavalue
+                            method! visit_ASharedLoan () _ bid _ _ =
+                              if BorrowId.Set.mem bid !ids then found:=true
+                          end in
+                          List.iter (scan#visit_tavalue ()) owner.avalues;
+                          if !found then Some(abs_to_string span ~with_ended:true ctx owner)
+                          else None
+                      | _ -> None) ctx.env in
+                    "\nshared payload loan owners:\n" ^ String.concat "\n" owners in
+                  let original_values=match !abstraction_match_values with
+                    | None -> ""
+                    | Some(left,right) ->
+                        "\nordinary_equal=" ^ string_of_bool(equal_tavalue left right)
+                        ^ " opaque_equal=" ^ string_of_bool
+                          (InterpRecordedSharedLeafPreservation.same_tavalue left right)
+                        ^ "\noriginal left root: " ^ show_tavalue left
+                        ^ shared_payload_owners ctx0 left
+                        ^ "\noriginal right root: " ^ show_tavalue right
+                        ^ shared_payload_owners ctx1 right in
+                  failed_candidates :=
+                    ("at " ^ !abstraction_match_step ^ ": " ^ reason ^ original_values ^ "\n"
+                     ^ abs_to_string span ~with_ended:true ctx1 abs1)
+                    :: !failed_candidates);
                 (* Restore the state and continue exploring *)
                 restore_maps maps;
                 None
@@ -2922,6 +3869,17 @@ let match_ctxs (span : Meta.span) ~(check_equiv : bool)
     ^ eval_ctx_to_string ~span:(Some span) ~filter:false ctx0
     ^ "\n"];
 
+  (* A final required match can report only its failing binding/candidates,
+     without replaying the matcher or changing recoverable backtracking. *)
+  let failure_context = ref (fun () -> "before environment matching") in
+  let note_failure_context describe =
+    if diagnose_failure then failure_context := describe
+  in
+  let note_value_pair label v0 v1 =
+    note_failure_context (fun () ->
+      label ^ "\nleft: " ^ tvalue_to_string ctx0 v0
+      ^ "\nright: " ^ tvalue_to_string ctx1 v1)
+  in
   (* Rem.: this function raises exceptions of type [Distinct] *)
   let rec match_envs (env0 : env) (env1 : env) : unit =
     [%ldebug
@@ -2941,12 +3899,19 @@ let match_ctxs (span : Meta.span) ~(check_equiv : bool)
       ^ eval_ctx_to_string ~span:(Some span) ~filter:false
           { ctx1 with env = List.rev env1 }
       ^ "\n\n"];
+    note_failure_context (fun () ->
+      match env0 with
+      | e :: _ -> "left binding: " ^ env_elem_to_string span ctx0 e
+      | [] ->
+          "unmatched right bindings:\n"
+          ^ String.concat "\n" (List.map (env_elem_to_string span ctx1) env1));
     match env0 with
     | EBinding (BDummy b0, v0) :: env0' ->
         (* Check whether the dummy value is fixed or not *)
         let v1, env1' =
           if DummyVarId.Set.mem b0 fixed_ids.dids then (
             let v1, env1' = pop_dummy b0 env1 in
+            note_value_pair ("fixed dummy " ^ DummyVarId.to_string b0) v0 v1;
             (* Fixed values: the values must be equal *)
             [%sanity_check_recover] S.recover span (equal_tvalue v0 v1);
             (* The ids present in the left value must be fixed *)
@@ -2956,12 +3921,14 @@ let match_ctxs (span : Meta.span) ~(check_equiv : bool)
             (v1, env1'))
           else pop_first_dummy env1
         in
+        note_value_pair ("dummy " ^ DummyVarId.to_string b0) v0 v1;
         (* Match the values - allows to compute mappings (which
            are the identity actually) *)
         let _ = M.match_tvalues ctx0 ctx1 v0 v1 in
         match_envs env0' env1'
     | EBinding (BVar b0, v0) :: env0' ->
         let v1, env1' = pop_var b0 env1 in
+        note_value_pair ("variable " ^ real_var_binder_to_string ctx0 b0) v0 v1;
         (* Match the values *)
         let _ = M.match_tvalues ctx0 ctx1 v0 v1 in
         (* Continue *)
@@ -2971,6 +3938,10 @@ let match_ctxs (span : Meta.span) ~(check_equiv : bool)
         if AbsId.Set.mem abs0.abs_id fixed_ids.aids then (
           [%ldebug "match_envs: matching abs: fixed abs"];
           let abs1, env1' = pop_abs abs0.abs_id env1 in
+          note_failure_context (fun () ->
+            "fixed abstraction\nleft: "
+            ^ abs_to_string span ~with_ended:true ctx0 abs0
+            ^ "\nright: " ^ abs_to_string span ~with_ended:true ctx1 abs1);
           (* Still in the prefix: the abstractions must be the same *)
           [%sanity_check_recover] S.recover span (equal_abs abs0 abs1);
           (* Their ids must be fixed *)
@@ -3010,7 +3981,20 @@ let match_ctxs (span : Meta.span) ~(check_equiv : bool)
     | _ -> [%craise] span "Unreachable"
   in
 
-  match_envs env0 env1;
+  (try match_envs env0 env1 with
+  | (Distinct _ | ValueMatchFailure _ | Errors.RFailure) as error ->
+      if diagnose_failure then (
+        let reason = match error with
+          | Distinct message -> message
+          | ValueMatchFailure kind -> show_updt_env_kind kind
+          | _ -> "recoverable structural/type mismatch" in
+        Printf.eprintf
+          "CONTEXT_MATCH_FAILED reason=%s\n%s\nregion_map=%s\nsymbolic_map=%s\nabstraction_map=%s\n%!"
+          reason ((!failure_context) ())
+          (RegionId.InjSubst.show_t !rid_map)
+          (SymbolicValueId.InjSubst.show_t !sid_map)
+          (AbsId.InjSubst.show_t !aid_map));
+      raise error);
   let maps =
     {
       aid_map = !aid_map;
@@ -3026,14 +4010,16 @@ let match_ctxs (span : Meta.span) ~(check_equiv : bool)
 
 let try_match_ctxs (span : Meta.span) ~(check_equiv : bool)
     ?(check_kind : bool = true) ?(check_can_end : bool = true)
-    (fixed_ids : ids_sets) (lookup_shared_value_in_ctx0 : BorrowId.id -> tvalue)
+    ?(diagnose_failure : bool = false)
+    ?(match_current_interface : bool = false) (fixed_ids : ids_sets)
+    (lookup_shared_value_in_ctx0 : BorrowId.id -> tvalue)
     (lookup_shared_value_in_ctx1 : BorrowId.id -> tvalue) (ctx0 : eval_ctx)
     (ctx1 : eval_ctx) : ids_maps option =
   try
     Some
       (match_ctxs span ~check_equiv ~check_kind ~check_can_end ~recoverable:true
-         fixed_ids lookup_shared_value_in_ctx0 lookup_shared_value_in_ctx1 ctx0
-         ctx1)
+         ~diagnose_failure ~match_current_interface fixed_ids
+         lookup_shared_value_in_ctx0 lookup_shared_value_in_ctx1 ctx0 ctx1)
   with
   | Distinct msg ->
       [%ltrace "distinct: " ^ msg];

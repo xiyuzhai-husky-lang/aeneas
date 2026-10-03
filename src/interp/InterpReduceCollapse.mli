@@ -89,6 +89,8 @@ type borrow_or_proj =
 val collapse_ctx :
   config ->
   Meta.span ->
+  ?recorded_packet_merges:(abs_id * InterpPacketRouting.recorded_merge) list ref ->
+  ?recorded_shared_components:InterpRecordedSharedComponent.action list ref ->
   ?recorded_shared_leaves:InterpRecordedSharedLeaf.right_shared_leaf list ref option ->
   ?sequence:(abs_id * abs_id * abs_id) list ref option ->
   ?shared_borrows_seq:
@@ -113,7 +115,9 @@ val collapse_ctx :
     was computed by, e.g., [collapse_ctx], one should reverse the sequence
     before calling [collapse_ctx_no_markers_following_sequence]. *)
 val collapse_ctx_no_markers_following_sequence :
-  Meta.span ->
+  config -> Meta.span ->
+  ?recorded_packet_merges:(abs_id * InterpPacketRouting.recorded_merge) list ->
+  ?recorded_shared_components:InterpRecordedSharedComponent.action list ->
   ?recorded_shared_leaves:InterpRecordedSharedLeaf.right_shared_leaf list ->
   ?recorded_fixed_aids:AbsId.Set.t option ->
   (abs_id * abs_id * abs_id) list ->
@@ -125,5 +129,5 @@ val collapse_ctx_no_markers_following_sequence :
 
 (** Restricted analysis-only dead shared projector ending; default-off. *)
 val end_dead_shared_analysis_projections :
-  Meta.span -> with_abs_conts:bool -> recording:bool -> AbsId.Set.t ->
+  config -> Meta.span -> with_abs_conts:bool -> recording:bool -> AbsId.Set.t ->
   eval_ctx -> eval_ctx

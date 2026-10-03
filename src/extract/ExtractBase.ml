@@ -1276,6 +1276,8 @@ let builtin_pure_functions () : (pure_builtin_fun_id * string) list =
         (IndexMutAtIndex Array, "Array.index_mut_usize");
         (ToResult, "lift");
         (ResultUnwrapMut, "core.result.Result.unwrap.mut");
+        (OptionExpectMut, "core.option.Option.expect_mut");
+        (ResultAndThenMutCapture, "core.result.Result.and_then_mut_capture");
         (GetTarget, "get_target");
         (TargetFeatureEnabled, "target_feature_enabled");
       ]

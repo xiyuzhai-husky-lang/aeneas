@@ -12,7 +12,10 @@ let enabled () = Sys.getenv_opt "AENEAS_EXPERIMENTAL_RECORDED_SHARED_LEAF" = Som
 let require span b message =
   [%cassert] span b ("Recorded shared leaf: " ^ message)
 
+type leaf_placement = TopLevel | UnderIgnoredSharedLoan
+
 type right_shared_leaf = {
+  placement : leaf_placement;
   recorded_owner : abs_id;
   sid : symbolic_value_id;
   full_type : ty;
@@ -101,9 +104,32 @@ let current_owner span ctx aid =
   require span (in_frame ctx.env) "owner outside current frame";
   List.hd all
 
-let roots sid (owner : abs) = List.filter_map (fun (i, (v : tavalue)) -> match v.value with
-  | ASymbolic (pm, AProjLoans q) when q.proj.sv_id = sid -> Some (i, v, pm, q)
-  | _ -> None) (List.mapi (fun i v -> i, v) owner.avalues)
+(** Exactly two supported locations. An ignored shared wrapper carries no
+    consumed or given-back interface of its own; its live child is still a
+    permission and must be ended by the native operation before cleanup. *)
+let loan_at_root (root : tavalue) =
+  let selected placement (leaf : tavalue) = match leaf.value with
+    | ASymbolic (marker, AProjLoans proj) -> Some (placement, leaf, marker, proj)
+    | _ -> None in
+  match root.value with
+  | ALoan (AIgnoredSharedLoan child) -> selected UnderIgnoredSharedLoan child
+  | _ -> selected TopLevel root
+
+let replace_leaf placement (root : tavalue) (leaf : tavalue) =
+  match placement with
+  | TopLevel -> leaf
+  | UnderIgnoredSharedLoan -> {root with value=ALoan(AIgnoredSharedLoan leaf)}
+
+let right_leaf_root_index (owner : abs) =
+  List.find_map (fun (i,root) -> match loan_at_root root with
+    | Some (_,_,PRight,_) -> Some i
+    | _ -> None) (List.mapi (fun i v -> i,v) owner.avalues)
+
+let roots sid (owner : abs) = List.filter_map (fun (i, root) ->
+  match loan_at_root root with
+  | Some (placement,leaf,marker,proj) when proj.proj.sv_id=sid ->
+      Some (i,root,placement,leaf,marker,proj)
+  | _ -> None) (List.mapi (fun i v -> i,v) owner.avalues)
 
 let validate_leaf span ~fixed_aids ~marker ctx owner sid =
   require span (owner.kind = WithCont && owner.can_end && Option.is_some owner.cont)
@@ -112,11 +138,26 @@ let validate_leaf span ~fixed_aids ~marker ctx owner sid =
   require span (not (AbsLevelSet.mem 0 owner.ended_subabs)) "level zero already ended";
   require span (current_owner span ctx owner.abs_id == owner)
     "owner is not the current physical object";
+  if count_a sid owner <> 1 then
+    Printf.eprintf "RECORDED_SHARED_LEAF_NONUNIQUE owner=%s sid=%s\n%s\n%!"
+      (AbsId.to_string owner.abs_id) (SymbolicValueId.to_string sid)
+      (InterpUtils.abs_to_string span ~with_ended:true ctx owner);
   require span (count_a sid owner = 1) "target A occurrence is not unique";
   require span (count_e sid ctx = 0) "current E projector counterpart exists";
   let xs = roots sid owner in
-  require span (List.length xs = 1) "target is not a unique top-level active loan";
-  let i, v, pm, q = List.hd xs in
+  require span (List.length xs = 1) "target is not a unique supported active loan";
+  let i, root, placement, v, pm, q = List.hd xs in
+  (match placement, root.ty with
+  | TopLevel, _ -> ()
+  | UnderIgnoredSharedLoan, TRef(RVar(Free outer), referent, RShared) ->
+      require span (not (RegionId.Set.mem outer owner.regions.owned))
+        "ignored shared wrapper owns its outer reference region";
+      require span (equal_ty referent v.ty)
+        "ignored shared wrapper child disagrees with its referent type"
+  | UnderIgnoredSharedLoan, _ ->
+      require span false "ignored shared wrapper is not a native shared reference");
+  (Invariants.check_typing_invariant_visitor span ctx false)#visit_abs None
+    {owner with avalues=[root];cont=None};
   require span (pm = marker) "wrong side/marker";
   require span (q.consumed = [] && q.borrows = []) "nonempty target history";
   require span (equal_ty v.ty q.proj.proj_ty) "typed root/own projector type mismatch";
@@ -130,7 +171,7 @@ let validate_leaf span ~fixed_aids ~marker ctx owner sid =
     "ended owned region in selected projection";
   require span (not (TypesUtils.ty_has_mut_borrow_for_region_in_set
     ctx.type_ctx.type_infos owner.regions.owned q.proj.proj_ty)) "owned mutable projection";
-  i, v, q
+  i, root, placement, v, q
 
 (** Original input lineage is calculated from the chronological merge program.
     No final marker alone is accepted as a source witness. *)
@@ -156,26 +197,26 @@ let origins span original chronological final =
 
 let plan_right_leaf span ~original_joined ~chronological_merges ~fixed_aids ctx owner index =
   require span (enabled ()) "feature disabled";
-  let sid = match (List.nth owner.avalues index).value with
-    | ASymbolic (PRight, AProjLoans q) -> q.proj.sv_id
+  let sid = match loan_at_root (List.nth owner.avalues index) with
+    | Some (_,_,PRight,q) -> q.proj.sv_id
     | _ -> [%craise] span "Recorded shared leaf: selected root is not a right loan" in
   Printf.eprintf "RECORDED_SHARED_LEAF attempt owner=%s sid=%s root=%d chronological_merges=%d\n%!"
     (AbsId.to_string owner.abs_id) (SymbolicValueId.to_string sid) index (List.length chronological_merges);
-  let i, _, q = validate_leaf span ~fixed_aids ~marker:PRight ctx owner sid in
+  let i, root, placement, _, _ = validate_leaf span ~fixed_aids ~marker:PRight ctx owner sid in
   require span (i = index) "selected root index mismatch";
   let lineage = origins span original_joined chronological_merges owner.abs_id in
   let candidates = List.concat_map (fun aid ->
     let a = current_owner span original_joined aid in
-    List.filter_map (fun (_, (v : tavalue), pm, (oq : aproj_loans)) ->
-      if pm = PRight && oq.consumed = [] && oq.borrows = []
+    List.filter_map (fun (_, (original_root : tavalue), original_placement, (v : tavalue), pm, (oq : aproj_loans)) ->
+      if original_placement=placement && pm = PRight && oq.consumed = [] && oq.borrows = []
          && equal_ty v.ty oq.proj.proj_ty && count_a sid a = 1
-      then Some (a, oq.proj.proj_ty) else None) (roots sid a)) (AbsId.Set.elements lineage) in
+      then Some (a, original_root.ty) else None) (roots sid a)) (AbsId.Set.elements lineage) in
   require span (List.length candidates = 1) "no unique original right leaf witness";
   let origin, origin_ty = List.hd candidates in
   check_transport span ctx ~left_ty:origin_ty ~left_owned:origin.regions.owned
-    ~left_ended:original_joined.ended_regions ~right_ty:q.proj.proj_ty
+    ~left_ended:original_joined.ended_regions ~right_ty:root.ty
     ~right_owned:owner.regions.owned ~right_ended:ctx.ended_regions;
-  {recorded_owner=owner.abs_id; sid; full_type=q.proj.proj_ty;
+  {placement; recorded_owner=owner.abs_id; sid; full_type=root.ty;
    owned=owner.regions.owned; ended_regions=ctx.ended_regions; original_root_index=i;
    origin_owner=origin.abs_id; origin_full_type=origin_ty; origin_owned=origin.regions.owned}
 
@@ -184,20 +225,37 @@ let plan_right_leaf span ~original_joined ~chronological_merges ~fixed_aids ctx 
     the global cleanup is deliberately not reapplied to unrelated roots. *)
 let apply_leaf span ~fixed_aids ~marker action owner ctx =
   require span (enabled ()) "action feature disabled";
-  let index, original, q = validate_leaf span ~fixed_aids ~marker ctx owner action.sid in
+  let index, original_root, placement, original, q = validate_leaf span ~fixed_aids ~marker ctx owner action.sid in
+  require span (placement=action.placement) "selected leaf changed its wrapper location";
   check_transport span ctx ~left_ty:action.full_type ~left_owned:action.owned
-    ~left_ended:action.ended_regions ~right_ty:q.proj.proj_ty
+    ~left_ended:action.ended_regions ~right_ty:original_root.ty
     ~right_owned:owner.regions.owned ~right_ended:ctx.ended_regions;
   (* Contexts.map_eval_ctx changes only env (Contexts.ml:568-575). The complete
      expected environment is independently checked below before old objects
      are retained; ordinary equality alone is intentionally insufficient. *)
+  (* Failure-only dependency evidence. The native guard below remains the
+     authority; a recorded leaf cannot consume any intersecting reborrow. *)
+  (match lookup_intersecting_aproj_borrows_opt span true owner.regions.owned q.proj ctx with
+  | None -> ()
+  | Some borrowers ->
+      Printf.eprintf "RECORDED_SHARED_LEAF blocked owner=%s sid=%s marker=%s\n%s\n%!"
+        (AbsId.to_string owner.abs_id) (SymbolicValueId.to_string action.sid)
+        (show_proj_marker marker) (InterpUtils.abs_to_string span ~with_ended:true ctx owner);
+      let trace kind (aid, ty, level) =
+        Printf.eprintf "RECORDED_SHARED_LEAF blocker kind=%s owner=%s level=%d fixed=%b proj_ty=%s\n%!"
+          kind (AbsId.to_string aid) level (AbsId.Set.mem aid fixed_aids)
+          (InterpUtils.ty_to_string ctx ty) in
+      List.iter (trace "shared") borrowers.shared_projs;
+      List.iter (trace "ordinary") borrowers.non_shared_projs;
+      Invariants.trace_symbolic_value span "blocked recorded shared leaf" ctx action.sid);
   let native = InterpBorrows.end_unblocked_proj_loans span owner.abs_id owner.regions.owned q.proj ctx in
   let updated = current_owner span native owner.abs_id in
   require span (List.length updated.avalues = List.length owner.avalues)
     "native update changed root count";
   require span (Preserve.same_cont owner.cont updated.cont) "native update changed saved continuation";
-  let expected = {original with value=ASymbolic(marker,AEndedProjLoans {
+  let expected_leaf = {original with value=ASymbolic(marker,AEndedProjLoans {
     proj_ty=q.proj.proj_ty;proj=q.proj.sv_id;consumed=[];borrows=[]})} in
+  let expected = replace_leaf placement original_root expected_leaf in
   List.iteri (fun i v -> require span
     (Preserve.same_tavalue (if i=index then expected else List.nth owner.avalues i) v)
     "native update changed unexpected A payload") updated.avalues;

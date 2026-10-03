@@ -13,7 +13,7 @@ let log = Logging.symbolic_to_pure_expressions_log
     The original loop packet translator already omitted this exact unit function.
     Validate native subject types including metadata which ordinary visitors skip. *)
 let is_filtered_shared_loop_level (span : Meta.span) (crate : A.crate)
-    (type_infos : TypesAnalysis.type_infos) (abs_level : V.abs_level)
+    (ectx : C.eval_ctx) (type_infos : TypesAnalysis.type_infos) (abs_level : V.abs_level)
     (abs : V.abs) ~(has_binding : bool) ~(is_ignored : bool) : bool =
   let canonical_unit ty = T.equal_ty ty TypesUtils.mk_unit_ty in
   let shape =
@@ -22,14 +22,52 @@ let is_filtered_shared_loop_level (span : Meta.span) (crate : A.crate)
       Some { input = Some { value = V.EApp (V.ELoop (aid, lid), [ [] ]); ty = ity };
              output = Some { value = V.EAdt { borrow_proj = true; variant_id = None; fields = [] }; ty = oty } } ->
         aid = abs.abs_id && lid = loop_id && canonical_unit ity && canonical_unit oty
+    | V.Join,
+      Some { input = Some { value = V.EApp (V.EJoin aid, [ [] ]); ty = ity };
+             output = Some { value = V.EAdt { borrow_proj = true; variant_id = None; fields = [] }; ty = oty } } ->
+        (* Joins use the same native unit-continuation filtering as loops.
+           Its original EJoin must identify this exact already-filtered owner;
+           the caller still checks both level interfaces and translates the
+           original input to the exact non-failing unit expression. *)
+        aid = abs.abs_id && canonical_unit ity && canonical_unit oty
     | _ -> false
   in
-  if abs_level <= 0 || has_binding || not is_ignored || not shape then false
+  if abs_level <= 0 || has_binding || not is_ignored || not shape then (
+    Printf.eprintf
+      "FILTERED_SHARED_LOOP_REJECTED level=%d has_binding=%b ignored=%b shape=%b\nowner=%s\n%!"
+      abs_level has_binding is_ignored shape (V.show_abs abs);
+    false)
   else (
     let visitor = object (self)
       inherit [_] V.iter_tavalue as super
+      method! visit_tavalue () (value : V.tavalue) =
+        match value.value,value.ty with
+        | V.ABorrow (V.AEndedIgnoredMutBorrow ended),
+          T.TRef (T.RVar (T.Free outer),referent,T.RMut)
+          when not (T.RegionId.Set.mem outer abs.regions.owned)
+            && T.equal_ty ended.child.ty referent
+            && T.equal_ty ended.given_back.ty referent
+            && T.equal_ty ended.given_back_meta.sv_ty referent
+            && V.AbsLevelSet.mem abs_level abs.ended_subabs
+            && not (V.AbsLevelSet.mem 0 abs.ended_subabs)
+            && InterpSharedHistory.empty_native_interface span ectx abs value ->
+            (* Native projection classification does not assign a mutable
+               interface to this already-ended ignored outer borrow. Its
+               child stays at this level, and its given-back loan is at the
+               next level. Check every original referent/metadata type and
+               retain the entire wrapper; do not treat its historical &mut
+               type as a fresh active mutable projector. *)
+            self#visit_ty () referent;
+            self#visit_tavalue () ended.child;
+            self#visit_tavalue () ended.given_back;
+            self#visit_msymbolic_value () ended.given_back_meta
+        | _ -> super#visit_tavalue () value
       method! visit_ty () ty =
-        ignore (InterpMatchCtxs.validate_symbolic_hierarchy_type span crate type_infos ty);
+        (try ignore (InterpMatchCtxs.validate_symbolic_hierarchy_type span crate type_infos ty)
+         with exn ->
+           Printf.eprintf "FILTERED_SHARED_LOOP_TYPE_REJECTED level=%d type=%s\nowner=%s\n%!"
+             abs_level (T.show_ty ty) (V.show_abs abs);
+           raise exn);
         super#visit_ty () ty
       method! visit_mvalue () v = self#visit_tvalue () v; super#visit_mvalue () v
       method! visit_msymbolic_value () v = self#visit_symbolic_value () v; super#visit_msymbolic_value () v
@@ -906,6 +944,88 @@ and translate_function_call_aux (call : S.call) (e : S.expr) (ctx : bs_ctx) :
             else call_e)
     | _ -> call_e
   in
+  (* The ordinary Option.expect model has no backward component. At an actual
+     call with T = &mut U, preserve the native return/give-back signature with
+     the corresponding library lens. Inspect the LLBC type before erasure.
+     Shared references inside U have no mutable backward component and retain
+     their native interpreter ownership; the same lens reconstructs Some U.
+     Nested mutable references and static lifetimes remain outside this model. *)
+  let call_e =
+    match (Config.backend (), call.call_id, call.generics.types) with
+    | Lean, S.Fun (Fun fid, _), [T.TRef (_, referent, T.RMut)]
+      when (let info = TypesAnalysis.analyze_ty (Some ctx.span)
+                  ctx.type_ctx.type_infos referent in
+            not (info.contains_mut_borrow || info.contains_static)) -> (
+        match FunDeclId.Map.find_opt fid ctx.decls_ctx.fun_ctx.fun_decls with
+        | Some decl when not decl.item_meta.is_local &&
+            not decl.item_meta.started_from ->
+            let info = match_name_find_opt ctx.decls_ctx decl.item_meta.name
+              (ExtractBuiltin.builtin_funs_map ()) in
+            (match info with
+            | Some { extract_name = "core.option.Option.expect"; _ } ->
+                let app, args = destruct_apps call_e in
+                (match app.e with
+                | Qualif { generics; _ } ->
+                    [%add_loc] mk_apps ctx.span
+                      {app with e = Qualif {
+                        id = FunOrOp (Fun (Pure OptionExpectMut)); generics }} args
+                | _ -> [%internal_error] ctx.span)
+            | _ -> call_e)
+        | _ -> call_e)
+    | _ -> call_e
+  in
+  (* A known native FnOnce closure may return its mutable capture when the
+     consumed callback ends. Preserve this actual backward component in both
+     the dictionary output and the applied Result.and_then binding. *)
+  (if Sys.getenv_opt "AENEAS_TRACE_FN_ONCE_CAPTURE" = Some "1" then
+     match call.call_id with
+     | S.Fun (Fun fid, _) ->
+         (match FunDeclId.Map.find_opt fid ctx.decls_ctx.fun_ctx.fun_decls with
+         | Some decl ->
+             (match match_name_find_opt ctx.decls_ctx decl.item_meta.name
+                 (ExtractBuiltin.builtin_funs_map ()) with
+             | Some {extract_name="core.result.Result.and_then";_} ->
+                 Printf.eprintf "FN_ONCE_CAPTURE_CALL generics=%s\n"
+                   (T.show_generic_args call.generics);
+                 List.iter (fun tr ->
+                   Printf.eprintf "FN_ONCE_CAPTURE_WITNESS trait=%b witness=%b ref=%s\n"
+                     (Option.is_some (AppliedFnOnceCapture.classify_trait
+                        ctx.decls_ctx.crate ctx.type_ctx.type_infos
+                        tr.T.trait_decl_ref.binder_value))
+                     (Option.is_some (AppliedFnOnceCapture.classify_witness
+                        ctx.decls_ctx.crate ctx.type_ctx.type_infos tr))
+                     (T.show_trait_ref tr)) call.generics.trait_refs
+             | _ -> ())
+         | _ -> ())
+     | _ -> ());
+  let call_e = match Config.backend (),call.call_id,call.generics.types with
+    | Lean,S.Fun(Fun fid,_),[_;_;_;closure] ->
+        (match FunDeclId.Map.find_opt fid ctx.decls_ctx.fun_ctx.fun_decls with
+        | Some decl when not decl.item_meta.is_local && not decl.item_meta.started_from ->
+            let binding=match_name_find_opt ctx.decls_ctx decl.item_meta.name
+              (ExtractBuiltin.builtin_funs_map ()) in
+            let witnesses=List.filter_map
+              (AppliedFnOnceCapture.classify_witness ctx.decls_ctx.crate
+                 ctx.type_ctx.type_infos) call.generics.trait_refs in
+            (match binding,witnesses with
+            | Some {extract_name="core.result.Result.and_then";_},[self]
+              when T.equal_ty self closure ->
+                let native_output=(Option.get call.inst_sg).output in
+                let expected=mk_simpl_tuple_ty [
+                  translate_fwd_ty (Some ctx.span) ctx.decls_ctx native_output;
+                  translate_fwd_ty (Some ctx.span) ctx.decls_ctx closure] in
+                [%cassert] ctx.span (dest_v.ty=expected)
+                  "Mutable-capture and_then requires the native complete closure write-back";
+                let app,args=destruct_apps call_e in
+                (match app.e with
+                | Qualif {generics;_} ->
+                    [%add_loc] mk_apps ctx.span
+                      {app with e=Qualif {
+                        id=FunOrOp(Fun(Pure ResultAndThenMutCapture));generics}} args
+                | _ -> [%internal_error] ctx.span)
+            | _ -> call_e)
+        | _ -> call_e)
+    | _ -> call_e in
   [%ldebug "call_e: " ^ texpr_to_string ctx call_e];
   [%ldebug
     "- dest_v.ty: "
@@ -1405,7 +1525,7 @@ and translate_end_abstraction_join_or_loop (ectx : C.eval_ctx) (abs : V.abs)
      Sys.getenv_opt "AENEAS_EXPERIMENTAL_FILTERED_SHARED_LOOP_LEVEL" = Some "1"
   then (
     [%cassert] span
-      (is_filtered_shared_loop_level span ctx.decls_ctx.crate ctx.type_ctx.type_infos
+      (is_filtered_shared_loop_level span ctx.decls_ctx.crate ectx ctx.type_ctx.type_infos
          abs_level abs
          ~has_binding:(V.AbsId.Map.mem abs.abs_id ctx.abs_id_to_info)
          ~is_ignored:(V.AbsId.Set.mem abs.abs_id ctx.ignored_abs_ids))
@@ -1481,7 +1601,41 @@ and translate_end_abstraction_join_or_loop (ectx : C.eval_ctx) (abs : V.abs)
 and translate_end_abstraction_with_cont (ectx : C.eval_ctx) (abs : V.abs)
     (abs_level : abs_level) (e : S.expr) (ctx : bs_ctx) : texpr =
   [%ldebug "abs:\n" ^ abs_to_string ctx abs];
-  [%cassert] ctx.span (abs_level = 0) "Unimplemented";
+  if abs_level > 0 then (
+    (* Native ending retains this owner's continuation until level zero. A
+       strictly shared sublevel neither consumes nor returns Pure data. Do
+       not run that continuation twice: require every original A interface to
+       be empty and every preserved E call to be one the ordinary translator
+       has already classified as unit-to-unit and ignored. Mutable interfaces,
+       captured EValue reads, variables and observable backward calls continue
+       to require the general nested-continuation translation. *)
+    let rec ignored_calls (value : V.tevalue) = match value.value with
+      | V.ELet (_,_,bound,next) -> ignored_calls bound && ignored_calls next
+      | V.EAdt adt -> List.for_all ignored_calls adt.fields
+      | V.EIgnored _ -> true
+      | V.EApp ((V.EFunCall id | V.ELoop (id,_) | V.EJoin id),args) ->
+          V.AbsId.Set.mem id ctx.ignored_abs_ids
+          && not (V.AbsId.Map.mem id ctx.abs_id_to_info)
+          && List.for_all (List.for_all ignored_calls) args
+      | _ -> false in
+    let empty_cont = match abs.cont with
+      | Some {input=Some input;output=Some output} ->
+          ignored_calls input && ignored_calls output
+      | _ -> false in
+    let shared_only = InterpSharedPacketSignature.enabled ()
+      && V.AbsLevelSet.mem abs_level abs.ended_subabs
+      && not (V.AbsLevelSet.mem 0 abs.ended_subabs)
+      && List.for_all
+        (InterpSharedHistory.empty_native_interface ctx.span ectx abs) abs.avalues
+      && InterpSharedInterfaceMatch.continuation_is_shared ectx abs
+      && empty_cont in
+    [%cassert] ctx.span shared_only
+      ("Unsupported nonzero abstraction continuation at level "
+        ^ string_of_int abs_level ^ " (ignored calls=" ^ string_of_bool empty_cont
+        ^ "):\n" ^ abs_to_string ctx abs);
+    translate_expr e ctx)
+  else (
+  [%sanity_check] ctx.span (abs_level = 0);
   (* Translate the continuation *)
   let ctx, can_fail, output, abs_e =
     translate_ended_abs_to_texpr ctx ectx abs abs_level
@@ -1492,7 +1646,7 @@ and translate_end_abstraction_with_cont (ectx : C.eval_ctx) (abs : V.abs)
   (* Translate the next expression *)
   let next_e = translate_expr e ctx in
   (* Put everything together *)
-  [%add_loc] mk_closed_checked_let ctx can_fail output abs_e next_e
+  [%add_loc] mk_closed_checked_let ctx can_fail output abs_e next_e)
 
 and translate_global_eval (gid : A.GlobalDeclId.id) (generics : T.generic_args)
     (sval : V.symbolic_value) (e : S.expr) (ctx : bs_ctx) : texpr =

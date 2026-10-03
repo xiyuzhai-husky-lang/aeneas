@@ -375,7 +375,12 @@ let symbolic_value_id_in_ctx (sv_id : SymbolicValueId.id) (ctx : eval_ctx) :
     the type (this is more general). *)
 let symbolic_value_has_ended_regions (ended_regions : RegionId.Set.t)
     (s : symbolic_value) : bool =
-  let regions = ty_regions s.sv_ty in
+  let regions =
+    try ty_regions s.sv_ty with exn ->
+      Printf.eprintf "SYMBOLIC_ENDED_REGION_TYPE_REJECTED value=%s\n%!"
+        (Values.show_symbolic_value s);
+      raise exn
+  in
   not (RegionId.Set.disjoint regions ended_regions)
 
 let region_is_owned (abs : abs) (r : region) : bool =

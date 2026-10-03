@@ -27,6 +27,12 @@ open Contexts
 val convert_value_to_abstractions :
   Meta.span -> abs_kind -> can_end:bool -> eval_ctx -> tvalue -> abs list
 
+(** Analysis-only native return of newly converted identity reborrows whose
+    old loan still has tracked subscribers. Caller excludes marker synthesis
+    and merge recording; fixed owners and named borrow permissions are checked. *)
+val end_subscribed_identity_reborrows :
+  config -> Meta.span -> AbsId.Set.t -> eval_ctx -> eval_ctx -> eval_ctx
+
 (** Convert a value to a list of *output* avalues (the value should contain
     borrows but no loans), and output and input expressions, so that we can put
     it in a region abstraction.
@@ -217,8 +223,14 @@ type merge_duplicates_funcs = {
 
     We return the updated context as well as the id of the new abstraction which
     results from the merge. *)
+(** Native abstraction composition without a global region substitution. *)
+val merge_abstractions :
+  Meta.span -> abs_kind -> can_end:bool -> merge_duplicates_funcs option ->
+  with_abs_conts:bool -> eval_ctx -> abs -> abs -> abs
+
 val merge_into_first_abstraction :
   ?packet_fixed_abs_ids:AbsId.Set.t ->
+  ?packet_replay:InterpPacketRouting.recorded_merge ->
   Meta.span ->
   abs_kind ->
   can_end:bool ->
@@ -272,3 +284,6 @@ val normalize_ended_shared_aliases :
 (** Separate default-off single-context multi-exit loop boundary admission. *)
 val normalize_after_loop_ended_shared_aliases :
   Meta.span -> AbsId.Set.t -> eval_ctx -> eval_ctx
+
+(** Native whole-environment region quotient used by abstraction merging. *)
+val ctx_merge_regions : eval_ctx -> RegionId.id -> RegionId.Set.t -> eval_ctx

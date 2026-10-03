@@ -350,6 +350,31 @@ def core.slice.index.Slice.index
   (slice : Slice T) (i : I) : Result Output :=
   inst.index i slice
 
+/-- Shared references are erased to their referenced value, as in `Slice.get`. -/
+@[expose, rust_fun "core::slice::{[@T]}::first"]
+def core.slice.Slice.first {T : Type} (s : Slice T) : Result (Option T) :=
+  ok s.val.head?
+
+@[simp] theorem core.slice.Slice.first_exact {T : Type} (s : Slice T) :
+    core.slice.Slice.first s = ok s.val.head? := rfl
+
+@[step] theorem core.slice.Slice.first_spec {T : Type} (s : Slice T) :
+    core.slice.Slice.first s ⦃ result => result = s.val.head? ⦄ := by
+  simp [core.slice.Slice.first]
+
+/-- Shared slice references are erased, as in `first`; the native method
+returns the final element without changing the slice. -/
+@[expose, rust_fun "core::slice::{[@T]}::last"]
+def core.slice.Slice.last {T : Type} (s : Slice T) : Result (Option T) :=
+  ok s.val.getLast?
+
+@[simp] theorem core.slice.Slice.last_exact {T : Type} (s : Slice T) :
+    core.slice.Slice.last s = ok s.val.getLast? := rfl
+
+@[step] theorem core.slice.Slice.last_spec {T : Type} (s : Slice T) :
+    core.slice.Slice.last s ⦃ result => result = s.val.getLast? ⦄ := by
+  simp [core.slice.Slice.last]
+
 @[expose, rust_fun "core::slice::{[@T]}::get"]
 def core.slice.Slice.get
   {T I Output : Type} (inst : core.slice.index.SliceIndex I (Slice T) Output)

@@ -1132,7 +1132,8 @@ and eval_switch_with_join (config : config) (span : Meta.span)
           else
             (* The abstraction is fresh and is thus introduced by the join:
                 we need to update its continuation *)
-            InterpAbs.add_abs_cont_to_abs span joined_ctx abs (EJoin abs.abs_id))
+            InterpAbs.add_abs_cont_to_abs ~shared_packet_signature:!Config.multi_exit_loops
+              span joined_ctx abs (EJoin abs.abs_id))
         joined_ctx
     in
     [%ldebug

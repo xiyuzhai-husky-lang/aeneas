@@ -290,7 +290,10 @@ let extract_const_generic (span : Meta.span) (ctx : extraction_ctx)
 let extract_literal_type (_ctx : extraction_ctx) (fmt : F.formatter)
     (ty : literal_type) : unit =
   match ty with
-  | TBool -> F.pp_print_string fmt (bool_name ())
+  | TBool ->
+      (* A surrounding Rust enum may itself have a Bool constructor. *)
+      F.pp_print_string fmt
+        (if backend () = Lean then "_root_.Bool" else bool_name ())
   | TChar -> F.pp_print_string fmt (char_name ())
   | TInt int_ty ->
       let prefix = if backend () = Lean then "Std." else "" in
@@ -621,12 +624,23 @@ and extract_trait_instance_id (span : Meta.span) (ctx : extraction_ctx)
       | _ -> F.pp_print_string fmt "ERROR(\"Unexpected Self\")")
   | (AppliedSliceVecZip (a,b) | AppliedVecSliceZip (a,b)) as mixed ->
       [%cassert] span (backend () = Lean && AppliedMixedZip.enabled ())
-        "Applied mixed Zip requires the private admitted-input Lean boundary";
+        "Applied mixed Zip requires the opt-in Lean contents model and supported trait methods";
       let generics = { empty_generic_args with types = [a;b] } in
       if inside then F.pp_print_string fmt "(";
       F.pp_print_string fmt (match mixed with AppliedSliceVecZip _ -> "core.iter.traits.iterator.IteratorSliceVecZip" | _ -> "core.iter.traits.iterator.IteratorVecSliceZip");
       extract_generic_args span ctx fmt no_params_tys
         ~explicit:(Some { explicit_types = [Explicit;Explicit]; explicit_const_generics = [] }) generics;
+      if inside then F.pp_print_string fmt ")"
+  | (AppliedSliceZipBack (a,b) | AppliedSliceZipSize (a,b)) as reverse ->
+      [%cassert] span (backend () = Lean && !Config.applied_slice_zip)
+        "Applied shared-slice Zip reverse dictionaries require the ordinary slice model";
+      let generics = { empty_generic_args with types = [a;b] } in
+      if inside then F.pp_print_string fmt "(";
+      F.pp_print_string fmt (match reverse with
+        | AppliedSliceZipBack _ -> "core.iter.traits.double_ended.DoubleEndedIteratorSliceZip"
+        | _ -> "core.iter.traits.exact_size.ExactSizeIteratorSliceZip");
+      extract_generic_args span ctx fmt no_params_tys
+        ~explicit:(Some {explicit_types=[Explicit;Explicit];explicit_const_generics=[]}) generics;
       if inside then F.pp_print_string fmt ")"
   | AppliedSliceZip (a, b) ->
       [%cassert] span (backend () = Lean && !Config.applied_slice_zip)

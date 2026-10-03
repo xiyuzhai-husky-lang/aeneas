@@ -129,6 +129,27 @@ def defaultContents (K V : Type) {S : Type} (defaultS : core.default.Default S) 
   let _ ← defaultS.default
   ok ⟨[]⟩
 
+/-- Standard constructor, with the same hidden RandomState seed as `Default`. -/
+@[expose, rust_fun
+  "std::collections::hash::map::{std::collections::hash::map::HashMap<@K, @V, std::hash::random::RandomState, alloc::alloc::Global>}::new"]
+def new (K V : Type) : Result (HashMap K V std.hash.random.RandomState Global) :=
+  defaultContents K V std.hash.random.RandomState.Insts.CoreDefaultDefault
+
+@[simp] theorem new_empty (K V : Type) : new K V = ok ⟨[]⟩ := by
+  simp [new, defaultContents, std.hash.random.RandomState.Insts.CoreDefaultDefault.default]
+
+/-- Contents after a normally returning native capacity constructor. The
+requested bucket allocation and its possible abort/panic are outside the same
+resource abstraction as `new` and Vec.with_capacity. This model does not prove
+that a native allocation succeeds or expose a native bucket-capacity value. -/
+@[expose, rust_fun
+  "std::collections::hash::map::{std::collections::hash::map::HashMap<@K, @V, std::hash::random::RandomState, alloc::alloc::Global>}::with_capacity"]
+def with_capacity (K V : Type) (_capacity : Usize) :
+    Result (HashMap K V std.hash.random.RandomState Global) := new K V
+
+@[simp] theorem with_capacity_empty (K V : Type) (capacity : Usize) :
+    with_capacity K V capacity = ok ⟨[]⟩ := new_empty K V
+
 @[expose, rust_fun
   "std::collections::hash::map::{std::collections::hash::map::HashMap<@K, @V, @S, @A>}::get"
   (keepParams := [true, true, true, true, true, false])
@@ -136,6 +157,18 @@ def defaultContents (K V : Type) {S : Type} (defaultS : core.default.Default S) 
 def getContents (borrow : core.borrow.Borrow K Q) (eq : core.cmp.Eq Q)
     (self : HashMap K V S A) (query : Q) : Result (Option V) :=
   lookupWith borrow.borrow eq.partialEqInst.eq self.entries query
+
+/-- Presence uses the existing borrowed-key traversal, including its callback
+failures/divergence. Native hash/probe order remains under the lawful pure-key
+boundary documented above; this does not add an arbitrary-effectful-key claim. -/
+@[expose, rust_fun
+  "std::collections::hash::map::{std::collections::hash::map::HashMap<@K, @V, @S, @A>}::contains_key"
+  (keepParams := [true, true, true, true, true, false])
+  (keepTraitClauses := [false, false, false, true, false, true])]
+def containsContents (borrow : core.borrow.Borrow K Q) (eq : core.cmp.Eq Q)
+    (self : HashMap K V S A) (query : Q) : Result Bool := do
+  let found ← getContents borrow eq self query
+  ok found.isSome
 
 @[expose, rust_fun
   "std::collections::hash::map::{std::collections::hash::map::HashMap<@K, @V, @S, @A>}::insert"
@@ -283,6 +316,28 @@ theorem getContents_identity [DecidableEq K] (eq : core.cmp.Eq K)
   have h := getContents_exact (core.borrow.Borrow.Blanket K) eq id (by intro; rfl)
     eqLaw self key
   simpa [view] using h
+
+/-- The exact borrowed key observation; contents are not updated. -/
+theorem containsContents_exact [DecidableEq Q] (borrow : core.borrow.Borrow K Q)
+    (eq : core.cmp.Eq Q) (keyView : K → Q)
+    (borrowLaw : ExactBorrow borrow.borrow keyView) (eqLaw : ExactEq eq.partialEqInst.eq)
+    (self : HashMap K V S A) (query : Q) :
+    containsContents borrow eq self query =
+      ok (lookupEntries (self.entries.map fun entry => (keyView entry.1, entry.2)) query).isSome := by
+  simp only [containsContents, getContents_exact borrow eq keyView borrowLaw eqLaw,
+    bind_tc_ok]
+
+theorem containsContents_fail (borrow : core.borrow.Borrow K Q) (eq : core.cmp.Eq Q)
+    (self : HashMap K V S A) (query : Q) (error : Error)
+    (failed : getContents borrow eq self query = fail error) :
+    containsContents borrow eq self query = fail error := by
+  simp only [containsContents, failed, bind_tc_fail]
+
+theorem containsContents_div (borrow : core.borrow.Borrow K Q) (eq : core.cmp.Eq Q)
+    (self : HashMap K V S A) (query : Q)
+    (diverged : getContents borrow eq self query = div) :
+    containsContents borrow eq self query = div := by
+  simp only [containsContents, diverged, bind_tc_div]
 
 theorem insertContents_exact [DecidableEq K] (eq : core.cmp.Eq K)
     (eqLaw : ExactEq eq.partialEqInst.eq) (self : HashMap K V S A) (key : K) (value : V) :
@@ -500,6 +555,137 @@ theorem insertWith_eq_div (eq : K → K → Result Bool) (stored key : K)
     (old value : V) (rest : List (K × V)) (diverged : eq key stored = div) :
     insertWith eq ((stored, old) :: rest) key value = div := by
   simp only [insertWith, diverged, bind_tc_div]
+
+
+/-- The returned lens captures the matched entry. Returning `None` keeps its old
+value; a miss never inserts. This is the same optional-reference erasure convention
+as `SliceIndex::get_mut`, and native callers preserve the option's constructor. -/
+@[expose]
+def getMutWith (borrow : K → Result Q) (eq : Q → Q → Result Bool) :
+    List (K × V) → Q → Result (Option V × (Option V → List (K × V)))
+  | [], _ => ok (none, fun _ => [])
+  | (stored, value) :: rest, query => do
+      let borrowed ← borrow stored
+      let same ← eq query borrowed
+      if same then
+        ok (some value, fun updated => (stored, updated.getD value) :: rest)
+      else
+        let (found, back) ← getMutWith borrow eq rest query
+        ok (found, fun updated => (stored, value) :: back updated)
+
+/-- Logical value replacement through an existing borrowed key; no insertion. -/
+def replaceEntries [DecidableEq Q] (keyView : K → Q) :
+    List (K × V) → Q → Option V → List (K × V)
+  | [], _, _ => []
+  | (stored, value) :: rest, query, updated =>
+      if query = keyView stored then (stored, updated.getD value) :: rest
+      else (stored, value) :: replaceEntries keyView rest query updated
+
+@[expose, rust_fun
+  "std::collections::hash::map::{std::collections::hash::map::HashMap<@K, @V, @S, @A>}::get_mut"
+  (keepParams := [true, true, true, true, true, false])
+  (keepTraitClauses := [false, false, false, true, false, true])]
+def getMutContents (borrow : core.borrow.Borrow K Q) (eq : core.cmp.Eq Q)
+    (self : HashMap K V S A) (query : Q) :
+    Result (Option V × (Option V → HashMap K V S A)) := do
+  let (found, back) ← getMutWith borrow.borrow eq.partialEqInst.eq self.entries query
+  ok (found, fun updated => ⟨back updated⟩)
+
+theorem getMutWith_exact [DecidableEq Q]
+    (borrow : K → Result Q) (keyView : K → Q) (eq : Q → Q → Result Bool)
+    (borrowLaw : ExactBorrow borrow keyView) (eqLaw : ExactEq eq)
+    (entries : List (K × V)) (query : Q) :
+    getMutWith borrow eq entries query =
+      ok (lookupEntries (entries.map fun p => (keyView p.1, p.2)) query,
+        replaceEntries keyView entries query) := by
+  unfold ExactBorrow at borrowLaw
+  unfold ExactEq at eqLaw
+  induction entries with
+  | nil => rfl
+  | cons entry rest ih =>
+      rcases entry with ⟨stored, value⟩
+      simp only [getMutWith, borrowLaw, eqLaw, bind_tc_ok, decide_eq_true_eq,
+        List.map_cons, lookupEntries]
+      by_cases hit : query = keyView stored
+      · simp [hit, replaceEntries]
+      · simp only [hit, ↓reduceIte, ih, bind_tc_ok]
+        congr 2
+        funext updated
+        simp [replaceEntries, hit]
+
+theorem getMutContents_exact [DecidableEq Q] (borrow : core.borrow.Borrow K Q)
+    (eq : core.cmp.Eq Q) (keyView : K → Q)
+    (borrowLaw : ExactBorrow borrow.borrow keyView) (eqLaw : ExactEq eq.partialEqInst.eq)
+    (self : HashMap K V S A) (query : Q) :
+    getMutContents borrow eq self query =
+      ok (lookupEntries (self.entries.map fun p => (keyView p.1, p.2)) query,
+        fun updated => ⟨replaceEntries keyView self.entries query updated⟩) := by
+  simp only [getMutContents, getMutWith_exact _ _ _ borrowLaw eqLaw, bind_tc_ok]
+
+theorem getMutContents_identity [DecidableEq K] (eq : core.cmp.Eq K)
+    (eqLaw : ExactEq eq.partialEqInst.eq) (self : HashMap K V S A) (key : K) :
+    getMutContents (core.borrow.Borrow.Blanket K) eq self key =
+      ok (self.view key, fun updated => ⟨replaceEntries id self.entries key updated⟩) := by
+  simpa [view] using getMutContents_exact (core.borrow.Borrow.Blanket K) eq id
+    (by intro; rfl) eqLaw self key
+
+@[simp] theorem replaceEntries_keys [DecidableEq Q] (keyView : K → Q)
+    (entries : List (K × V)) (query : Q) (updated : Option V) :
+    (replaceEntries keyView entries query updated).map Prod.fst = entries.map Prod.fst := by
+  induction entries with
+  | nil => rfl
+  | cons entry rest ih =>
+      rcases entry with ⟨stored, value⟩
+      simp only [replaceEntries]
+      split <;> simp_all
+
+@[simp] theorem replaceEntries_none [DecidableEq Q] (keyView : K → Q)
+    (entries : List (K × V)) (query : Q) :
+    replaceEntries keyView entries query none = entries := by
+  induction entries with
+  | nil => rfl
+  | cons entry rest ih =>
+      rcases entry with ⟨stored, value⟩
+      simp only [replaceEntries]
+      split <;> simp_all
+
+theorem replaceEntries_absent [DecidableEq Q] (keyView : K → Q)
+    (entries : List (K × V)) (query : Q) (updated : Option V)
+    (absent : lookupEntries (entries.map fun p => (keyView p.1, p.2)) query = none) :
+    replaceEntries keyView entries query updated = entries := by
+  induction entries with
+  | nil => rfl
+  | cons entry rest ih =>
+      rcases entry with ⟨stored, value⟩
+      by_cases hit : query = keyView stored
+      · simp [lookupEntries, hit] at absent
+      · simp only [List.map_cons, lookupEntries, if_neg hit] at absent
+        simp [replaceEntries, hit, ih absent]
+
+theorem replaceEntries_present [DecidableEq K]
+    (entries : List (K × V)) (key : K) (old updated : V)
+    (present : lookupEntries entries key = some old) :
+    replaceEntries id entries key (some updated) = putEntries entries key updated := by
+  induction entries with
+  | nil => simp [lookupEntries] at present
+  | cons entry rest ih =>
+      rcases entry with ⟨stored, value⟩
+      by_cases hit : key = stored
+      · simp [replaceEntries, putEntries, hit]
+      · simp only [lookupEntries, if_neg hit] at present
+        simp [replaceEntries, putEntries, hit, ih present]
+
+theorem getMutWith_borrow_fail (borrow : K → Result Q) (eq : Q → Q → Result Bool)
+    (stored : K) (value : V) (rest : List (K × V)) (query : Q) (error : Error)
+    (failed : borrow stored = fail error) :
+    getMutWith borrow eq ((stored, value) :: rest) query = fail error := by
+  simp [getMutWith, failed]
+
+theorem getMutWith_eq_div (borrow : K → Result Q) (eq : Q → Q → Result Bool)
+    (stored : K) (value : V) (rest : List (K × V)) (query borrowed : Q)
+    (returned : borrow stored = ok borrowed) (diverged : eq query borrowed = div) :
+    getMutWith borrow eq ((stored, value) :: rest) query = div := by
+  simp [getMutWith, returned, diverged]
 
 end HashMap
 

@@ -688,8 +688,7 @@ impl_def core.iter.traits.iterator.IteratorEnumerate {I : Type} {Item : Type}
     (core.iter.traits.iterator.IteratorEnumerate IteratorInst)
 }
 
--- Enumerate.next_back is extracted from its actual full-MIR sysroot body.
--- No handwritten model or native binding is installed for that method.
+-- Enumerate reverse operations and their exact dictionary live in EnumerateBack.
 
 -- ============================================================================
 -- Take.next — generic over any inner iterator
@@ -771,6 +770,36 @@ def core.iter.adapters.zip.Zip.Insts.CoreIterTraitsIteratorIteratorPair.next
 def core.ops.range.RangeInclusive.new {Idx : Type}
     (start «end» : Idx) : Result (core.ops.range.RangeInclusive Idx) :=
   ok ⟨start, «end», false⟩
+
+/-- `RangeBounds::contains`: lower comparison first, then the upper bound.
+An exhausted inclusive range has the exclusive upper bound `start`. -/
+@[rust_fun "core::ops::range::{core::ops::range::RangeInclusive<@Idx>}::contains"]
+def core.ops.range.RangeInclusive.contains {Idx U : Type}
+    (_same : core.cmp.PartialOrd Idx Idx)
+    (lower : core.cmp.PartialOrd Idx U) (upper : core.cmp.PartialOrd U Idx)
+    (self : core.ops.range.RangeInclusive Idx) (item : U) : Result Bool := do
+  let above ← lower.le self.start item
+  if above then
+    if self.exhausted then upper.lt item self.start else upper.le item self.«end»
+  else ok false
+
+theorem core.ops.range.RangeInclusive.contains_short_circuit {Idx U : Type}
+    (same : core.cmp.PartialOrd Idx Idx)
+    (lower : core.cmp.PartialOrd Idx U) (upper : core.cmp.PartialOrd U Idx)
+    (self : core.ops.range.RangeInclusive Idx) (item : U)
+    (below : lower.le self.start item = ok false) :
+    core.ops.range.RangeInclusive.contains same lower upper self item = ok false := by
+  simp [core.ops.range.RangeInclusive.contains, below]
+
+theorem core.ops.range.RangeInclusive.contains_u8 (self : core.ops.range.RangeInclusive U8)
+    (item : U8) :
+    core.ops.range.RangeInclusive.contains core.cmp.PartialOrdU8 core.cmp.PartialOrdU8
+      core.cmp.PartialOrdU8 self item =
+      ok (decide (self.exhausted = false ∧ self.start.val ≤ item.val ∧ item.val ≤ self.«end».val)) := by
+  cases exhausted : self.exhausted <;>
+    by_cases lower : self.start.val ≤ item.val <;>
+    simp [core.ops.range.RangeInclusive.contains, liftFun2,
+      core.cmp.impls.PartialOrdU8.le, core.cmp.impls.PartialOrdU8.lt, exhausted, lower]
 
 @[rust_fun "core::ops::range::{core::ops::range::RangeInclusive<@Idx>}::is_empty"]
 def core.ops.range.RangeInclusive.is_empty {Idx : Type} (inst : core.cmp.PartialOrd Idx Idx)

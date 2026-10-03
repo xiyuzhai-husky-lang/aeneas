@@ -507,6 +507,23 @@ let expand_symbolic_value_shared_borrow (span : Meta.span)
   (* Finally, replace the projectors on loans *)
   let see = SeSharedRef (bid, shared_sv) in
   let ctx = apply_symbolic_expansion_to_aevalues span original_sv see ctx in
+  let ctx = match original_sv.sv_ty with
+    | TRef (RStatic, referent, RShared)
+      when Sys.getenv_opt "AENEAS_EXPERIMENTAL_SYMBOLIC_REGION_HIERARCHY" = Some "1"
+           && equal_ty referent ref_ty
+           && not (ty_has_borrows (Some span) ctx.type_ctx.type_infos referent) ->
+        (* Static storage has no finite region owner whose loan projector can
+           supply this endpoint. As for native string constants, retain the
+           immutable referent in a dummy backing loan. The ordinary expansion
+           continuation still gives shared_sv exactly the original referent. *)
+        [%cassert] span (not !Config.use_static) "Unimplemented";
+        [%sanity_check] span
+          (Option.is_none (InterpBorrowsCore.lookup_loan_opt span
+            InterpBorrowsCore.ek_all bid ctx.env));
+        let shared=mk_tvalue_from_symbolic_value shared_sv in
+        let loan : tvalue={value=VLoan(VSharedLoan(bid,shared));ty=shared.ty} in
+        ctx_push_dummy_var ctx (ctx.fresh_dummy_var_id ()) loan
+    | _ -> ctx in
   ( ctx,
     (* Update the synthesized program *)
     S.synthesize_symbolic_expansion_no_branching span original_sv

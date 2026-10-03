@@ -3,7 +3,14 @@ open ExtractBuiltinCore
 
 let lean_builtin_types =
   [
+    mk_type "core::slice::iter::Split" "core.slice.iter.Split"
+      ~kind:(KStruct [("v", Some "v"); ("pred", Some "pred"); ("finished", Some "finished")]);
+    mk_type "core::array::iter::IntoIter" "core.array.iter.IntoIter";
+    mk_type "alloc::collections::TryReserveError" "alloc.collections.TryReserveError";
     mk_type "std::collections::hash::map::HashMap" "std.collections.hash.map.HashMap";
+    mk_type "std::collections::hash::map::Entry" "std.collections.hash.map.Entry"
+      ~mut_regions:[ 0 ];
+    mk_type "std::collections::hash::set::HashSet" "std.collections.hash.set.HashSet";
     mk_type "std::hash::random::RandomState" "std.hash.random.RandomState";
     (* file: "Aeneas/Std/Alloc.lean", line: 18 *)
     mk_type "alloc::alloc::Global" "Global" ~kind:(KEnum [ ("Mk", Some "mk") ]);
@@ -188,8 +195,51 @@ let lean_builtin_consts = []
 
 let lean_builtin_funs =
   [
+    mk_fun "core::result::{core::result::Result<@T, @E>}::ok" "core.result.Result.ok";
+    mk_fun "core::slice::{[@T]}::split" "core.slice.Slice.split";
+    mk_fun "core::slice::iter::{core::iter::traits::iterator::Iterator<core::slice::iter::Split<'a, @T, @P>, &'a [@T]>}::next"
+      "core.slice.iter.Split.next";
+    mk_fun "core::slice::{[@T]}::strip_prefix" "core.slice.Slice.strip_prefix";
+    mk_fun "core::slice::{core::slice::SlicePattern<[@T; @N], @T>}::as_slice"
+      "Array.Insts.CoreSliceSlicePattern.as_slice";
+    mk_fun "core::slice::{core::slice::SlicePattern<[@T], @T>}::as_slice"
+      "Slice.Insts.CoreSliceSlicePattern.as_slice";
+    mk_fun "core::hint::must_use" "core.hint.must_use";
+    mk_fun "alloc::fmt::format" "alloc.fmt.format";
+    mk_fun "alloc::string::{alloc::string::String}::into_bytes" "alloc.string.String.into_bytes";
+    mk_fun "alloc::string::{alloc::string::String}::as_bytes" "alloc.string.String.as_bytes";
+    mk_fun "core::borrow::{core::borrow::Borrow<&'0 @T, @T>}::borrow"
+      "core.borrow.Borrow.Shared.borrow";
+    mk_fun "std::collections::hash::set::{std::collections::hash::set::HashSet<@T, @S, @A>}::contains"
+      "std.collections.hash.set.HashSet.containsContents"
+      ~keep_params:(Some [ true; true; true; true; false ])
+      ~keep_trait_clauses:(Some [ false; false; false; true; false; true ]);
+    mk_fun "std::collections::hash::set::{std::collections::hash::set::HashSet<@T, std::hash::random::RandomState, alloc::alloc::Global>}::new"
+      "std.collections.hash.set.HashSet.new";
+    mk_fun "std::collections::hash::set::{std::collections::hash::set::HashSet<@T, @S, @A>}::insert"
+      "std.collections.hash.set.HashSet.insertContents"
+      ~keep_params:(Some [ true; true; true; false ])
+      ~keep_trait_clauses:(Some [ true; false; false ]);
+    mk_fun "std::collections::hash::map::{std::collections::hash::map::HashMap<@K, @V, std::hash::random::RandomState, alloc::alloc::Global>}::new"
+      "std.collections.hash.map.HashMap.new";
+    mk_fun "std::collections::hash::map::{std::collections::hash::map::HashMap<@K, @V, std::hash::random::RandomState, alloc::alloc::Global>}::with_capacity"
+      "std.collections.hash.map.HashMap.with_capacity";
+    mk_fun "std::collections::hash::map::{std::collections::hash::map::HashMap<@K, @V, @S, @A>}::entry"
+      "std.collections.hash.map.HashMap.entryContents"
+      ~keep_params:(Some [ true; true; true; true; false ])
+      ~keep_trait_clauses:(Some [ true; false; false ]);
+    mk_fun "std::collections::hash::map::{std::collections::hash::map::Entry<'a, @K, @V, alloc::alloc::Global>}::or_default"
+      "std.collections.hash.map.Entry.or_default";
     mk_fun "std::collections::hash::map::{std::collections::hash::map::HashMap<@K, @V, @S, @A>}::get"
       "std.collections.hash.map.HashMap.getContents"
+      ~keep_params:(Some [ true; true; true; true; true; false ])
+      ~keep_trait_clauses:(Some [ false; false; false; true; false; true ]);
+    mk_fun "std::collections::hash::map::{std::collections::hash::map::HashMap<@K, @V, @S, @A>}::contains_key"
+      "std.collections.hash.map.HashMap.containsContents"
+      ~keep_params:(Some [ true; true; true; true; true; false ])
+      ~keep_trait_clauses:(Some [ false; false; false; true; false; true ]);
+    mk_fun "std::collections::hash::map::{std::collections::hash::map::HashMap<@K, @V, @S, @A>}::get_mut"
+      "std.collections.hash.map.HashMap.getMutContents"
       ~keep_params:(Some [ true; true; true; true; true; false ])
       ~keep_trait_clauses:(Some [ false; false; false; true; false; true ]);
     mk_fun "std::collections::hash::map::{std::collections::hash::map::HashMap<@K, @V, @S, @A>}::remove"
@@ -210,6 +260,8 @@ let lean_builtin_funs =
       "alloc.vec.Vec.default";
     mk_fun "core::array::equality::{core::cmp::PartialEq<[@T], [@U; @N]>}::eq"
       "core.array.equality.PartialEqSliceArray.eq";
+    mk_fun "core::array::equality::{core::cmp::PartialEq<[@T], [@U; @N]>}::ne"
+      "core.array.equality.PartialEqSliceArray.ne";
     (* file: "Aeneas/Std/Alloc.lean", line: 27 *)
     mk_fun "alloc::alloc::{core::clone::Clone<alloc::alloc::Global>}::clone"
       "alloc.alloc.CloneGlobal.clone";
@@ -280,6 +332,13 @@ let lean_builtin_funs =
     mk_fun "alloc::vec::{alloc::vec::Vec<@T>}::insert" "alloc.vec.Vec.insert"
       ~keep_params:(Some [ true; false ]);
     (* file: "Aeneas/Std/Vec.lean", line: 88 *)
+    mk_fun "alloc::vec::{alloc::vec::Vec<@T>}::is_empty" "alloc.vec.Vec.is_empty"
+      ~keep_params:(Some [ true; false ]);
+    mk_fun "alloc::vec::{alloc::vec::Vec<@T>}::pop" "alloc.vec.Vec.pop"
+      ~keep_params:(Some [ true; false ]);
+    mk_fun "alloc::vec::partial_eq::{core::cmp::PartialEq<alloc::vec::Vec<@T>, &'0 [@U; @N]>}::eq"
+      "alloc.vec.partial_eq.PartialEqVecSharedArray.eq"
+      ~keep_params:(Some [ true; true; false ]);
     mk_fun "alloc::vec::{alloc::vec::Vec<@T>}::len" "alloc.vec.Vec.len"
       ~keep_params:(Some [ true; false ])
       ~can_fail:false ~lift:false;
@@ -287,11 +346,16 @@ let lean_builtin_funs =
     mk_fun "alloc::vec::{alloc::vec::Vec<@T>}::new" "alloc.vec.Vec.new"
       ~can_fail:false ~lift:false;
     (* file: "Aeneas/Std/Vec.lean", line: 155 *)
+    mk_fun "alloc::vec::{alloc::vec::Vec<@T>}::try_reserve" "alloc.vec.Vec.try_reserve"
+      ~keep_params:(Some [ true; false ]);
     mk_fun "alloc::vec::{alloc::vec::Vec<@T>}::push" "alloc.vec.Vec.push"
       ~keep_params:(Some [ true; false ]);
     (* file: "Aeneas/Std/Vec.lean", line: 453 *)
     mk_fun "alloc::vec::{alloc::vec::Vec<@T>}::resize" "alloc.vec.Vec.resize"
       ~keep_params:(Some [ true; false ]);
+    mk_fun "alloc::vec::{alloc::vec::Vec<@T>}::resize_with"
+      "alloc.vec.Vec.resize_with"
+      ~keep_params:(Some [ true; false; true ]);
     (* file: "Aeneas/Std/Vec.lean", line: 413 *)
     mk_fun "alloc::vec::{alloc::vec::Vec<@T>}::with_capacity"
       "alloc.vec.Vec.with_capacity" ~can_fail:false ~lift:false;
@@ -457,6 +521,8 @@ let lean_builtin_funs =
     (* file: "Aeneas/Std/Core/Cmp.lean", line: 236 *)
     mk_fun "core::cmp::impls::{core::cmp::PartialEq<bool, bool>}::eq"
       "core.cmp.impls.PartialEqBool.eq";
+    mk_fun "core::cmp::impls::{core::cmp::PartialEq<bool, bool>}::ne"
+      "core.cmp.impls.PartialEqBool.ne";
     (* file: "Aeneas/Std/Core/Cmp.lean", line: 281 *)
     mk_fun "core::cmp::impls::{core::cmp::PartialOrd<&'a @A, &'b @B>}::ge"
       "core.cmp.impls.PartialOrdShared.ge";
@@ -877,13 +943,32 @@ let lean_builtin_funs =
     mk_fun "core::iter::traits::iterator::Iterator::collect"
       "core.iter.traits.iterator.Iterator.collect.default";
     (* file: "Aeneas/Std/Core/Iter.lean", line: 103 *)
-    (* Actual-body probe: Enumerate.next_back has no registered model. *)
+    mk_fun
+      "core::iter::adapters::enumerate::{core::iter::traits::double_ended::DoubleEndedIterator<core::iter::adapters::enumerate::Enumerate<@I>, (usize, @Clause0_Clause0_Item)>}::next_back"
+      "core.iter.adapters.enumerate.DoubleEndedIteratorEnumerate.next_back";
+    mk_fun
+      "core::iter::adapters::enumerate::{core::iter::traits::double_ended::DoubleEndedIterator<core::iter::adapters::enumerate::Enumerate<@I>, (usize, @Clause0_Clause0_Item)>}::rfold"
+      "core.iter.adapters.enumerate.DoubleEndedIteratorEnumerate.rfold";
     (* Isolated iterator-support prototype: explicit functional API bindings. *)
+    mk_fun "core::iter::traits::iterator::Iterator::map"
+      "core.iter.traits.iterator.Iterator.map.default";
+    mk_fun "core::iter::adapters::map::{core::iter::traits::iterator::Iterator<core::iter::adapters::map::Map<@I, @F>, @B>}::next"
+      "core.iter.adapters.map.Map.next";
+    mk_fun "core::iter::adapters::map::{core::iter::traits::iterator::Iterator<core::iter::adapters::map::Map<@I, @F>, @B>}::fold"
+      "core.iter.adapters.map.Map.fold";
     mk_fun "core::iter::traits::iterator::Iterator::fold"
       "core.iter.traits.iterator.Iterator.fold.trait_default";
     mk_fun
       "core::iter::adapters::enumerate::{core::iter::traits::iterator::Iterator<core::iter::adapters::enumerate::Enumerate<@I>, (usize, @Clause0_Item)>}::fold"
       "core.iter.adapters.enumerate.IteratorEnumerate.fold";
+    mk_fun "core::array::iter::{core::iter::traits::iterator::Iterator<core::array::iter::IntoIter<@T, @N>, @T>}::next"
+      "core.array.iter.IteratorIntoIter.next";
+    mk_fun "core::array::iter::{core::iter::traits::iterator::Iterator<core::array::iter::IntoIter<@T, @N>, @T>}::fold"
+      "core.array.iter.IteratorIntoIter.fold";
+    mk_fun "core::array::iter::{core::iter::traits::collect::IntoIterator<[@T; @N], @T, core::array::iter::IntoIter<@T, @N>>}::into_iter"
+      "core.array.IntoIteratorArray.into_iter";
+    mk_fun "alloc::vec::{core::iter::traits::collect::Extend<alloc::vec::Vec<@T>, @T>}::extend"
+      "alloc.vec.Vec.extend" ~keep_params:(Some [true;false;true;true]);
     (* Vec reverse support: next_back override and actual inherited rfold default. *)
     mk_fun
       "alloc::vec::into_iter::{core::iter::traits::double_ended::DoubleEndedIterator<alloc::vec::into_iter::IntoIter<@T, @A>, @T>}::next_back"
@@ -1070,6 +1155,8 @@ let lean_builtin_funs =
       "core::ops::range::{core::ops::range::RangeInclusive<@Idx>}::is_empty"
       "core.ops.range.RangeInclusive.is_empty";
     (* file: "Aeneas/Std/Core/Iter.lean", line: 643 *)
+    mk_fun "core::ops::range::{core::ops::range::RangeInclusive<@Idx>}::contains"
+      "core.ops.range.RangeInclusive.contains";
     mk_fun "core::ops::range::{core::ops::range::RangeInclusive<@Idx>}::new"
       "core.ops.range.RangeInclusive.new";
     (* file: "Aeneas/Std/Core/CoreOption.lean", line: 13 *)
@@ -1084,6 +1171,16 @@ let lean_builtin_funs =
     (* file: "Aeneas/Std/Core/CoreOption.lean", line: 23 *)
     mk_fun "core::option::{core::option::Option<@T>}::ok_or"
       "core.option.Option.ok_or";
+    mk_fun
+      "core::iter::adapters::zip::{core::iter::traits::double_ended::DoubleEndedIterator<core::iter::adapters::zip::Zip<@A, @B>, (@Clause0_Clause0_Item, @Clause2_Clause0_Item)>}::next_back"
+      "core.iter.adapters.zip.Zip.Insts.CoreIterTraitsDouble_endedDoubleEndedIteratorPair.next_back";
+    mk_fun
+      "core::option::{core::cmp::PartialEq<core::option::Option<@T>, core::option::Option<@T>>}::eq"
+      "core.option.Option.Insts.CoreCmpPartialEqOption.eq";
+    mk_fun "core::option::{core::option::Option<@T>}::ok_or_else"
+      "core.option.Option.ok_or_else";
+    mk_fun "core::option::{core::option::Option<@T>}::is_some_and"
+      "core.option.Option.is_some_and";
     (* file: "Aeneas/Std/Core/Core.lean", line: 116 *)
     mk_fun "core::option::{core::option::Option<@T>}::take"
       "core.option.Option.take" ~can_fail:false ~lift:false;
@@ -1112,6 +1209,10 @@ let lean_builtin_funs =
     (* file: "Aeneas/Std/Core/CoreResult.lean", line: 13 *)
     mk_fun "core::result::{core::result::Result<@T, @E>}::map_err"
       "core.result.Result.map_err";
+    mk_fun "core::result::{core::result::Result<@T, @E>}::is_err"
+      "core.result.Result.is_err";
+    mk_fun "core::result::{core::result::Result<@T, @E>}::and_then"
+      "core.result.Result.and_then";
     (* file: "Aeneas/Std/Core/Fmt.lean", line: 22 *)
     mk_fun "core::result::{core::result::Result<@T, @E>}::unwrap"
       "core.result.Result.unwrap";
@@ -1313,6 +1414,11 @@ let lean_builtin_funs =
     (* file: "Aeneas/Std/Slice.lean", line: 1047 *)
     mk_fun "core::slice::{[@T]}::fill" "core.slice.Slice.fill";
     (* file: "Aeneas/Std/Slice.lean", line: 353 *)
+    mk_fun "core::slice::iter::{core::iter::traits::iterator::Iterator<core::slice::iter::Iter<'a, @T>, &'a @T>}::all"
+      "core.slice.iter.IteratorSliceIter.all";
+    mk_fun "core::slice::{[@T]}::first" "core.slice.Slice.first";
+    mk_fun "core::slice::{[@T]}::last" "core.slice.Slice.last";
+    mk_fun "core::slice::{[@T]}::last_mut" "core.slice.Slice.last_mut";
     mk_fun "core::slice::{[@T]}::get" "core.slice.Slice.get";
     (* file: "Aeneas/Std/Slice.lean", line: 366 *)
     mk_fun "core::slice::{[@T]}::get_mut" "core.slice.Slice.get_mut";
@@ -1326,6 +1432,8 @@ let lean_builtin_funs =
     mk_fun "core::slice::{[@T]}::iter_mut" "core.slice.Slice.iter_mut";
     (* file: "Aeneas/Std/Slice.lean", line: 52 *)
     mk_fun "core::slice::{[@T]}::len" "Slice.len" ~can_fail:false ~lift:false;
+    mk_fun "core::slice::raw::from_ref" "core.slice.raw.from_ref"
+      ~can_fail:false ~lift:false;
     (* file: "Aeneas/Std/Slice.lean", line: 334 *)
     mk_fun "core::slice::{[@T]}::reverse" "core.slice.Slice.reverse"
       ~can_fail:false;
@@ -1353,6 +1461,8 @@ let lean_builtin_funs =
 
 let lean_builtin_trait_decls =
   [
+    mk_trait_decl "core::slice::SlicePattern" "core.slice.SlicePattern"
+      ~methods:[("as_slice", "as_slice")];
     (* file: "Aeneas/Std/Core/Ptr.lean", line: 85 *)
     mk_trait_decl "core::alloc::global::GlobalAlloc"
       "core.alloc.global.GlobalAlloc"
@@ -1560,9 +1670,16 @@ let lean_builtin_trait_decls =
 
 let lean_builtin_trait_impls =
   [
+    mk_trait_impl "core::slice::SlicePattern<[@T; @N], @T>" "Array.Insts.CoreSliceSlicePattern";
+    mk_trait_impl "core::slice::SlicePattern<[@T], @T>" "Slice.Insts.CoreSliceSlicePattern";
+    mk_trait_impl "core::iter::traits::iterator::Iterator<core::slice::iter::Split<'a, @T, @P>, &'a [@T]>"
+      "core.iter.traits.iterator.IteratorSplit";
     mk_trait_impl "core::default::Default<std::hash::random::RandomState>"
       "std.hash.random.RandomState.Insts.CoreDefaultDefault";
+    mk_trait_impl "core::iter::traits::iterator::Iterator<core::iter::adapters::map::Map<@I, @F>, @B>"
+      "core.iter.traits.iterator.IteratorMap";
     mk_trait_impl "core::borrow::Borrow<@T, @T>" "core.borrow.Borrow.Blanket";
+    mk_trait_impl "core::borrow::Borrow<&'0 @T, @T>" "core.borrow.Borrow.Shared";
     mk_trait_impl "core::cmp::PartialEq<[@T], [@U; @N]>"
       "core.array.equality.PartialEqSliceArray";
     (* file: "Aeneas/Std/Core/Core.lean", line: 57 *)
@@ -1712,6 +1829,12 @@ let lean_builtin_trait_impls =
        core::slice::iter::Iter<'a, @T>>"
       "SharedSlice.Insts.CoreIterTraitsCollectIntoIteratorSharedIter";
     (* file: "Aeneas/Std/Core/Iter.lean", line: 189 *)
+    mk_trait_impl "core::iter::traits::iterator::Iterator<core::array::iter::IntoIter<@T, @N>, @T>"
+      "core.iter.traits.iterator.IteratorArrayIntoIter";
+    mk_trait_impl "core::iter::traits::collect::IntoIterator<[@T; @N], @T, core::array::iter::IntoIter<@T, @N>>"
+      "core.iter.traits.collect.IntoIteratorArray";
+    mk_trait_impl "core::iter::traits::collect::Extend<alloc::vec::Vec<@T>, @T>"
+      "core.iter.traits.collect.ExtendVec" ~keep_params:(Some [true;false]);
     mk_trait_impl "core::iter::traits::collect::IntoIterator<@I, @Item, @I>"
       "core.iter.traits.collect.IntoIterator.Blanket";
     (* file: "Aeneas/Std/VecIter.lean", line: 41 *)
@@ -1729,6 +1852,9 @@ let lean_builtin_trait_impls =
       "core::iter::traits::double_ended::DoubleEndedIterator<alloc::vec::into_iter::IntoIter<@T, @A>, @T>"
       "core.iter.traits.double_ended.DoubleEndedIteratorVecIntoIter"
       ~keep_params:(Some [ true; false ]);
+    mk_trait_impl
+      "core::iter::traits::double_ended::DoubleEndedIterator<core::iter::adapters::enumerate::Enumerate<@I>, (usize, @Clause0_Clause0_Item)>"
+      "core.iter.adapters.enumerate.DoubleEndedIteratorEnumerate";
     (* file: "Aeneas/Std/VecIter.lean", line: 22 *)
     mk_trait_impl
       "core::iter::traits::iterator::Iterator<alloc::vec::into_iter::IntoIter<@T, \
@@ -1754,6 +1880,12 @@ let lean_builtin_trait_impls =
       "core::iter::traits::iterator::Iterator<core::slice::iter::Iter<'a, @T>, \
        &'a @T>"
       "core.iter.traits.iterator.IteratorSliceIter";
+    mk_trait_impl
+      "core::iter::traits::exact_size::ExactSizeIterator<core::slice::iter::Iter<'a, @T>, &'a @T>"
+      "core.iter.traits.exact_size.ExactSizeIteratorSliceIter";
+    mk_trait_impl
+      "core::iter::traits::double_ended::DoubleEndedIterator<core::slice::iter::Iter<'a, @T>, &'a @T>"
+      "core.iter.traits.double_ended.DoubleEndedIteratorSliceIter";
     (* file: "Aeneas/Std/StringIter.lean", line: 24 *)
     mk_trait_impl
       "core::iter::traits::iterator::Iterator<core::str::iter::Chars<'a>, char>"

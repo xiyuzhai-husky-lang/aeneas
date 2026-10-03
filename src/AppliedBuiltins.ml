@@ -97,6 +97,110 @@ let classify_trait crate (original : trait_ref) =
       | _ -> None)
   | _ -> None
 
+(** These bindings are selected from the original native Zip and SliceIter
+    implementations, with all associated-item and lifetime arguments checked.
+    They do not supply a generic Zip fold or assume arbitrary iterator laws. *)
+let reverse_trait_kind crate id =
+  match TraitDeclId.Map.find_opt id crate.trait_decls with
+  | Some d when path d.item_meta
+      ["core"; "iter"; "traits"; "double_ended"; "DoubleEndedIterator"] ->
+      Some `DoubleEnded
+  | Some d when path d.item_meta
+      ["core"; "iter"; "traits"; "exact_size"; "ExactSizeIterator"] ->
+      Some `ExactSize
+  | _ -> None
+
+(** Charon's native Reverse/ExactSize associated Item erases only its outer
+    shared-reference lifetime. The SliceIter self and its element retain their
+    full original types. Accept that specific convention only after checking
+    the concrete native witness; no general type erasure is used here. *)
+let reverse_shared_item region element item = match item with
+  | TRef (r, t, RShared) -> (r = region || r = RErased) && t = element
+  | _ -> false
+
+let slice_reverse_parent_witness crate iter item (original : trait_ref) =
+  let* parent = resolve_parent crate [] original in
+  let* (region, element) = slice_iterator crate iter in
+  match parent.kind with
+  | TraitImpl r ->
+      let* (d, _, expected) = instantiate_impl crate r in
+      if not (impl_path d.item_meta ["core"; "slice"; "iter"] d.def_id)
+         || not (iterator_trait crate expected.id)
+         || expected.id <> parent.trait_decl_ref.binder_value.id then None else
+      (match r.generics, expected.generics, parent.trait_decl_ref.binder_value.generics with
+      | {regions = [bound]; types = [param]; const_generics = []; trait_refs = []},
+        {regions = []; types = [native_self; native_item]; const_generics = []; trait_refs = []},
+        {regions = []; types = [self; actual]; const_generics = []; trait_refs = []}
+        when (bound = region || bound = RErased) && param = element
+          && self = iter && actual = item && reverse_shared_item region element item ->
+          let* (native_region, native_element) = slice_iterator crate native_self in
+          if native_region = bound && native_element = element
+             && shared_item bound element native_item then Some () else None
+      | _ -> None)
+  | _ -> None
+
+let zip_reverse_parent_witness crate a b item_a item_b (original : trait_ref) =
+  let* parent = resolve_parent crate [] original in
+  match parent.kind with
+  | TraitImpl r ->
+      let* (d, _, expected) = instantiate_impl crate r in
+      if not (impl_path d.item_meta ["core"; "iter"; "adapters"; "zip"] d.def_id)
+         || not (iterator_trait crate expected.id)
+         || expected <> parent.trait_decl_ref.binder_value then None else
+      (match r.generics with
+      | {regions = []; types = [self_a; self_b; actual_a; actual_b]; const_generics = []; trait_refs = [ia; ib]}
+        when self_a = a && self_b = b && actual_a = item_a && actual_b = item_b ->
+          let* () = slice_reverse_parent_witness crate a item_a ia in
+          slice_reverse_parent_witness crate b item_b ib
+      | _ -> None)
+  | _ -> None
+
+let slice_reverse_witness crate kind iter item (witness : trait_ref) =
+  let* witness = resolve_parent crate [] witness in
+  match witness.kind with
+  | TraitImpl r ->
+      let* (d, subst, expected) = instantiate_impl crate r in
+      if not (impl_path d.item_meta ["core"; "slice"; "iter"] d.def_id)
+         || reverse_trait_kind crate expected.id <> Some kind
+         || expected <> witness.trait_decl_ref.binder_value then None else
+      (match expected.generics, d.implied_trait_refs with
+      | { regions = []; types = [self; actual]; const_generics = []; trait_refs = [] }, [parent]
+        when self = iter && actual = item ->
+          let parent = Charon.Substitute.trait_ref_substitute subst parent in
+          slice_reverse_parent_witness crate iter item parent
+      | _ -> None)
+  | _ -> None
+
+let classify_reverse_trait crate (original : trait_ref) =
+  if not (enabled ()) then None else
+  let* tr = resolve_parent crate [] original in
+  match tr.kind with
+  | TraitImpl r ->
+      let* (d, subst, expected) = instantiate_impl crate r in
+      if not (impl_path d.item_meta ["core"; "iter"; "adapters"; "zip"] d.def_id)
+         || expected <> tr.trait_decl_ref.binder_value then None else
+      let* kind = reverse_trait_kind crate expected.id in
+      (match r.generics, d.implied_trait_refs with
+      | {regions = []; types = [a; b; item_a; item_b]; const_generics = []; trait_refs}, [parent] ->
+          let* (ra, ta) = slice_iterator crate a in
+          let* (rb, tb) = slice_iterator crate b in
+          if not (reverse_shared_item ra ta item_a && reverse_shared_item rb tb item_b) then None else
+          let* () = (match kind, trait_refs with
+          | `DoubleEnded, [da; ea; db; eb] ->
+              let* () = slice_reverse_witness crate `DoubleEnded a item_a da in
+              let* () = slice_reverse_witness crate `ExactSize a item_a ea in
+              let* () = slice_reverse_witness crate `DoubleEnded b item_b db in
+              slice_reverse_witness crate `ExactSize b item_b eb
+          | `ExactSize, [ea; eb] ->
+              let* () = slice_reverse_witness crate `ExactSize a item_a ea in
+              slice_reverse_witness crate `ExactSize b item_b eb
+          | _ -> None) in
+          let parent = Charon.Substitute.trait_ref_substitute subst parent in
+          let* () = zip_reverse_parent_witness crate a b item_a item_b parent in
+          Some (kind, ta, tb)
+      | _ -> None)
+  | _ -> None
+
 type method_binding = Next | Fold
 
 let classify_function crate id (generics : generic_args) =

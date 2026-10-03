@@ -87,6 +87,192 @@ def core.slice.iter.IteratorSliceIter.fold {T B F : Type}
     (fun (state : B × F) item => fn.call_mut state.2 (state.1, item)) (init, f)
   ok result
 
+/-- Run the remaining window in order, retaining the callback state and the
+number of consumed items. The item returning false is consumed as well. -/
+def IteratorPrototype.sliceAll {T F : Type}
+    (fn : core.ops.function.FnMut F T Bool) (items : List T) (f : F) :
+    Result (Bool × Nat × F) :=
+  match items with
+  | [] => ok (true, 0, f)
+  | item :: rest => do
+      let (passed, f') ← fn.call_mut f item
+      if passed then
+        let (answer, consumed, f'') ← sliceAll fn rest f'
+        ok (answer, consumed + 1, f'')
+      else ok (false, 1, f')
+
+@[rust_fun "core::slice::iter::{core::iter::traits::iterator::Iterator<core::slice::iter::Iter<'a, @T>, &'a @T>}::all"]
+def core.slice.iter.IteratorSliceIter.all {T F : Type}
+    (fn : core.ops.function.FnMut F T Bool)
+    (it : core.slice.iter.Iter T) (f : F) : Result (Bool × core.slice.iter.Iter T) := do
+  let (answer, consumed, _) ← IteratorPrototype.sliceAll fn it.remaining f
+  ok (answer, { it with i := it.i + consumed })
+
+namespace IteratorPrototype
+
+/-- Exact successful execution: callback state is threaded through every true
+step; the first false step consumes its item and does not evaluate the tail. -/
+inductive SliceAllTrace {T F : Type} (fn : core.ops.function.FnMut F T Bool) :
+    List T → F → Bool → Nat → F → Prop
+  | nil (f : F) : SliceAllTrace fn [] f true 0 f
+  | stop (item : T) (rest : List T) (f f' : F)
+      (call : fn.call_mut f item = ok (false, f')) :
+      SliceAllTrace fn (item :: rest) f false 1 f'
+  | next (item : T) (rest : List T) (f f' f'' : F) (answer : Bool) (consumed : Nat)
+      (call : fn.call_mut f item = ok (true, f'))
+      (later : SliceAllTrace fn rest f' answer consumed f'') :
+      SliceAllTrace fn (item :: rest) f answer (consumed + 1) f''
+
+theorem sliceAll_of_trace {T F : Type} (fn : core.ops.function.FnMut F T Bool)
+    {items : List T} {f f' : F} {answer : Bool} {consumed : Nat}
+    (trace : SliceAllTrace fn items f answer consumed f') :
+    sliceAll fn items f = ok (answer, consumed, f') := by
+  induction trace with
+  | nil => rfl
+  | stop item rest f f' call => simp [sliceAll, call]
+  | next item rest f f' f'' answer consumed call later ih => simp [sliceAll, call, ih]
+
+theorem sliceAll_trace_of_ok {T F : Type} (fn : core.ops.function.FnMut F T Bool)
+    (items : List T) (f f' : F) (answer : Bool) (consumed : Nat)
+    (run : sliceAll fn items f = ok (answer, consumed, f')) :
+    SliceAllTrace fn items f answer consumed f' := by
+  induction items generalizing f f' answer consumed with
+  | nil =>
+      simp only [sliceAll, Result.ok.injEq, Prod.mk.injEq] at run
+      rcases run with ⟨rfl, rfl, rfl⟩
+      exact .nil _
+  | cons item rest ih =>
+      cases call : fn.call_mut f item with
+      | vis eff k => simp [sliceAll, call] at run
+      | div => simp [sliceAll, call] at run
+      | ret state =>
+          rcases state with ⟨passed, nextState⟩
+          cases passed with
+          | false =>
+              simp only [sliceAll, call, bind_tc_ok, Bool.false_eq_true, ↓reduceIte,
+                Result.ok.injEq, Prod.mk.injEq] at run
+              rcases run with ⟨rfl, rfl, rfl⟩
+              exact .stop item rest f nextState call
+          | true =>
+              cases tail : sliceAll fn rest nextState with
+              | vis eff k => simp [sliceAll, call, tail] at run
+              | div => simp [sliceAll, call, tail] at run
+              | ret result =>
+                  rcases result with ⟨result, count, finalState⟩
+                  simp only [sliceAll, call, bind_tc_ok, ↓reduceIte, tail,
+                    Result.ok.injEq, Prod.mk.injEq] at run
+                  rcases run with ⟨rfl, rfl, rfl⟩
+                  exact .next item rest f nextState finalState result count call
+                    (ih nextState finalState result count tail)
+
+theorem slice_all_spec {T F : Type} (fn : core.ops.function.FnMut F T Bool)
+    (it : core.slice.iter.Iter T) (f : F) (answer : Bool) (it' : core.slice.iter.Iter T) :
+    core.slice.iter.IteratorSliceIter.all fn it f = ok (answer, it') ↔
+      ∃ consumed f', SliceAllTrace fn it.remaining f answer consumed f' ∧
+        it' = { it with i := it.i + consumed } := by
+  constructor
+  · intro run
+    cases h : sliceAll fn it.remaining f with
+    | vis eff k => simp [core.slice.iter.IteratorSliceIter.all, h] at run
+    | div => simp [core.slice.iter.IteratorSliceIter.all, h] at run
+    | ret state =>
+        rcases state with ⟨result, consumed, f'⟩
+        simp only [core.slice.iter.IteratorSliceIter.all, h, bind_tc_ok,
+          Result.ok.injEq, Prod.mk.injEq] at run
+        rcases run with ⟨rfl, rfl⟩
+        exact ⟨consumed, f', sliceAll_trace_of_ok fn _ _ _ _ _ h, rfl⟩
+  · rintro ⟨consumed, f', trace, rfl⟩
+    simp [core.slice.iter.IteratorSliceIter.all, sliceAll_of_trace fn trace]
+
+theorem SliceAllTrace.consumed_le {T F : Type} {fn : core.ops.function.FnMut F T Bool}
+    {items : List T} {f f' : F} {answer : Bool} {consumed : Nat}
+    (trace : SliceAllTrace fn items f answer consumed f') : consumed ≤ items.length := by
+  induction trace with
+  | nil => simp
+  | stop => simp
+  | next item rest f f' f'' answer consumed call later ih => simp only [List.length_cons]; omega
+
+theorem SliceAllTrace.true_consumed {T F : Type} {fn : core.ops.function.FnMut F T Bool}
+    {items : List T} {f f' : F} {answer : Bool} {consumed : Nat}
+    (trace : SliceAllTrace fn items f answer consumed f') (h : answer = true) :
+    consumed = items.length := by
+  induction trace with
+  | nil => rfl
+  | stop => contradiction
+  | next item rest f f' f'' answer consumed call later ih => simp [ih h]
+
+/-- The returned iterator retains its slice and advances exactly within its
+original remaining window; true means that window was exhausted. -/
+theorem slice_all_progress {T F : Type} (fn : core.ops.function.FnMut F T Bool)
+    (it : core.slice.iter.Iter T) (f : F) (answer : Bool) (it' : core.slice.iter.Iter T)
+    (valid : it.i ≤ it.slice.val.length)
+    (run : core.slice.iter.IteratorSliceIter.all fn it f = ok (answer, it')) :
+    it'.slice = it.slice ∧ it.i ≤ it'.i ∧ it'.i ≤ it.slice.val.length ∧
+      (answer = true → it'.i = it.slice.val.length) := by
+  rcases (slice_all_spec fn it f answer it').mp run with ⟨consumed, f', trace, rfl⟩
+  have bound := trace.consumed_le
+  simp only [core.slice.iter.Iter.remaining, List.length_drop] at bound
+  refine ⟨rfl, by simp, by dsimp; omega, ?_⟩
+  intro h
+  have count := trace.true_consumed h
+  simp only [core.slice.iter.Iter.remaining, List.length_drop] at count
+  dsimp
+  omega
+
+theorem slice_all_empty {T F : Type} (fn : core.ops.function.FnMut F T Bool)
+    (it : core.slice.iter.Iter T) (f : F) (h : it.remaining = []) :
+    core.slice.iter.IteratorSliceIter.all fn it f = ok (true, it) := by
+  simp [core.slice.iter.IteratorSliceIter.all, h, sliceAll]
+
+theorem slice_all_stops_after_false {T F : Type} (fn : core.ops.function.FnMut F T Bool)
+    (it : core.slice.iter.Iter T) (f f' : F) (item : T) (rest : List T)
+    (h : it.remaining = item :: rest) (call : fn.call_mut f item = ok (false, f')) :
+    core.slice.iter.IteratorSliceIter.all fn it f = ok (false, {it with i := it.i + 1}) := by
+  simp [core.slice.iter.IteratorSliceIter.all, h, sliceAll, call]
+
+theorem sliceAll_pure_trace {T F : Type} (fn : core.ops.function.FnMut F T Bool)
+    (predicate : T → Bool)
+    (call : ∀ state item, fn.call_mut state item = ok (predicate item, state))
+    (items : List T) (f : F) :
+    ∃ consumed, SliceAllTrace fn items f (items.all predicate) consumed f := by
+  induction items with
+  | nil => exact ⟨0, .nil f⟩
+  | cons item rest ih =>
+      cases h : predicate item with
+      | false =>
+          refine ⟨1, ?_⟩
+          simpa [List.all_cons, h] using
+            SliceAllTrace.stop (fn := fn) item rest f f (by simpa [h] using call f item)
+      | true =>
+          rcases ih with ⟨consumed, trace⟩
+          refine ⟨consumed + 1, ?_⟩
+          simpa [List.all_cons, h] using
+            SliceAllTrace.next item rest f f f (rest.all predicate) consumed
+              (by simpa [h] using call f item) trace
+
+theorem slice_all_pure {T F : Type} (fn : core.ops.function.FnMut F T Bool)
+    (predicate : T → Bool)
+    (call : ∀ state item, fn.call_mut state item = ok (predicate item, state))
+    (it : core.slice.iter.Iter T) (f : F) :
+    ∃ updated, core.slice.iter.IteratorSliceIter.all fn it f =
+      ok (it.remaining.all predicate, updated) := by
+  rcases sliceAll_pure_trace fn predicate call it.remaining f with ⟨consumed, trace⟩
+  exact ⟨_, (slice_all_spec fn it f _ _).mpr ⟨consumed, f, trace, rfl⟩⟩
+
+theorem slice_all_callback_fail {T F : Type} (fn : core.ops.function.FnMut F T Bool)
+    (it : core.slice.iter.Iter T) (f : F) (item : T) (rest : List T) (e : Error)
+    (h : it.remaining = item :: rest) (call : fn.call_mut f item = fail e) :
+    core.slice.iter.IteratorSliceIter.all fn it f = fail e := by
+  simp [core.slice.iter.IteratorSliceIter.all, h, sliceAll, call]
+
+theorem slice_all_callback_div {T F : Type} (fn : core.ops.function.FnMut F T Bool)
+    (it : core.slice.iter.Iter T) (f : F) (item : T) (rest : List T)
+    (h : it.remaining = item :: rest) (call : fn.call_mut f item = .div) :
+    core.slice.iter.IteratorSliceIter.all fn it f = .div := by
+  simp [core.slice.iter.IteratorSliceIter.all, h, sliceAll, call]
+
+end IteratorPrototype
+
 @[rust_fun "core::slice::iter::{core::iter::traits::double_ended::DoubleEndedIterator<core::slice::iter::Iter<'a, @T>, &'a @T>}::next_back"]
 def core.slice.iter.DoubleEndedIteratorSliceIter.next_back {T : Type}
     (it : core.slice.iter.Iter T) : Result (Option T × core.slice.iter.Iter T) :=
@@ -204,6 +390,26 @@ impl_def core.iter.traits.iterator.IteratorSliceIter (T : Type) :
   take := core.iter.traits.iterator.Iterator.take.trait_default
     (core.iter.traits.iterator.IteratorSliceIter T)
 }
+
+@[reducible, rust_trait_impl
+  "core::iter::traits::exact_size::ExactSizeIterator<core::slice::iter::Iter<'a, @T>, &'a @T>"]
+def core.iter.traits.exact_size.ExactSizeIteratorSliceIter (T : Type) :
+    core.iter.traits.exact_size.ExactSizeIterator (core.slice.iter.Iter T) T := {
+  iteratorInst := core.iter.traits.iterator.IteratorSliceIter T
+  len := core.slice.iter.ExactSizeIteratorSliceIter.len
+}
+
+@[reducible, rust_trait_impl
+  "core::iter::traits::double_ended::DoubleEndedIterator<core::slice::iter::Iter<'a, @T>, &'a @T>"]
+def core.iter.traits.double_ended.DoubleEndedIteratorSliceIter (T : Type) :
+    core.iter.traits.double_ended.DoubleEndedIterator (core.slice.iter.Iter T) T := {
+  iteratorInst := core.iter.traits.iterator.IteratorSliceIter T
+  next_back := core.slice.iter.DoubleEndedIteratorSliceIter.next_back
+  rfold := core.iter.traits.iterator.Iterator.fold.default
+    core.slice.iter.DoubleEndedIteratorSliceIter.next_back
+}
+
+
 
 -- ============================================================================
 -- IntoIterator for shared array references: &[T; N] → Iter<T>

@@ -69,6 +69,58 @@ let reborrow_ashared_loans (span : Meta.span) (loop_id : LoopId.id option)
 
   let fresh_absl = ref [] in
 
+  (* Refreshing a symbolic shared referent also refreshes the identity of every
+     interior permission it carries. Keep an ordinary identity reborrow for
+     those permissions, using the same native hierarchy and projections as a
+     function with signature [&T -> &T]. The old referent and its frozen owners
+     remain intact; only the new loan has the fresh symbolic identity. *)
+  let push_abs_for_symbolic_shared_value (original : symbolic_value)
+      (lid : BorrowId.id) (sid : SharedBorrowId.id) =
+    let info=TypesAnalysis.analyze_ty (Some span) ctx.type_ctx.type_infos original.sv_ty in
+    [%cassert] span (info.contains_borrow && not info.contains_mut_borrow
+      && not info.contains_static && not info.contains_nested_borrows)
+      "Symbolic shared reborrow requires a purely shared interior interface";
+    [%cassert] span (RegionId.Set.is_empty (RegionId.Set.inter ctx.ended_regions
+      (TypesUtils.ty_regions original.sv_ty)))
+      "Symbolic shared reborrow contains an ended interior region";
+    let inner_regions,target=ty_refresh_regions (Some span) ctx.fresh_region_id original.sv_ty in
+    let outer=ctx.fresh_region_id () in
+    let reference=mk_ref_ty (RVar (Free outer)) target RShared in
+    let regions=outer::inner_regions in
+    let parameters=List.map (fun index ->
+      {index;name=None;variance=VaUnknown;mutability=LtUnknown}) regions in
+    let signature:LlbcAst.bound_fun_sig={
+      item_binder_params={empty_generic_params with regions=parameters};
+      item_binder_value={is_unsafe=false;abi=AbiRust;is_variadic=false;
+        inputs=[reference];output=reference}} in
+    let groups=RegionsHierarchy.compute_regions_hierarchy_for_sig (Some span) ctx.crate signature in
+    let ids=RegionGroupId.Map.of_list (List.map (fun (group:region_var_group) ->
+      group.id,ctx.fresh_abs_id ()) groups) in
+    [%cassert] span (RegionId.Set.equal (RegionId.Set.of_list regions)
+      (RegionId.Set.of_list (List.concat_map (fun (group:region_var_group)->group.regions) groups)))
+      "Symbolic shared reborrow hierarchy lost a region";
+    let nlid=ctx.fresh_borrow_id () and nsid=ctx.fresh_shared_borrow_id () in
+    let fresh:symbolic_value={sv_id=ctx.fresh_symbolic_value_id ();sv_ty=target} in
+    let borrowed:tvalue={ty=Substitute.erase_regions reference;value=VBorrow(VSharedBorrow(lid,sid))} in
+    List.iter (fun (group:region_var_group) ->
+      let owned=RegionId.Set.of_list group.regions in
+      let borrow=InterpProjectors.apply_proj_borrows span true ctx owned borrowed reference in
+      let loan=InterpProjectors.apply_proj_loans_on_symbolic_expansion span owned
+        (SeSharedRef(nlid,fresh)) reference reference ctx in
+      let loan={loan with ty=reference} in
+      let cont=if with_abs_conts then Some {
+        output=Some(mk_etuple ~borrow_proj:true []);
+        input=Some(mk_etuple ~borrow_proj:false [])} else None in
+      let owner={abs_id=RegionGroupId.Map.find group.id ids;
+        kind=(match loop_id with Some id->Loop id|None->Identity);can_end=true;
+        parents=AbsId.Set.of_list (List.map (fun id->RegionGroupId.Map.find id ids) group.parents);
+        ended_subabs=AbsLevelSet.empty;regions={owned};avalues=[borrow;loan];cont} in
+      Invariants.opt_type_check_abs span ctx owner;
+      fresh_absl:=owner::!fresh_absl) groups;
+    sid_subst:=(fresh.sv_id,original)::!sid_subst;
+    nlid,nsid
+  in
+
   (* Auxiliary function to create a new abstraction for a shared value.
 
      Example:
@@ -96,6 +148,13 @@ let reborrow_ashared_loans (span : Meta.span) (loop_id : LoopId.id option)
   let push_abs_for_shared_value (abs : abs) (sv : tvalue) (rty : ty option)
       (lid : BorrowId.id) (sid : SharedBorrowId.id) :
       BorrowId.id * SharedBorrowId.id =
+    match sv.value,rty with
+    | VSymbolic original,Some referent
+      when InterpSharedPacketSignature.enabled () && !Config.multi_exit_loops
+        && equal_ty original.sv_ty referent
+        && ty_has_borrows (Some span) ctx.type_ctx.type_infos original.sv_ty ->
+        push_abs_for_symbolic_shared_value original lid sid
+    | _ ->
     (* Create fresh borrows (for the reborrow) *)
     let nlid = ctx.fresh_borrow_id () in
     let nsid = ctx.fresh_shared_borrow_id () in
@@ -922,11 +981,58 @@ let join_ctxs (span : Meta.span) (fresh_abs_kind : abs_kind)
         symbolic_copy_origins = !symbolic_copy_origins }
     in
 
+    if Sys.getenv_opt "AENEAS_TRACE_DEAD_SHARED_ANALYSIS_PROJECTIONS" = Some "1" then
+      Invariants.trace_missing_symbolic_loans span "immediately after join_ctxs" ctx;
+
     (* Sanity check *)
     if !Config.sanity_checks then Invariants.check_unique_abs_ids span ctx;
 
     Ok join_info
   with ValueMatchFailure e -> Error e
+
+(** Reorganize only the original side, before join markers are introduced. *)
+let end_join_loan_no_synth (config : config) (span : Meta.span)
+    ~(with_abs_conts : bool) (side : string) (bid : loan_id)
+    (ctx : eval_ctx) : eval_ctx =
+  let trace_enabled =
+    Sys.getenv_opt "AENEAS_TRACE_DEAD_SHARED_ANALYSIS_PROJECTIONS" = Some "1" in
+  let shared_symbolic =
+    if not (!Config.multi_exit_loops || trace_enabled) then None
+    else match InterpBorrowsCore.ctx_lookup_loan_opt span InterpBorrowsCore.ek_all bid ctx with
+      | Some (_, Concrete (VSharedLoan (_, {value=VSymbolic symbolic;_})))
+          when symbolic_value_has_borrows (Some span) ctx symbolic -> Some symbolic
+      | _ -> None in
+  let trace phase ctx =
+    if trace_enabled then Option.iter (fun (symbolic : symbolic_value) ->
+      Invariants.trace_symbolic_value span
+        (phase ^ " native end_loan side=" ^ side ^ " loan=" ^ BorrowId.to_string bid)
+        ctx symbolic.sv_id) shared_symbolic in
+  trace "before" ctx;
+  let ended = InterpBorrows.end_loan_no_synth config span bid ctx in
+  trace "after" ended;
+  let simplify_shared_chain =
+    !Config.multi_exit_loops && not with_abs_conts
+    && (match shared_symbolic with
+       | None -> false
+       | Some symbolic ->
+           let info = TypesAnalysis.analyze_ty (Some span) ctx.type_ctx.type_infos
+             symbolic.sv_ty in
+           not (info.contains_mut_borrow || info.contains_static)
+           && not (symbolic_value_has_ended_regions ended.ended_regions symbolic))
+    && List.for_all (function
+         | EAbs abs -> not (abs_has_markers abs)
+         | EBinding _ | EFrame -> true) ended.env in
+  if simplify_shared_chain then (
+    (* Ending the outer loan can expose a now-unused shared reborrow chain.
+       Run the same native cleanup used before the first join, while the side
+       is still unmarked: it respects frozen owners, actual live borrowers and
+       symbolic values, and checks the complete context after every step.
+       Analysis discards its continuation exactly as the initial preprocess
+       does; synthesis still uses its existing reorganization path. *)
+    let simplified, _ = simplify_dummy_values_useless_abs config span ended in
+    trace "after native cleanup" simplified;
+    simplified)
+  else ended
 
 let join_ctxs_list (config : config) (span : Meta.span)
     (fresh_abs_kind : abs_kind) ?(preprocess_first_ctx : bool = true)
@@ -972,12 +1078,12 @@ let join_ctxs_list (config : config) (span : Meta.span)
           (* TODO: simplify *)
           match err with
           | LoanInRight bid ->
-              InterpBorrows.end_loan_no_synth config span bid ctx
+              end_join_loan_no_synth config span ~with_abs_conts "right" bid ctx
           | LoansInRight bids ->
               InterpBorrows.end_loans_no_synth config span bids ctx
           | LoanInLeft bid ->
               joined_ctx :=
-                InterpBorrows.end_loan_no_synth config span bid !joined_ctx;
+                end_join_loan_no_synth config span ~with_abs_conts "left" bid !joined_ctx;
               ctx
           | LoansInLeft bids ->
               joined_ctx :=
@@ -1088,6 +1194,96 @@ let loop_join_origin_with_continue_ctxs (config : config) (span : Meta.span)
   [%sanity_check] span (List.length ctxl' = List.length ctxl + 1);
   ((List.hd ctxl', List.tl ctxl'), joined_ctx)
 
+(* A break branch can already have ended an iterator lifetime which is
+   still represented by a terminal shared return packet on another branch.
+   End that packet in its ORIGINAL unmarked context before join unions the
+   ended-region sets. Native end_abs returns its level-one child first and
+   updates the original reciprocal history; no permission or region is
+   cleared by this alignment. The native continuation is returned unchanged for
+   target synthesis; break-context analysis deliberately discards it. *)
+let rec align_shared_history config span fixed_aids ~with_abs_conts
+    (other : eval_ctx) : cm_fun = fun ctx ->
+  if not (!Config.multi_exit_loops && InterpSharedPacketSignature.enabled ()) then (ctx,Fun.id)
+  else
+    (* Historical roots are inspected only to identify the sole current
+       terminal return. They remain in the original owner passed to end_abs,
+       including ignored-borrow metadata and all continuation captures. *)
+    let rec no_current_permission (value:tavalue) = match value.value with
+      | AAdt adt -> List.for_all no_current_permission adt.fields
+      | ALoan(AIgnoredSharedLoan child) -> no_current_permission child
+      | ABorrow(AEndedIgnoredMutBorrow ended) ->
+          no_current_permission ended.child && no_current_permission ended.given_back
+      | _ -> InterpSharedHistory.permission_free_history span ctx value in
+    let candidate = List.find_map (function
+      | EAbs owner when owner.can_end && (Option.is_none owner.cont
+          || with_abs_conts && InterpSharedInterfaceMatch.continuation_is_shared ctx owner)
+          && AbsId.Set.is_empty owner.parents && AbsLevelSet.is_empty owner.ended_subabs
+          && not (AbsId.Set.mem owner.abs_id fixed_aids) ->
+          (match List.filter (fun (value:tavalue) ->
+              not (no_current_permission value
+                && InterpSharedHistory.empty_native_interface span ctx owner value)) owner.avalues with
+          | [{value=ASymbolic(PNone,AProjBorrows {proj;loans=_::_});_}] ->
+              (* Native repeated returns can leave multiple children and deeper
+                 reciprocal histories. They do not change the original sole
+                 shared-borrow interface. The full descriptor and dependency
+                 checks below precede native sublevel/owner ending; keep every
+                 original history node and continuation for that operation. *)
+              let current=RegionId.Set.inter owner.regions.owned (ty_regions proj.proj_ty) in
+              if not(RegionId.Set.is_empty(RegionId.Set.inter current other.ended_regions))
+                && RegionId.Set.is_empty(RegionId.Set.inter current ctx.ended_regions)
+                && not(ty_has_mut_borrow_for_region_in_set ctx.type_ctx.type_infos
+                  owner.regions.owned proj.proj_ty)
+              then Some owner else None
+          | _ -> None)
+      | _ -> None) ctx.env in
+    match candidate with
+    | None -> (ctx,Fun.id)
+    | Some owner ->
+        let descriptor=InterpPacketRouting.validate_owner span ctx owner in
+        let sids=List.fold_left(fun sids (packet:InterpPacketInterface.packet) ->
+          match packet.sid with None->sids | Some sid->SymbolicValueId.Set.add sid sids)
+            SymbolicValueId.Set.empty descriptor.packets in
+        let _,runtime,issues=InterpExternalPermissions.inventory span ctx.env sids in
+        [%cassert] span (runtime=[] && issues=[])
+          "Break history alignment has a current runtime dependency";
+        let before_fixed=List.filter_map(function
+          | EAbs owner when AbsId.Set.mem owner.abs_id fixed_aids -> Some owner
+          | _ -> None) ctx.env in
+        let ended,cc=InterpBorrows.end_abs config span owner.abs_id 0 ctx in
+        (* Returning a child can leave its earlier shared owner borrow-only.
+           Use the same native simplifier as [prepare_ctx] to finish that
+           cascade before comparing the original break interfaces. *)
+        let ended,cc=comp cc (simplify_dummy_values_useless_abs config span ended) in
+        [%cassert] span (Option.is_none(ctx_lookup_abs_opt ended owner.abs_id))
+          "Native break history ending did not retire the selected owner";
+        List.iter(fun (fixed:abs) ->
+          (* [fixed_aids] distinguishes pre-loop owners for matching, not
+             non-endable owners. The native break simplifier already ends
+             endable pre-loop shared chains. Accept that same native cascade
+             only when every owned lifetime has ended on the other branch. *)
+          let preserved=match ctx_lookup_abs_opt ended fixed.abs_id with
+            | Some _ -> RegionId.Set.is_empty(RegionId.Set.inter fixed.regions.owned
+                (RegionId.Set.diff ended.ended_regions ctx.ended_regions))
+            | None -> fixed.can_end
+                && RegionId.Set.subset fixed.regions.owned other.ended_regions
+                && List.for_all (InterpSharedHistory.empty_native_interface span ctx fixed)
+                  fixed.avalues
+                && (Option.is_none fixed.cont
+                  || InterpSharedInterfaceMatch.continuation_is_shared ctx fixed) in
+          if not preserved then
+            Printf.eprintf "BREAK_HISTORY_FIXED_DEPENDENCY owner=%s removed=%b other_ended=%s\n%s\n%!"
+              (AbsId.to_string fixed.abs_id)
+              (Option.is_none(ctx_lookup_abs_opt ended fixed.abs_id))
+              (RegionId.Set.to_string None other.ended_regions)
+              (InterpUtils.abs_to_string span ~with_ended:true ctx fixed
+                ^ "\nNative result:\n" ^ Option.fold ~none:"removed"
+                  ~some:(InterpUtils.abs_to_string span ~with_ended:true ended)
+                  (ctx_lookup_abs_opt ended fixed.abs_id));
+          [%cassert] span preserved
+            "Native break history ending crossed a fixed owner") before_fixed;
+        Invariants.check_invariants span ended;
+        comp cc (align_shared_history config span fixed_aids ~with_abs_conts other ended)
+
 let loop_join_break_ctxs (config : config) (span : Meta.span)
     (loop_id : LoopId.id) (fixed_aids : AbsId.Set.t)
     (fixed_dids : DummyVarId.Set.t) (ctxl : eval_ctx list) : eval_ctx =
@@ -1118,12 +1314,22 @@ let loop_join_break_ctxs (config : config) (span : Meta.span)
     in
     [%ltrace
       "prepare_ctx: after reduce:\n" ^ eval_ctx_to_string ~span:(Some span) ctx];
+    (* Reduction can finish the last child loan of a borrowed projection.
+       End the resulting borrow-only owner through the native simplifier on
+       this original, unmarked branch before introducing join markers. This
+       is break-context analysis, so the synthesis continuation is unused. *)
+    let ctx =
+      if !Config.multi_exit_loops && InterpSharedPacketSignature.enabled () then
+        fst (simplify_dummy_values_useless_abs config span ctx)
+      else ctx
+    in
     (* Sanity check *)
     if !Config.sanity_checks then Invariants.check_invariants span ctx;
 
     ctx
   in
   let ctxl = List.map prepare_ctx ctxl in
+
 
   match ctxl with
   | [] -> [%internal_error] span
@@ -1147,6 +1353,10 @@ let loop_join_break_ctxs (config : config) (span : Meta.span)
           we update the context and retry.
        *)
       let rec join_one_aux (ctx : eval_ctx) =
+        let ctx = fst(align_shared_history config span fixed_aids
+          ~with_abs_conts:false !joined_ctx ctx) in
+        joined_ctx := fst(align_shared_history config span fixed_aids
+          ~with_abs_conts:false ctx !joined_ctx);
         match
           join_ctxs span fresh_abs_kind ~recoverable:false ~with_abs_conts
             !joined_ctx ctx
@@ -1159,12 +1369,12 @@ let loop_join_break_ctxs (config : config) (span : Meta.span)
               (* TODO: simplify *)
               match err with
               | LoanInRight bid ->
-                  InterpBorrows.end_loan_no_synth config span bid ctx
+                  end_join_loan_no_synth config span ~with_abs_conts "right" bid ctx
               | LoansInRight bids ->
                   InterpBorrows.end_loans_no_synth config span bids ctx
               | LoanInLeft bid ->
                   joined_ctx :=
-                    InterpBorrows.end_loan_no_synth config span bid !joined_ctx;
+                    end_join_loan_no_synth config span ~with_abs_conts "left" bid !joined_ctx;
                   ctx
               | LoansInLeft bids ->
                   joined_ctx :=
@@ -1323,11 +1533,38 @@ let destructure_shared_loans (span : Meta.span) (fixed_aids : AbsId.Set.t) :
             | AIgnoredMutBorrow (lid, child) ->
                 let child, avl = destructure_avalue abs child in
                 (AIgnoredMutBorrow (lid, child), avl)
+            | AEndedSharedBorrow when InterpSharedPacketSignature.enabled () ->
+                (* Native ending leaves this historical leaf inside retained
+                   wrappers. It has no current shared referent to copy or lift;
+                   preserve its original type and position at its native level.
+                   Validate this leaf locally: other roots may still contain
+                   precisely the nested loans this traversal is about to lift. *)
+                (match av.ty with
+                | TRef (RVar (Free rid), _, RShared) ->
+                    [%sanity_check] span (RegionId.Set.mem rid abs.regions.owned)
+                | _ -> [%craise] span "Ended shared borrow lost its reference type");
+                (Invariants.check_typing_invariant_visitor span ctx false)
+                  #visit_tavalue (Some abs) av;
+                (bc, [])
             | AEndedMutBorrow _ | AEndedSharedBorrow ->
-                (* Shouldn't find ended borrows in live abstractions *)
+                (* The ordinary flat path does not retain ended borrows. *)
                 [%internal_error] span
             | AEndedIgnoredMutBorrow _ -> (bc, [])
-            | AProjSharedBorrow _ -> [%craise] span "Not implemented"
+            | AProjSharedBorrow borrows
+              when InterpSharedPacketSignature.enabled ()
+                && List.for_all (function
+                     | AsbProjReborrows _ -> true | AsbBorrow _ -> false) borrows ->
+                (* This symbolic reborrow has no concrete shared loan to lift.
+                   Keep its original permission and full type, as in marker
+                   insertion; neither copying a referent nor making a new
+                   synthesis binding is appropriate here. *)
+                ignore (InterpSharedPacketSignature.check span ctx abs);
+                (bc, [])
+            | AProjSharedBorrow _ -> [%craise] span
+                ("Unsupported shared reborrow while destructuring shared loans: "
+                 ^ show_aborrow_content bc
+                 ^ "\noriginal typed root: " ^ show_tavalue av
+                 ^ "\noriginal owner: " ^ abs_to_string span ~with_ended:true ctx abs)
           in
           (ABorrow bc, avl)
       | ASymbolic _ | AIgnored _ -> (av.value, [])
@@ -1518,6 +1755,31 @@ let match_ctx_with_target (config : config) (span : Meta.span)
   in
   [%ltrace "- tgt_ctx after reduce_ctx:\n" ^ eval_ctx_to_string tgt_ctx];
 
+  (* Reduction can leave an endable shared-reborrow owner with no loans.
+     End such newly exposed chains through the native simplifier while the
+     target is still unmarked. Its saved backward calls must remain composed
+     into synthesis; the recorded identity-continuation leaf action cannot
+     consume these external dependencies after the join. *)
+  let tgt_ctx, cc =
+    if !Config.multi_exit_loops && InterpSharedPacketSignature.enabled () then
+      comp cc (simplify_dummy_values_useless_abs config span tgt_ctx)
+    else tgt_ctx, cc
+  in
+  [%ltrace "- tgt_ctx after post-reduction native cleanup:\n" ^ eval_ctx_to_string tgt_ctx];
+  if Sys.getenv_opt "AENEAS_TRACE_SHARED_MASK_TARGET"=Some "1" then
+    InterpClosedSharedMask.trace_unmarked_cycle span fixed_aids tgt_ctx;
+  let tgt_ctx =
+    if !Config.multi_exit_loops && InterpSharedPacketSignature.enabled () then
+      InterpClosedSharedMask.retire_target_cycles config span ~fixed_aids
+        ~abs_kind:fresh_abs_kind tgt_ctx
+    else tgt_ctx in
+
+  (* Mirror break-history lifecycle alignment while preserving every native
+     backward call. The source is the already computed fixed-point interface;
+     only the original, unmarked target is changed. *)
+  let tgt_ctx,cc=comp cc (align_shared_history config span fixed_aids
+    ~with_abs_conts:true src_ctx tgt_ctx) in
+
   (* Join the source context with the target context *)
   let join_info =
     match
@@ -1551,11 +1813,16 @@ let match_ctx_with_target (config : config) (span : Meta.span)
      TODO: we need to make the match more general so that we do not have to do this.
   *)
   let merge_seq = ref [] in
+  let recorded_packet_merges =
+    if InterpPacketRouting.enabled () then Some (ref []) else None in
+  let recorded_shared_components =
+    if InterpPacketRouting.enabled () && InterpRecordedSharedLeaf.enabled ()
+    then Some (ref []) else None in
   let add_borrows_seq = ref [] in
   let recorded_shared_leaves =
     if InterpRecordedSharedLeaf.enabled () then Some (ref []) else None in
   let joined_ctx_not_projected =
-    collapse_ctx config span ~sequence:(Some merge_seq)
+    collapse_ctx config span ~sequence:(Some merge_seq) ?recorded_packet_merges ?recorded_shared_components
       ~recorded_shared_leaves ~shared_borrows_seq:(Some add_borrows_seq) ~recoverable
       ~with_abs_conts:true fresh_abs_kind joined_ctx
   in
@@ -1594,7 +1861,9 @@ let match_ctx_with_target (config : config) (span : Meta.span)
 
   (* Apply the sequence of merges to the projected context *)
   let joined_ctx =
-    collapse_ctx_no_markers_following_sequence span merge_seq add_borrows_seq
+    collapse_ctx_no_markers_following_sequence config span merge_seq add_borrows_seq
+      ~recorded_packet_merges:(match recorded_packet_merges with None -> [] | Some r -> !r)
+      ~recorded_shared_components:(match recorded_shared_components with None -> [] | Some r -> !r)
       ~recorded_shared_leaves:(match recorded_shared_leaves with None -> [] | Some r -> !r)
       ~recorded_fixed_aids:(match recorded_shared_leaves with None -> None | Some _ -> Some fixed_aids)
       ~with_abs_conts:true fresh_abs_kind joined_ctx
@@ -1651,7 +1920,9 @@ let match_ctx_with_target (config : config) (span : Meta.span)
     in
     match
       try_match_ctxs span ~check_equiv:false ~check_kind:false
-        ~check_can_end:false fixed_ids lookup_in_src lookup_in_joined src_ctx
+        ~check_can_end:false ~diagnose_failure:true
+        ~match_current_interface:(!Config.multi_exit_loops && InterpSharedPacketSignature.enabled ())
+        fixed_ids lookup_in_src lookup_in_joined src_ctx
         joined_ctx
     with
     | Some ctx -> ctx

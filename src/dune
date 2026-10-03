@@ -43,9 +43,9 @@
   ppx_deriving_yojson)
  (modules
   AppliedBuiltins
-  MixedZipAdmission
   AppliedMixedZip
   AppliedZipDispatch
+  AppliedFnOnceCapture
   AppliedBuiltinUses
   BorrowCheck
   Collections
@@ -79,6 +79,13 @@
   InterpRecordedSharedLeafPreservation
   InterpBorrowsCore
   InterpBorrows
+  InterpClosedSharedComponent
+  InterpClosedSharedProjector
+  InterpClosedSharedConcrete
+  InterpClosedSharedMask
+  InterpRecordedSharedComponent
+  InterpSharedInterfaceMatch
+  InterpSharedHistory
   InterpExpansion
   InterpExpressions
   Interp

@@ -1716,6 +1716,32 @@ let end_abs_no_synth config span ?(snapshots = true) id level ctx =
 let end_abs_set_no_synth config span ?(snapshots = true) ids ctx =
   fst (end_abs_set config ~snapshots span ids ctx)
 
+(** Return just the borrows of a checked analysis sublevel. This deliberately
+    does not call end_abs_aux/end_abs_synthesize: ending the owner's lifetime
+    would also end its still-live level-zero regions. A caller must establish
+    that these shared permissions form a closed internal component, then check
+    the exact native result before committing it to its original context. *)
+let return_analysis_sublevel_borrows ?(allow_unchanged_cont=false) config span abs_id level ctx =
+  let owner = ctx_lookup_abs ctx abs_id in
+  [%cassert] span (level > 0 && owner.can_end
+    && (owner.cont=None || allow_unchanged_cont)
+    && AbsId.Set.is_empty owner.parents && AbsLevelSet.is_empty owner.ended_subabs)
+    "Analysis sublevel return requires an independent live owner with admitted continuation";
+  [%cassert] span
+    (Option.is_none (get_first_non_ignored_aloan_in_abs span owner level level))
+    "Analysis sublevel return still contains a live loan";
+  let result = fst (end_abs_borrows config span ~snapshots:false [] abs_id level ctx) in
+  let returned = ctx_lookup_abs result abs_id in
+  [%cassert] span (RegionId.Set.equal result.ended_regions ctx.ended_regions
+    && RegionId.Set.equal returned.regions.owned owner.regions.owned
+    && AbsLevelSet.equal returned.ended_subabs owner.ended_subabs
+    && AbsId.Set.equal returned.parents owner.parents
+    && returned.kind=owner.kind && returned.can_end=owner.can_end
+    && (returned.cont==owner.cont || (allow_unchanged_cont
+      && InterpRecordedSharedLeafPreservation.same_cont returned.cont owner.cont)))
+    "Analysis sublevel return changed owner lifetime or continuation state";
+  result
+
 (** Helper function: see {!activate_reserved_mut_borrow}.
 
     This function updates the shared loan to a mutable loan (we then update the
@@ -1943,6 +1969,29 @@ let rec promote_reserved_mut_borrow (config : config) (span : Meta.span)
         "Can't activate a reserved mutable borrow referencing a loan inside\n\
         \         a region abstraction"
 
+(** Exact original top-root cleanup predicate, also shared with the narrowly
+    recorded leaf action. It does not examine or edit continuations. *)
+let rec ended_shared_loan_is_eliminable (span : Meta.span) (ctx : eval_ctx)
+    (v : tavalue) : bool =
+  match v.value with
+  | ALoan (AIgnoredSharedLoan child) ->
+      (* This wrapper consumes and gives back nothing in the Pure interface.
+         Remove it only after its entire child is independently eliminable. *)
+      let rec ignored_child (child : tavalue) =
+        match child.value with
+        | AIgnored _ -> true
+        | AAdt adt -> List.for_all ignored_child adt.fields
+        | _ -> ended_shared_loan_is_eliminable span ctx child
+      in
+      ignored_child child
+  | ALoan (AEndedSharedLoan (sv, child))
+    when (not (value_has_loans_or_borrows (Some span) ctx sv.value))
+         && is_aignored child.value -> true
+  | ASymbolic (_, AEndedProjLoans { proj_ty = _; proj = _; consumed; borrows })
+    when List.for_all (fun (_, proj) -> proj = AEmpty) (consumed @ borrows)
+    -> true
+  | _ -> false
+
 let destructure_abs
     ?(on_symbolic_copy : symbolic_value -> symbolic_value -> unit = fun _ _ -> ())
     (span : Meta.span) (abs_kind : abs_kind) ~(can_end : bool)
@@ -1950,6 +1999,9 @@ let destructure_abs
   [%ltrace "- abs:\n" ^ abs_to_string span ctx abs0];
   (* Accumulator to store the destructured values *)
   let avalues = ref [] in
+  let current_root = ref None in
+  let current_avalue = ref None in
+  let current_value = ref None in
   (* Utility function to store a value in the accumulator *)
   let push_avalue av = avalues := List.append !avalues [ av ] in
   (* We use this function to make sure we never register values (i.e.,
@@ -1960,9 +2012,45 @@ let destructure_abs
      we don't register values while doing so.
   *)
   let push_fail _ = [%craise] span "Unreachable" in
+  let check_ended_mut_loan_continuation (av : tavalue) (ended : aended_mut_loan) =
+    let target=match av.ty with
+      | TRef (RVar(Free region),target,RMut)
+        when RegionId.Set.mem region abs0.regions.owned -> target
+      | _ -> [%craise] span "Completed mutable loan lost its owned native reference type" in
+    [%cassert] span (equal_ty target ended.child.ty && equal_ty target ended.given_back.ty
+      && equal_ty (Substitute.erase_regions target) ended.given_back_meta.ty)
+      "Completed mutable loan changed its original child or consumed-value type";
+    [%cassert] span (RegionId.Set.is_empty
+      (RegionId.Set.inter (TypesUtils.ty_regions target) abs0.regions.owned))
+      "Completed mutable loan still projects an owned inner region";
+    (Invariants.check_typing_invariant_visitor span ctx false)#visit_abs None
+      {abs0 with avalues=[av];cont=None};
+    (Invariants.check_typing_invariant_visitor span ctx false)#visit_tvalue None ended.given_back_meta;
+    let matches=ref 0 in
+    let visitor=object
+      inherit [_] InterpBorrowsCore.iter_tavalue_with_levels as super
+      method incr_level level=level+1
+      method! visit_tevalue level (value : tevalue) =
+        (match value.value with
+        | ELoan (EEndedMutLoan original)
+          when level=0 && equal_ty value.ty av.ty
+            && original.given_back_meta==ended.given_back_meta
+            && equal_ty original.child.ty target && equal_ty original.given_back.ty target
+            && (match original.child.value,original.given_back.value with
+                | EIgnored _,EIgnored _ -> true | _ -> false) -> incr matches
+        | _ -> ());
+        super#visit_tevalue level value
+    end in
+    Option.iter (fun (cont : abs_cont) ->
+      Option.iter (visitor#visit_tevalue 0) cont.input) abs0.cont;
+    [%classert] span (!matches=1)
+      (lazy ("Completed mutable loan requires its exact original E consumption\n"
+        ^ abs_to_string span ~with_ended:true ctx abs0))
+  in
   (* Function to explore an avalue and destructure it *)
   let rec list_avalues (allow_borrows : int) (push : tavalue -> unit)
       (av : tavalue) : unit =
+    current_avalue := Some (allow_borrows,av);
     let ty = av.ty in
     match av.value with
     | AIgnored _ -> ()
@@ -1972,6 +2060,21 @@ let destructure_abs
     | ALoan lc -> (
         (* Explore the loan content *)
         match lc with
+        | ASharedLoan (_, _, { value = VSymbolic symbolic; _ }, _)
+          when InterpSharedPacketSignature.enabled () && allow_borrows = 2
+               && symbolic_value_has_borrows (Some span) ctx symbolic ->
+            (* This exact shared referent owns no region of the abstraction.
+               Preserve the loan, symbolic payload and ignored child together;
+               do not copy its SID or flatten its borrowed type in list_values. *)
+            InterpSharedPacketSignature.check_retained_shared_loan span ctx abs0 0 av;
+            push av
+        | ASharedLoan (_, _, {value=VBorrow(VSharedBorrow _);_}, _)
+          when InterpSharedPacketSignature.enabled () && allow_borrows=2 ->
+            (* Retain both current shared permissions at their native location.
+               The packet index and closure inventory traverse the original
+               inner borrow; list_values must neither copy nor flatten it. *)
+            InterpSharedPacketSignature.check_retained_shared_loan ~allow_marked:true span ctx abs0 0 av;
+            push av
         | ASharedLoan (pm, bids, sv, child_av) ->
             (* We don't support nested borrows for now *)
             [%cassert] span
@@ -2001,6 +2104,13 @@ let destructure_abs
             let ignored = mk_aignored span child_av.ty None in
             let value = ALoan (AMutLoan (pm, bid, ignored)) in
             push { value; ty }
+        | AIgnoredMutLoan (Some _, _)
+          when InterpSharedPacketSignature.enabled () && allow_borrows=2 ->
+            (* The parent owns the actual loan. Keep this return subscription
+               and child projection for the original native A/E give-back. *)
+            ignore (InterpSharedPacketSignature.check span ctx
+              { abs0 with avalues = [av] });
+            push av
         | AIgnoredMutLoan (opt_bid, child_av) ->
             (* We don't support nested borrows for now *)
             [%cassert] span
@@ -2010,6 +2120,15 @@ let destructure_abs
             [%sanity_check] span (opt_bid = None);
             (* Simply explore the child *)
             list_avalues 0 push_fail child_av
+        | AEndedSharedLoan (sv, child_av)
+          when InterpSharedPacketSignature.enabled () && allow_borrows=2
+            && is_aignored child_av.value
+            && not (value_has_loans_or_borrows (Some span) ctx sv.value) ->
+            (* This is the same exact dead-root condition used by
+               ended_shared_loan_is_eliminable. ADT destructuring may expose
+               it below a wrapper; a ghost borrowed type alone is not a live
+               permission after native payload-borrow ending. *)
+            ()
         | AEndedSharedLoan (sv, child_av) ->
             (* We don't support nested borrows for now *)
             [%cassert] span
@@ -2026,6 +2145,28 @@ let destructure_abs
             (* Push the avalues introduced because we decomposed the inner loans
                in the shared value - see the ASharedLoan case *)
             List.iter push avl
+        | AEndedIgnoredMutLoan { child; _ }
+          when InterpSharedPacketSignature.enabled () && allow_borrows = 2
+               && ty_has_borrows (Some span) ctx.type_ctx.type_infos child.ty ->
+            (* Preserve native child/given-back levels and synthesis metadata.
+               First lift only nested level-zero concrete shared loans through
+               the same native list_values used by ordinary shared roots. *)
+            let lifted,av = if destructure_shared_values then retained_shared_values 0 av
+              else [],av in
+            ignore (InterpSharedPacketSignature.check span ctx
+              { abs0 with avalues = av :: lifted });
+            push av;
+            List.iter push lifted
+        | AEndedMutLoan ended
+          when InterpSharedPacketSignature.enabled () && allow_borrows=2
+            && is_aignored ended.child.value && is_aignored ended.given_back.value
+            && ty_has_borrows (Some span) ctx.type_ctx.type_infos ended.child.ty ->
+            (* Follow ordinary native destructuring: this A node has no current
+               children to register. Its consumed mutable value is NOT empty;
+               the exact original EEndedMutLoan retains that input and its
+               continuation, including the same metadata object, is unchanged. *)
+            check_ended_mut_loan_continuation av ended;
+            list_avalues 0 push_fail ended.child
         | AEndedMutLoan
             { child = child_av; given_back = _; given_back_meta = _ }
         | AEndedIgnoredMutLoan
@@ -2039,6 +2180,16 @@ let destructure_abs
                 ^ abs_to_string span ~with_ended:true ctx abs0));
             (* Simply explore the child *)
             list_avalues 0 push_fail child_av
+        | AIgnoredSharedLoan _
+          when InterpSharedPacketSignature.enabled () && allow_borrows = 2
+            && ended_shared_loan_is_eliminable span ctx av ->
+            (* Native ending can leave an ignored shared wrapper around an ADT
+               of ignored fields and ended shared leaves. The whole wrapper
+               consumes/gives back nothing even with filtering disabled. Check
+               its original typed tree, then apply the existing ended-root
+               cleanup without changing any continuation or metadata. *)
+            ignore (InterpSharedPacketSignature.check span ctx
+              { abs0 with avalues = [av] })
         | AIgnoredSharedLoan child_av ->
             (* An ignored outer shared region can wrap an independently owned
                shared loan (Values.AIgnoredSharedLoan). Admit only this single
@@ -2113,6 +2264,14 @@ let destructure_abs
             push { value; ty }
         | ASharedBorrow _ ->
             (* Nothing specific to do: keep the value as it is *)
+            push av
+        | AIgnoredMutBorrow (Some _, _)
+          when InterpSharedPacketSignature.enabled () && allow_borrows=2 ->
+            (* Keep the parent's return notification together with its child.
+               Native give_back_value must still update this exact A/E wrapper;
+               the ignored ID never becomes a separate cancellation key. *)
+            ignore (InterpSharedPacketSignature.check span ctx
+              { abs0 with avalues = [av] });
             push av
         | AIgnoredMutBorrow (opt_bid, child_av) ->
             (* We don't support nested borrows for now *)
@@ -2197,7 +2356,42 @@ let destructure_abs
             (* Just ignore *)
             ()
         | AEmpty -> ())
+  and retained_shared_values level (value : tavalue) : tavalue list * tavalue =
+    match value.value with
+    | AAdt adt ->
+        let lifted,fields=List.split (List.map (retained_shared_values level) adt.fields) in
+        let value=if List.for_all2 ( == ) fields adt.fields then value
+          else {value with value=AAdt {adt with fields}} in
+        List.concat lifted,value
+    | ALoan (AEndedIgnoredMutLoan ended) ->
+        let before,child=retained_shared_values level ended.child in
+        let after,given_back=retained_shared_values (level+1) ended.given_back in
+        let value=if child==ended.child && given_back==ended.given_back then value
+          else {value with value=ALoan(AEndedIgnoredMutLoan {ended with child;given_back})} in
+        before @ after,value
+    | ALoan (ASharedLoan (PNone,bid,shared,child))
+      when level=0 && ValuesUtils.is_aignored child.value
+        && not (ty_has_borrows (Some span) ctx.type_ctx.type_infos shared.ty)
+        && concrete_borrows_loans_in_value shared.value ->
+        (* Reuse native payload decomposition, including fresh symbolic copies
+           and the original on_symbolic_copy observer. The new loans belong to
+           this same level-zero owner and are emitted after the retained root.
+           Never hoist a given-back-level permission into level zero. *)
+        let lifted,shared=list_values shared in
+        lifted,{value with value=ALoan(ASharedLoan(PNone,bid,shared,child))}
+    | ALoan (AEndedSharedLoan (shared,child))
+      when level=0 && ValuesUtils.is_aignored child.value
+        && not (ty_has_borrows (Some span) ctx.type_ctx.type_infos shared.ty)
+        && concrete_borrows_loans_in_value shared.value ->
+        (* Native ordinary AEndedSharedLoan destructuring also visits its
+           stored shared value with list_values: ending the outer loan does
+           not end inner loans. Keep the retained wrapper/history here and
+           emit those same current inner loans at their original level. *)
+        let lifted,shared=list_values shared in
+        lifted,{value with value=ALoan(AEndedSharedLoan(shared,child))}
+    | _ -> [],value
   and list_values (v : tvalue) : tavalue list * tvalue =
+    current_value := Some v;
     let ty = v.ty in
     match v.value with
     | VLiteral _ -> ([], v)
@@ -2269,19 +2463,45 @@ let destructure_abs
               (avl, sv))
             else (avl, { v with value = VLoan (VSharedLoan (bids, sv)) })
         | VMutLoan _ -> [%craise] span "Unreachable")
-    | VSymbolic _ ->
-        (* For now, we fore all symbolic values containing borrows to be eagerly
-           expanded *)
-        [%sanity_check] span
-          (not (ty_has_borrows (Some span) ctx.type_ctx.type_infos ty));
+    | VSymbolic symbolic ->
+        (* Borrowed symbolic payloads still need explicit support; preserve the
+           actual typed diagnostic without weakening the eager-expansion guard. *)
+        [%classert] span
+          (not (ty_has_borrows (Some span) ctx.type_ctx.type_infos ty))
+          (lazy ("Unsupported borrowed symbolic shared payload: "
+            ^ tvalue_to_string ctx v ^ "\nfull symbolic type: "
+            ^ ty_to_string ctx symbolic.sv_ty ^ "\nerased value type: "
+            ^ ty_to_string ctx v.ty ^ "\n"
+            ^ abs_to_string span ~with_ended:true ctx abs0));
         ([], v)
   in
 
-  (* Destructure the avalues *)
-  List.iter (list_avalues 2 push_avalue) abs0.avalues;
-  let avalues = !avalues in
-  (* Update *)
-  { abs0 with avalues; kind = abs_kind; can_end }
+  (* Destructure the avalues. On failure preserve the exact exception and
+     backtrace while exposing the original root and local typed node. *)
+  try
+    List.iteri (fun i value ->
+      current_root := Some (i,value);
+      current_avalue := None;
+      current_value := None;
+      list_avalues 2 push_avalue value) abs0.avalues;
+    let avalues = !avalues in
+    { abs0 with avalues; kind = abs_kind; can_end }
+  with error ->
+    let backtrace=Printexc.get_raw_backtrace () in
+    let root=match !current_root with
+      | Some(i,value) -> "avalue/" ^ string_of_int i ^ ": "
+          ^ tavalue_to_string ~with_ended:true ctx value ^ " : " ^ ty_to_string ctx value.ty
+      | None -> "before first root" in
+    let leaf=match !current_avalue with
+      | Some(allow,value) -> "\ncurrent avalue allow_borrows=" ^ string_of_int allow ^ ": "
+          ^ tavalue_to_string ~with_ended:true ctx value ^ " : " ^ ty_to_string ctx value.ty
+      | None -> "" in
+    let concrete=match !current_value with
+      | Some value -> "\nlast concrete payload: " ^ show_tvalue value
+      | None -> "" in
+    Printf.eprintf "DESTRUCTURE_ABS_REJECTED %s%s%s\noriginal owner:\n%s\n%!"
+      root leaf concrete (abs_to_string span ~with_ended:true ctx abs0);
+    Printexc.raise_with_backtrace error backtrace
 
 let abs_is_destructured (span : Meta.span) (destructure_shared_values : bool)
     (ctx : eval_ctx) (abs : abs) : bool =
@@ -2303,8 +2523,13 @@ let abs_is_destructured (span : Meta.span) (destructure_shared_values : bool)
       method! visit_AIgnored _ _ = AIgnored None
     end
   in
-  let abs = visitor#visit_abs () abs in
+  (* Preserved shared payloads can retain AIgnored metadata on both sides.
+     Exact stability is sufficient; do not turn it into a mismatch by clearing
+     only the input. Keep the legacy tolerance for destructuring that actually
+     removes metadata, without relaxing any other structural comparison. *)
   equal_abs abs abs'
+  || (let abs = visitor#visit_abs () abs in
+      equal_abs abs abs')
 
 exception FoundBorrowId of unique_borrow_id
 exception FoundAbsId of AbsId.id
@@ -2378,24 +2603,43 @@ let abs_mut_borrows_loans_in_fixed span (ctx : eval_ctx)
         super#visit_abs (Some abs) abs
 
       method! visit_AProjLoans env proj' =
+        let loan_owner = [%unwrap_with_span] span env "Loan projector outside an abstraction" in
         if
-          proj.sv_id = proj'.proj.sv_id
+          AbsId.Set.mem loan_owner.abs_id fixed_abs_ids
+          && proj.sv_id = proj'.proj.sv_id
           && projections_intersect span ctx abs.regions.owned proj.proj_ty
-               (Option.get env).regions.owned proj'.proj.proj_ty
+               loan_owner.regions.owned proj'.proj.proj_ty
         then raise Found
         else super#visit_AProjLoans env proj'
     end
   in
 
   let visit_borrows =
-    object
+    object (self)
       inherit [_] iter_eval_ctx as super
 
-      method! visit_borrow_content _ _ =
-        (* We can get there through shared loans: let's just ignore it for now
-           (this function should be used to explore abstractions which don't
-           have remaining loans - see its use below) *)
-        [%internal_error] span
+      method! visit_AEndedSharedLoan in_ended_shared shared child =
+        self#visit_tvalue true shared;
+        self#visit_tavalue in_ended_shared child
+
+      method! visit_borrow_content in_ended_shared borrow =
+        match borrow with
+        | VSharedBorrow (bid, _)
+          when InterpSharedPacketSignature.enabled () && in_ended_shared ->
+            (* The native end_abs_borrows case replaces this precise shared
+               borrow with Bottom without giving a value back to its loan.
+               It cannot mutate a fixed mutable loan. Keep the authoritative
+               loan correspondence check; the reader itself changes nothing. *)
+            (match ctx_lookup_loan span ek_all bid ctx with
+            | _, Concrete (VSharedLoan (actual, _))
+            | _, Abstract (ASharedLoan (PNone, actual, _, _)) ->
+                [%sanity_check] span (actual = bid)
+            | _ -> [%craise] span "Ended shared payload borrow has no current shared loan")
+        | _ ->
+            [%craise] span
+              ("Unsupported concrete borrow while checking abstraction ending: "
+               ^ show_borrow_content borrow ^ "\noriginal owner:\n"
+               ^ abs_to_string span ~with_ended:true ctx abs)
 
       method! visit_aborrow_content env lc =
         super#visit_aborrow_content env lc;
@@ -2426,22 +2670,9 @@ let abs_mut_borrows_loans_in_fixed span (ctx : eval_ctx)
     end
   in
   try
-    visit_borrows#visit_abs () abs;
+    visit_borrows#visit_abs false abs;
     false
   with Found -> true
-
-(** Exact original top-root cleanup predicate, also shared with the narrowly
-    recorded leaf action. It does not examine or edit continuations. *)
-let ended_shared_loan_is_eliminable (span : Meta.span) (ctx : eval_ctx)
-    (v : tavalue) : bool =
-  match v.value with
-  | ALoan (AEndedSharedLoan (sv, child))
-    when (not (value_has_loans_or_borrows (Some span) ctx sv.value))
-         && is_aignored child.value -> true
-  | ASymbolic (_, AEndedProjLoans { proj_ty = _; proj = _; consumed; borrows })
-    when List.for_all (fun (_, proj) -> proj = AEmpty) (consumed @ borrows)
-    -> true
-  | _ -> false
 
 let eliminate_ended_shared_loans (span : Meta.span) (ctx : eval_ctx) : eval_ctx =
   let update_abs (abs : abs) : abs =
@@ -2596,6 +2827,24 @@ let rec simplify_dummy_values_useless_abs_aux (config : config)
            && AbsId.Set.is_empty abs.parents
            && not (AbsId.Set.mem abs.abs_id frozen_abs) -> (
         [%ldebug "Diving into abs:\n" ^ abs_to_string span ctx abs];
+        if InterpSharedPacketSignature.enabled () then begin
+          let rec payload (value : tvalue) = match value.value with
+            | VAdt adt -> List.iter payload adt.fields
+            | VBorrow (VSharedBorrow (bid,sid)) ->
+                raise (FoundBorrowId (UShared (bid,sid)))
+            | _ -> () in
+          let rec ended_root (value : tavalue) = match value.value with
+            | AAdt adt -> List.iter ended_root adt.fields
+            | ALoan (AEndedSharedLoan (shared,child))
+              when is_aignored child.value -> payload shared
+            | _ -> () in
+          (* Native end_concrete_borrow_get_borrow explicitly permits ending
+             these stored shared borrows without ending their abstraction.
+             Select only level-zero ADT/ended-shared paths, never a live loan,
+             mutable borrow, given-back level, frozen owner or E metadata.
+             The existing FoundBorrowId handler preserves the native cc. *)
+          List.iter ended_root abs.avalues
+        end;
         (* End the shared loans with no corresponding borrows *)
         let visitor =
           object

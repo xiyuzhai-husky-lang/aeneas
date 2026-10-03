@@ -380,6 +380,8 @@ and trait_instance_id_to_string (env : fmt_env) (id : trait_instance_id) :
   match id with
   | AppliedSliceVecZip (a,b) -> "AppliedSliceVecZip(" ^ ty_to_string env false a ^ ", " ^ ty_to_string env false b ^ ")"
   | AppliedVecSliceZip (a,b) -> "AppliedVecSliceZip(" ^ ty_to_string env false a ^ ", " ^ ty_to_string env false b ^ ")"
+  | AppliedSliceZipBack (a,b) -> "AppliedSliceZipBack(" ^ ty_to_string env false a ^ ", " ^ ty_to_string env false b ^ ")"
+  | AppliedSliceZipSize (a,b) -> "AppliedSliceZipSize(" ^ ty_to_string env false a ^ ", " ^ ty_to_string env false b ^ ")"
   | AppliedSliceZip (a, b) -> "AppliedSliceZip(" ^ ty_to_string env false a ^ ", " ^ ty_to_string env false b ^ ")"
   | Self -> "Self"
   | TraitImpl (impl_id, generics) ->
@@ -875,6 +877,8 @@ let pure_builtin_fun_id_to_string (fid : pure_builtin_fun_id) : string =
     end
   | Discriminant -> "@discriminant"
   | ResultUnwrapMut -> "@resultUnwrapMut"
+  | ResultAndThenMutCapture -> "@resultAndThenMutCapture"
+  | OptionExpectMut -> "@optionExpectMut"
   | GetTarget -> "@getTarget"
   | TargetFeatureEnabled -> "@targetFeatureEnabled"
 

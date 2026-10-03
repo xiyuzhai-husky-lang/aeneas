@@ -96,6 +96,10 @@ let prune (crate : crate) =
           self#visit_generic_args env
             (filtered_args d.item_meta.span info.keep_params info.keep_trait_clauses r.generics)
     method! visit_trait_ref env tr =
+      match AppliedBuiltins.classify_reverse_trait crate tr with
+      | Some (_,a,b) -> self#visit_ty env a; self#visit_ty env b;
+          self#visit_trait_decl_ref env tr.trait_decl_ref.binder_value
+      | None ->
       match AppliedZipDispatch.classify_trait crate tr with
       | Some (_,a,b) -> self#visit_ty env a; self#visit_ty env b;
           self#visit_trait_decl_ref env tr.trait_decl_ref.binder_value

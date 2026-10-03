@@ -1379,6 +1379,17 @@ let extract_file (config : gen_config) (ctx : gen_ctx) (fi : extract_file_info)
         Printf.fprintf out "@[expose] public section\n";
       (* Always open the Primitives namespace *)
       Printf.fprintf out "open Aeneas Aeneas.Std Result ControlFlow Error\n";
+      (* Reservation outcomes are an explicit external-library parameter. Lean
+         propagates the instance only into declarations which actually use it;
+         the extracted Rust control flow and failure branches are unchanged. *)
+      if
+        FunDeclId.Map.exists
+          (fun _ (trans : pure_fun_translation) ->
+            match trans.f.builtin_info with
+            | Some info -> info.extract_name = "alloc.vec.Vec.try_reserve"
+            | None -> false)
+          ctx.trans_funs
+      then Printf.fprintf out "variable [ReservationModel]\n";
       (* Silence the linters which would fire on generated code. *)
       List.iter
         (fun option -> Printf.fprintf out "set_option %s false\n" option)

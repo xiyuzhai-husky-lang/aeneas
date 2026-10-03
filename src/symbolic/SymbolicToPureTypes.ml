@@ -54,7 +54,7 @@ let translate_const_generic_param (span : span option)
 
 (* Some generic translation functions (we need to translate different "flavours"
    of types: forward types, backward types, etc.) *)
-let rec translate_generic_args ?crate (span : Meta.span option)
+let rec translate_generic_args ?crate ?type_infos (span : Meta.span option)
     (translate_ty : T.ty -> ty) (generics : T.generic_args) : generic_args =
   (* We ignore the regions: if they didn't cause trouble for the symbolic execution,
      then everything's fine *)
@@ -65,47 +65,58 @@ let rec translate_generic_args ?crate (span : Meta.span option)
       generics.const_generics
   in
   let trait_refs =
-    List.map (translate_trait_ref ?crate span translate_ty) generics.trait_refs
+    List.map (translate_trait_ref ?crate ?type_infos span translate_ty) generics.trait_refs
   in
   { types; const_generics; trait_refs }
 
-and translate_trait_ref ?crate (span : Meta.span option) (translate_ty : T.ty -> ty)
+and translate_trait_ref ?crate ?type_infos (span : Meta.span option) (translate_ty : T.ty -> ty)
     (tr : T.trait_ref) : trait_ref =
   let trait_id =
+    match Option.bind crate (fun c -> AppliedBuiltins.classify_reverse_trait c tr) with
+    | Some (`DoubleEnded,a,b) -> AppliedSliceZipBack (translate_ty a,translate_ty b)
+    | Some (`ExactSize,a,b) -> AppliedSliceZipSize (translate_ty a,translate_ty b)
+    | None ->
     match Option.bind crate (fun c -> AppliedZipDispatch.classify_trait c tr) with
     | Some (AppliedZipDispatch.SliceSlice, a, b) -> AppliedSliceZip (translate_ty a, translate_ty b)
     | Some (AppliedZipDispatch.SliceVec, a, b) -> AppliedSliceVecZip (translate_ty a, translate_ty b)
     | Some (AppliedZipDispatch.VecSlice, a, b) -> AppliedVecSliceZip (translate_ty a, translate_ty b)
-    | None -> translate_trait_ref_kind ?crate span translate_ty tr in
+    | None -> translate_trait_ref_kind ?crate ?type_infos span translate_ty tr in
   let trait_decl_ref =
     translate_region_binder
-      (translate_trait_decl_ref ?crate span translate_ty)
+      (translate_trait_decl_ref ?crate ?type_infos span translate_ty)
       tr.trait_decl_ref
   in
   { trait_id; trait_decl_ref }
 
-and translate_trait_decl_ref ?crate (span : Meta.span option)
+and translate_trait_decl_ref ?crate ?type_infos (span : Meta.span option)
     (translate_ty : T.ty -> ty) (tr : T.trait_decl_ref) : trait_decl_ref =
-  let decl_generics = translate_generic_args ?crate span translate_ty tr.generics in
+  let decl_generics = translate_generic_args ?crate ?type_infos span translate_ty tr.generics in
+  let decl_generics = match crate,type_infos with
+    | Some crate,Some infos when Option.is_some (AppliedFnOnceCapture.classify_trait crate infos tr) ->
+        (match decl_generics.types with
+        | [self;argument;output] ->
+            {decl_generics with types=[self;argument;mk_simpl_tuple_ty [output;self]]}
+        | _ -> [%craise_opt_span] span "Mutable-capture FnOnce lost its original trait parameters")
+    | _ -> decl_generics in
   { trait_decl_id = tr.id; decl_generics }
 
-and translate_fun_decl_ref ?crate (span : Meta.span option) (translate_ty : T.ty -> ty)
+and translate_fun_decl_ref ?crate ?type_infos (span : Meta.span option) (translate_ty : T.ty -> ty)
     (fr : T.fun_decl_ref) : fun_decl_ref =
-  let fun_generics = translate_generic_args ?crate span translate_ty fr.generics in
+  let fun_generics = translate_generic_args ?crate ?type_infos span translate_ty fr.generics in
   { fun_id = fr.id; fun_generics }
 
-and translate_global_decl_ref ?crate (span : Meta.span option)
+and translate_global_decl_ref ?crate ?type_infos (span : Meta.span option)
     (translate_ty : T.ty -> ty) (gr : T.global_decl_ref) : global_decl_ref =
-  let global_generics = translate_generic_args ?crate span translate_ty gr.generics in
+  let global_generics = translate_generic_args ?crate ?type_infos span translate_ty gr.generics in
   { global_id = gr.id; global_generics }
 
-and translate_trait_ref_kind ?crate (span : Meta.span option)
+and translate_trait_ref_kind ?crate ?type_infos (span : Meta.span option)
     (translate_ty : T.ty -> ty) (tref : T.trait_ref) : trait_instance_id =
   match tref.kind with
   | T.Self -> Self
   | TraitImpl impl_ref ->
       let generics =
-        translate_generic_args ?crate span translate_ty impl_ref.generics
+        translate_generic_args ?crate ?type_infos span translate_ty impl_ref.generics
       in
       TraitImpl (impl_ref.id, generics)
   | BuiltinOrAuto (data, _, _, _) ->
@@ -129,7 +140,7 @@ and translate_trait_ref_kind ?crate (span : Meta.span option)
       Clause var
       (* Note: the `de_bruijn_id`s are incorrect, see comment on `translate_region_binder` *)
   | ParentClause (tref, clause_id) ->
-      let inst_id = translate_trait_ref_kind ?crate span translate_ty tref in
+      let inst_id = translate_trait_ref_kind ?crate ?type_infos span translate_ty tref in
       ParentClause (inst_id, tref.trait_decl_ref.binder_value.id, clause_id)
   | ItemClause _ ->
       (* `ItemClause`s are removed by Charon's `--remove-associated-types`, except for GATs *)
@@ -436,11 +447,11 @@ let rec translate_fwd_ty (span : Meta.span option) (decls_ctx : C.decls_ctx)
 
 and translate_fwd_generic_args (span : Meta.span option)
     (decls_ctx : C.decls_ctx) (generics : T.generic_args) : generic_args =
-  translate_generic_args ~crate:decls_ctx.crate span (translate_fwd_ty span decls_ctx) generics
+  translate_generic_args ~crate:decls_ctx.crate ~type_infos:decls_ctx.type_ctx.type_infos span (translate_fwd_ty span decls_ctx) generics
 
 and translate_fwd_trait_ref (span : Meta.span option) (decls_ctx : C.decls_ctx)
     (tr : T.trait_ref) : trait_ref =
-  translate_trait_ref ~crate:decls_ctx.crate span (translate_fwd_ty span decls_ctx) tr
+  translate_trait_ref ~crate:decls_ctx.crate ~type_infos:decls_ctx.type_ctx.type_infos span (translate_fwd_ty span decls_ctx) tr
 
 (** Compute the *number* of levels of sub-abstractions existing for a given
     region type. *)

@@ -108,6 +108,10 @@ type pure_builtin_fun_id =
   | VecSliceZipFold
       (** Applied external-library bindings; produced only after exact LLBC
           shared-slice iterator and witness classification. *)
+  | ResultAndThenMutCapture
+      (** Applied FnOnce with one native mutable capture, returning its complete state. *)
+  | OptionExpectMut
+      (** Option.expect applied to a mutable reference with a borrow-free target. *)
   | Return  (** The monadic return *)
   | Fail  (** The monadic fail *)
   | Assert  (** Assertion *)
@@ -690,6 +694,8 @@ and builtin_impl_data =
 and trait_instance_id =
   | Self
   | AppliedSliceZip of ty * ty
+  | AppliedSliceZipBack of ty * ty
+  | AppliedSliceZipSize of ty * ty
   | AppliedSliceVecZip of ty * ty
   | AppliedVecSliceZip of ty * ty
       (** A concrete Iterator dictionary for Zip<SliceIter<T>, SliceIter<U>>.

@@ -148,6 +148,9 @@ module type PrimMatcher = sig
   (** Only structural equivalence/application matching may preserve this wrapper.
       Its map query is read-only and validates any existing value binding too. *)
   val supports_ignored_shared_projector : bool
+  (** Final application only: preserve an unchanged concrete shared reference
+      payload after all ordinary recursive value/type/permission callbacks. *)
+  val supports_identical_shared_reference_payload : bool
   val ignored_shared_projector_mappings :
     symbolic_value -> RegionId.Set.t -> bool
 
@@ -567,6 +570,7 @@ module type MatchCheckEquivState = sig
   (** [true] if we check equivalence between contexts, [false] if we compute a
       mapping from a source context to a target context. *)
   val check_equiv : bool
+  val match_current_interface : bool
 
   val rid_map : RegionId.InjSubst.t ref
 
@@ -589,6 +593,8 @@ end
 
 module type CheckEquivMatcher = sig
   include PrimMatcher
+
+  val match_symbolic_value_ids : symbolic_value_id -> symbolic_value_id -> symbolic_value_id
 
   val match_aid : abs_id -> abs_id -> abs_id
   val match_aidl : abs_id list -> abs_id list -> abs_id list
@@ -761,10 +767,22 @@ let ids_sets_empty_borrows_loans (ids : ids_sets) : ids_sets =
 (** Small utility: add a projection marker to a typed avalue. This can be used
     in combination with List.map to add markers to an entire abstraction *)
 let tavalue_add_marker (span : Meta.span) (ctx : eval_ctx) (pm : proj_marker)
-    (av : tavalue) : tavalue =
+    ~(owner : abs) (av : tavalue) : tavalue =
   let obj =
-    object
+    object (self)
       inherit [_] map_tavalue as super
+      method! visit_tavalue env (value:tavalue) =
+        match value.value with
+        | ALoan(ASharedLoan(PNone,bid,({value=VBorrow(VSharedBorrow _);_} as shared),child))
+          when InterpSharedPacketSignature.enabled ()
+            && List.exists (fun original->original==value) owner.avalues ->
+            InterpSharedPacketSignature.check_retained_shared_loan span ctx owner 0 value;
+            (* Concrete payloads have no marker field. Like native incidence
+               traversal, they inherit the enclosing loan's marker; preserve
+               the actual inner BID/SID and value instead of fabricating an A leaf. *)
+            {value with value=ALoan(ASharedLoan(pm,bid,shared,self#visit_tavalue env child))}
+        | _ -> super#visit_tavalue env value
+
       method! visit_borrow_content _ _ = [%craise] span "Unexpected borrow"
       method! visit_loan_content _ _ = [%craise] span "Unexpected loan"
 
@@ -775,7 +793,22 @@ let tavalue_add_marker (span : Meta.span) (ctx : eval_ctx) (pm : proj_marker)
 
       method! visit_ASymbolic _ pm0 aproj =
         [%sanity_check] span (pm0 = PNone);
-        ASymbolic (pm, aproj)
+        (* Native ending leaves typed historical nodes in retained wrappers.
+           Do not create a permission marker where no current permission remains;
+           any live history child still takes the ordinary marked route. *)
+        let inactive =
+          match aproj with
+          | AEmpty -> true
+          | AEndedProjBorrows p -> p.loans = []
+          | AEndedProjLoans p ->
+              List.for_all (fun (_, child) -> child = AEmpty)
+                (p.consumed @ p.borrows)
+          | AProjLoans _ | AProjBorrows _ -> false
+        in
+        let marker =
+          if InterpSharedPacketSignature.enabled () && inactive then PNone
+          else pm in
+        ASymbolic (marker, aproj)
 
       method! visit_symbolic_value _ sv =
         (* Symbolic values can appear in shared values *)
@@ -791,6 +824,25 @@ let tavalue_add_marker (span : Meta.span) (ctx : eval_ctx) (pm : proj_marker)
         | ASharedLoan (pm0, bids, av, child) ->
             [%sanity_check] span (pm0 = PNone);
             super#visit_aloan_content env (ASharedLoan (pm, bids, av, child))
+        | AEndedSharedLoan (shared, child)
+          when InterpSharedPacketSignature.enabled ()
+            && ValuesUtils.is_aignored child.value
+            && not (tvalue_has_loans_or_borrows (Some span) ctx shared) ->
+            (* Native ending already returned this permission. Preserve its
+               original payload and ignored metadata without making a marker. *)
+            lc
+        | AIgnoredMutLoan (Some bid,child)
+          when InterpSharedPacketSignature.enabled () ->
+            AIgnoredMutLoan (Some bid,self#visit_tavalue env child)
+        | AIgnoredSharedLoan child when InterpSharedPacketSignature.enabled () ->
+            AIgnoredSharedLoan (self#visit_tavalue env child)
+        | AEndedIgnoredMutLoan ended when InterpSharedPacketSignature.enabled () ->
+            (* Mark current leaves in place. The wrapper still determines the
+               child's original level and the given-back child's next level;
+               its historical metadata is retained as the exact original value. *)
+            AEndedIgnoredMutLoan {ended with
+              child=self#visit_tavalue env ended.child;
+              given_back=self#visit_tavalue env ended.given_back}
         | _ ->
             [%craise] span
               ("(Internal error: please file an issue (unexpected value: "
@@ -805,7 +857,33 @@ let tavalue_add_marker (span : Meta.span) (ctx : eval_ctx) (pm : proj_marker)
         | ASharedBorrow (pm0, bid, sid) ->
             [%sanity_check] span (pm0 = PNone);
             super#visit_aborrow_content env (ASharedBorrow (pm, bid, sid))
-        | _ -> [%internal_error] span
+        | AIgnoredMutBorrow (Some bid,child)
+          when InterpSharedPacketSignature.enabled () ->
+            (* The ID is a parent-return subscription with no marker field.
+               Only its original child permissions receive the branch marker. *)
+            AIgnoredMutBorrow (Some bid,self#visit_tavalue env child)
+        | AEndedIgnoredMutBorrow ended
+          when InterpSharedPacketSignature.enabled () ->
+            AEndedIgnoredMutBorrow {ended with
+              child=self#visit_tavalue env ended.child;
+              given_back=self#visit_tavalue env ended.given_back}
+        | AEndedSharedBorrow when InterpSharedPacketSignature.enabled () ->
+            (* This native ended leaf has neither an active permission nor a
+               marker field. Keep the exact original constructor. *)
+            bc
+        | AProjSharedBorrow borrows
+          when InterpSharedPacketSignature.enabled ()
+            && List.for_all (function AsbProjReborrows _->true|AsbBorrow _->false) borrows ->
+            (* This native constructor has no marker. Keep the exact validated
+               shared obligation; it remains outside the cancellation index and
+               present in external closure. In particular it is never converted
+               to an ordinary marked borrow projector. *)
+            bc
+        | _ -> [%craise] span
+            ("Unsupported A borrow while adding join marker: "
+             ^ show_aborrow_content bc
+             ^ "\noriginal typed root: " ^ show_tavalue av
+             ^ "\noriginal owner: " ^ abs_to_string span ~with_ended:true ctx owner)
     end
   in
   obj#visit_tavalue () av
@@ -842,6 +920,9 @@ let tevalue_add_marker (span : Meta.span) (ctx : eval_ctx) (pm : proj_marker)
         | EMutLoan (pm0, bid, av) ->
             [%sanity_check] span (pm0 = PNone);
             super#visit_eloan_content ty (EMutLoan (pm, bid, av))
+        | EIgnoredMutLoan (Some bid,child)
+          when InterpSharedPacketSignature.enabled () ->
+            EIgnoredMutLoan (Some bid,self#visit_tevalue ty child)
         | EEndedMutLoan _ | EEndedIgnoredMutLoan _ ->
             super#visit_eloan_content ty lc
         | _ ->
@@ -855,6 +936,9 @@ let tevalue_add_marker (span : Meta.span) (ctx : eval_ctx) (pm : proj_marker)
         | EMutBorrow (pm0, bid, av) ->
             [%sanity_check] span (pm0 = PNone);
             super#visit_eborrow_content env (EMutBorrow (pm, bid, av))
+        | EIgnoredMutBorrow (Some bid,child)
+          when InterpSharedPacketSignature.enabled () ->
+            EIgnoredMutBorrow (Some bid,self#visit_tevalue env child)
         | EEndedIgnoredMutBorrow bc ->
             EEndedIgnoredMutBorrow (self#visit_eended_ignored_mut_borrow env bc)
         | _ -> [%internal_error] span
@@ -873,9 +957,12 @@ let abs_cont_add_marker (span : Meta.span) (ctx : eval_ctx) (pm : proj_marker)
     in combination with List.map to add markers to an entire abstraction *)
 let abs_add_marker (span : Meta.span) (ctx : eval_ctx) (pm : proj_marker)
     (abs : abs) : abs =
+  if InterpSharedPacketSignature.enabled ()
+     && InterpSharedPacketSignature.needs_explicit_signature abs then
+    ignore (InterpSharedPacketSignature.check span ctx abs);
   {
     abs with
-    avalues = List.map (tavalue_add_marker span ctx pm) abs.avalues;
+    avalues = List.map (tavalue_add_marker span ctx pm ~owner:abs) abs.avalues;
     cont = Option.map (abs_cont_add_marker span ctx pm) abs.cont;
   }
 

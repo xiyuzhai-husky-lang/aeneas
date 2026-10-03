@@ -17,6 +17,9 @@ open InterpJoinCore
 
     Parameters:
     - [explore]: this function is used to filter abstractions. *)
+val retained_cross_level_shared_self_edge :
+  Meta.span -> eval_ctx -> AbsId.id -> (proj_marker * borrow_id) -> bool
+
 val compute_abs_borrows_loans_maps :
   Meta.span -> (abs -> bool) -> eval_ctx -> env -> abs_borrows_loans_maps
 
@@ -77,6 +80,13 @@ module MakeCheckEquivMatcher : functor (_ : MatchCheckEquivState) ->
       [false], compute a mapping from the first context to the second context,
       in the sense of [match_ctx_with_target].
 
+    - [match_current_interface]: only for the final loop application match
+      with [check_equiv=false]. Match owned regions visible in the whole
+      current environment, leaving continuation-only ownership untouched. The
+      returned region map is then only an interface map; callers must retain
+      the original target abstractions and continuations, not rename them
+      through this map.
+
     - [fixed_ids]
 
     - [lookup_shared_value_in_ctx0], [lookup_shared_value_in_ctx1]: The lookup
@@ -95,6 +105,8 @@ val try_match_ctxs :
   check_equiv:bool ->
   ?check_kind:bool ->
   ?check_can_end:bool ->
+  ?diagnose_failure:bool ->
+  ?match_current_interface:bool ->
   ids_sets ->
   (loan_id -> tvalue) ->
   (loan_id -> tvalue) ->
@@ -114,6 +126,8 @@ val match_ctxs :
   ?check_kind:bool ->
   ?check_can_end:bool ->
   recoverable:bool ->
+  ?diagnose_failure:bool ->
+  ?match_current_interface:bool ->
   ids_sets ->
   (loan_id -> tvalue) ->
   (loan_id -> tvalue) ->

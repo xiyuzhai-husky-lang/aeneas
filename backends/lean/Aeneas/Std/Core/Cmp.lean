@@ -26,6 +26,7 @@ def core.cmp.Eq.assert_fields_are_eq.default
   .ok ()
 
 /- Default method. -/
+@[expose]
 def core.cmp.PartialEq.ne.default {Self Rhs : Type} (eq : Self → Rhs → Result Bool)
   (self : Self) (other : Rhs) : Result Bool := do
   ok (¬ (← eq self other))
@@ -235,6 +236,13 @@ def core.cmp.impls.OrdUnit.cmp (_ _ : Unit) : Result Ordering :=
 
 @[expose, rust_fun "core::cmp::impls::{core::cmp::PartialEq<bool, bool>}::eq"]
 def core.cmp.impls.PartialEqBool.eq (b0 b1 : Bool) : Result Bool := .ok (b0 = b1)
+
+@[expose, rust_fun "core::cmp::impls::{core::cmp::PartialEq<bool, bool>}::ne"]
+def core.cmp.impls.PartialEqBool.ne (b0 b1 : Bool) : Result Bool := .ok (b0 ≠ b1)
+
+@[simp] theorem core.cmp.impls.PartialEqBool.ne_exact (b0 b1 : Bool) :
+    core.cmp.impls.PartialEqBool.ne b0 b1 = .ok (decide (b0 ≠ b1)) := rfl
+
 
 @[expose, reducible, rust_trait_impl "core::cmp::PartialEq<bool, bool>"]
 def core.cmp.PartialEqBool : core.cmp.PartialEq Bool Bool := {

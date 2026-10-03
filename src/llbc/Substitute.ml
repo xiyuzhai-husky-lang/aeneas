@@ -7,6 +7,24 @@ open Types
 open Values
 open LlbcAst
 
+(* Charon's erasure substitutes region variables but preserves the static
+   constant. Aeneas runtime values require every region annotation erased,
+   including static fields exposed by symbolic ADT expansion. Keep the original
+   full symbolic/declaration types unchanged and erase only this runtime view. *)
+let erase_runtime_static_regions (ty : ty) : ty =
+  let visitor=object
+    inherit [_] map_ty
+    method! visit_RStatic _ = RErased
+  end in
+  visitor#visit_ty () ty
+
+let erase_regions (ty : ty) : ty =
+  erase_runtime_static_regions (Charon.Substitute.erase_regions ty)
+
+let type_decl_get_instantiated_field_etypes def variant generics =
+  List.map erase_runtime_static_regions
+    (Charon.Substitute.type_decl_get_instantiated_field_etypes def variant generics)
+
 (* Fails if the variable is bound *)
 let expect_free_var span (var : 'id de_bruijn_var) : 'id =
   match var with

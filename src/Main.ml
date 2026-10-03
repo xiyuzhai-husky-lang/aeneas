@@ -216,10 +216,8 @@ let () =
          collisions with field projectors. Example: the `len` method in `impl \
          Struct { fn len(&self) -> usize { ... } }` would be named \
          `Struct.impl.len`." );
-      ( "-applied-mixed-zip-admission", Arg.Set_string mixed_zip_admission,
-        " Private mixed Zip: approved pinned-input admission record (Lean only)" );
-      ( "-mixed-zip-source-root", Arg.Set_string mixed_zip_source_root,
-        " Complete unchanged source root for the approved mixed Zip record" );
+      ( "-applied-mixed-zip", Arg.Set applied_mixed_zip,
+        " Experimental Lean-only concrete shared-slice/owned-Vec Zip models" );
       ( "-applied-slice-zip", Arg.Set applied_slice_zip,
         " Experimental Lean-only concrete shared-slice Zip model binding" );
       ( "-multi-exit-loops",
@@ -590,10 +588,7 @@ let () =
   in
 
   (* Load the module *)
-  match (if !mixed_zip_admission = "" && !mixed_zip_source_root = "" then
-    crate_of_json_file filename
-  else MixedZipAdmission.load ~record_path:!mixed_zip_admission
-    ~source_root:!mixed_zip_source_root ~filename) with
+  match crate_of_json_file filename with
   | Error s ->
       log#error "error: %s\n" s;
       exit 1

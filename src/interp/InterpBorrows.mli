@@ -22,6 +22,12 @@ val end_loan : config -> Meta.span -> ?snapshots:bool -> loan_id -> cm_fun
 *)
 val end_loans : config -> Meta.span -> ?snapshots:bool -> loan_id_set -> cm_fun
 
+(** Native return of the borrows in a closed analysis-only strict sublevel.
+    The caller proves component closure and checks exact resulting edits.
+    This does not end owner regions or record a sub-abstraction as ended. *)
+val return_analysis_sublevel_borrows :
+  ?allow_unchanged_cont:bool -> config -> Meta.span -> AbsId.id -> int -> eval_ctx -> eval_ctx
+
 (** End an abstraction while preserving the invariants. *)
 val end_abs :
   config -> Meta.span -> ?snapshots:bool -> AbsId.id -> int -> cm_fun

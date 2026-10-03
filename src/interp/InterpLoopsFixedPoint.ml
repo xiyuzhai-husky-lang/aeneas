@@ -19,7 +19,8 @@ let loop_abs_reorder_and_add_info (span : Meta.span) (fixed_ids : ids_sets)
 
   (* Introduce continuation expressions. *)
   let add_abs_cont_to_abs (abs : abs) (loop_id : loop_id) : abs =
-    InterpAbs.add_abs_cont_to_abs span ctx abs (ELoop (abs.abs_id, loop_id))
+    InterpAbs.add_abs_cont_to_abs ~shared_packet_signature:!Config.multi_exit_loops
+      span ctx abs (ELoop (abs.abs_id, loop_id))
   in
   let add_abs_conts ctx =
     let visitor =
@@ -346,7 +347,10 @@ let compute_loop_break_context ?exit_kind (config : config) (span : Meta.span)
          abstractions introduced by function calls inside the loop body should be
          treated as loop abstractions. *)
       let add_abs_cont_to_abs (abs : abs) (loop_id : loop_id) : abs =
-        InterpAbs.add_abs_cont_to_abs span break_ctx abs
+        (* As for multi-exit output contexts, retain the complete A tree when
+           its checked shared packet signature has no mutable interface. The
+           ordinary constructor still handles every other abstraction. *)
+        InterpAbs.add_abs_cont_to_abs ~shared_packet_signature:true span break_ctx abs
           (ELoop (abs.abs_id, loop_id))
       in
       let add_abs_conts ctx =

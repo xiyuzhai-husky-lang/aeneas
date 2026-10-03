@@ -635,6 +635,5 @@ let drop_as_no_op = ref true
 (* Isolated applied-library prototype; never enabled by default. *)
 let applied_slice_zip = ref false
 
-(** Private mixed Zip prototype: requires an approved pinned input record. *)
-let mixed_zip_admission = ref ""
-let mixed_zip_source_root = ref ""
+(** Opt-in mixed Zip contents model; concrete shape checks remain in AppliedMixedZip. *)
+let applied_mixed_zip = ref false
