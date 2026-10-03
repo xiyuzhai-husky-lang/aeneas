@@ -17,6 +17,7 @@ public import Aeneas.Std.Scalar.TraitOps
 public import Aeneas.Std.Slice
 public import Aeneas.Std.SliceDef
 public import Aeneas.Std.SliceIter
+public import Aeneas.Std.SliceLast
 public import Aeneas.Std.Std
 public import Aeneas.Std.String
 public import Aeneas.Std.StringDef

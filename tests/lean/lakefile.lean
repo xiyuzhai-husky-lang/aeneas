@@ -114,6 +114,8 @@ package «tests» {}
 @[default_target] lean_lib ScalarTraitOps
 @[default_target] lean_lib ScalarTraitOpsTests
 @[default_target] lean_lib Scalars
+@[default_target] lean_lib SliceLast
+@[default_target] lean_lib SliceLastTests
 @[default_target] lean_lib Slices
 @[default_target] lean_lib Static
 @[default_target] lean_lib StepBy
