@@ -19,6 +19,7 @@ public import Aeneas.Std.StringDef
 public import Aeneas.Std.StringIter
 public import Aeneas.Std.Target
 public import Aeneas.Std.Vec
+public import Aeneas.Std.VecOps
 public import Aeneas.Std.VecIter
 public import Aeneas.Data.Tuples
 public import Aeneas.Std.RangeIter

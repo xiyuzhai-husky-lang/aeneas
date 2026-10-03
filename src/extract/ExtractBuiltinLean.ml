@@ -192,6 +192,22 @@ let lean_builtin_consts =
 
 let lean_builtin_funs =
   [
+    (* file: "Aeneas/Std/VecOps.lean", line: 16 *)
+    mk_fun "alloc::vec::{alloc::vec::Vec<@T>}::as_slice" "alloc.vec.Vec.as_slice" ~keep_params:(Some [true; false]) ~can_fail:false ~lift:false;
+    (* file: "Aeneas/Std/VecOps.lean", line: 74 *)
+    mk_fun "alloc::vec::{alloc::vec::Vec<@T>}::clear" "alloc.vec.Vec.clear" ~keep_params:(Some [true; false]);
+    (* file: "Aeneas/Std/VecOps.lean", line: 139 *)
+    mk_fun "alloc::vec::{alloc::vec::Vec<@T>}::dedup" "alloc.vec.Vec.dedup" ~keep_params:(Some [true; false]);
+    (* file: "Aeneas/Std/VecOps.lean", line: 81 *)
+    mk_fun "alloc::vec::{alloc::vec::Vec<@T>}::is_empty" "alloc.vec.Vec.is_empty" ~keep_params:(Some [true; false]) ~can_fail:false ~lift:false;
+    (* file: "Aeneas/Std/VecOps.lean", line: 61 *)
+    mk_fun "alloc::vec::{alloc::vec::Vec<@T>}::pop" "alloc.vec.Vec.pop" ~keep_params:(Some [true; false]);
+    (* file: "Aeneas/Std/VecOps.lean", line: 41 *)
+    mk_fun "alloc::vec::{alloc::vec::Vec<@T>}::remove" "alloc.vec.Vec.remove" ~keep_params:(Some [true; false]);
+    (* file: "Aeneas/Std/VecOps.lean", line: 113 *)
+    mk_fun "alloc::vec::{alloc::vec::Vec<@T>}::retain" "alloc.vec.Vec.retain" ~keep_params:(Some [true; false; true]);
+    (* file: "Aeneas/Std/VecOps.lean", line: 28 *)
+    mk_fun "alloc::vec::{alloc::vec::Vec<@T>}::truncate" "alloc.vec.Vec.truncate" ~keep_params:(Some [true; false]);
     (* file: "Aeneas/Std/Alloc.lean", line: 27 *)
     mk_fun "alloc::alloc::{core::clone::Clone<alloc::alloc::Global>}::clone"
       "alloc.alloc.CloneGlobal.clone";
