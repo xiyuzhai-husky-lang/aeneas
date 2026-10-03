@@ -26,8 +26,8 @@ theorem ByteArray.length_toList (bs : ByteArray) :
   rw [loop_length 0 [] (Nat.zero_le _)]
   simp
 
-/-- TODO: we shouldn't use `decide +native` but it seems we can't reduce it otherwise. -/
-def toStr (s : String) (h : s.toByteArray.size ≤ U32.max := by decide +native) : Str :=
+/-- Literal size bounds are checked by the kernel after rewriting the opaque scalar limit. -/
+def toStr (s : String) (h : s.toByteArray.size ≤ U32.max := by rw [U32.max_eq]; decide) : Str :=
   .from (s.toByteArray.toList.map
     (fun x => ⟨ x.toNat, by cases x; simp only [UInt8.toNat_ofBitVec, UScalarTy.U8_numBits_eq, Nat.reducePow]; omega  ⟩))
     (by
@@ -35,6 +35,10 @@ def toStr (s : String) (h : s.toByteArray.size ≤ U32.max := by decide +native)
         List.length_map]
       rw [ByteArray.length_toList]
       exact h.trans (by scalar_tac))
+
+theorem toStr_length (s : String) (h : s.toByteArray.size ≤ U32.max) :
+    (toStr s h).val.length = s.toByteArray.size := by
+  simp only [toStr, Slice.from_val, List.length_map, ByteArray.length_toList]
 
 example : Str := toStr "hello"
 
