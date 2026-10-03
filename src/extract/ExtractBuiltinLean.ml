@@ -192,6 +192,8 @@ let lean_builtin_consts =
 
 let lean_builtin_funs =
   [
+    (* file: "Aeneas/Std/SliceFirst.lean", line: 10 *)
+    mk_fun "core::slice::{[@T]}::first" "core.slice.Slice.first";
     (* file: "Aeneas/Std/SliceLast.lean", line: 10 *)
     mk_fun "core::slice::{[@T]}::last" "core.slice.Slice.last";
     (* file: "Aeneas/Std/Core/Hash.lean", line: 20 *)
