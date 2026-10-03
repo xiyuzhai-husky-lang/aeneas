@@ -18,3 +18,8 @@ public import Aeneas.Std.Vec
 public import Aeneas.Std.VecIter
 public import Aeneas.Data.Tuples
 public import Aeneas.Std.RangeIter
+
+public import Aeneas.Std.SliceZip
+public import Aeneas.Std.MixedZip
+
+public import Aeneas.Std.HashMap

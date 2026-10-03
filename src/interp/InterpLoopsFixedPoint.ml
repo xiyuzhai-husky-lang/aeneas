@@ -170,9 +170,10 @@ let compute_loop_entry_fixed_point (config : config) (span : Meta.span)
             (* See the comment in {!eval_loop} *)
             [%craise] span "Unreachable"
         | Continue i ->
-            (* For now we don't support continues to outer loops *)
-            [%cassert] span (i = 0) "Continues to outer loops not supported yet";
-            Some ctx
+            if !Config.multi_exit_loops && i > 0 then None
+            else (
+              [%cassert] span (i = 0) "Continues to outer loops not supported yet";
+              Some ctx)
       in
       let continue_ctxs = List.filter_map keep_continue_ctx ctx_resl in
 
@@ -243,7 +244,7 @@ type break_ctx =
       *)
   | Multiple of (eval_ctx * abs list)  (** We joined multiple break contexts *)
 
-let compute_loop_break_context (config : config) (span : Meta.span)
+let compute_loop_break_context ?exit_kind (config : config) (span : Meta.span)
     (loop_id : LoopId.id) (eval_loop_body : stl_cm_fun) (fp_ctx : eval_ctx)
     (fixed_aids : AbsId.Set.t) (fixed_dids : DummyVarId.Set.t) : break_ctx =
   [%ltrace
@@ -279,7 +280,9 @@ let compute_loop_break_context (config : config) (span : Meta.span)
     let ctx_resl, _ = eval_loop_body fp_ctx in
     let keep_break_ctx (ctx, res) : eval_ctx option =
       [%ltrace "register_break_ctx"];
-      match res with
+      match exit_kind with
+      | Some kind -> if res = kind then Some ctx else None
+      | None -> match res with
       | Return | Panic | Continue _ -> None
       | Unit ->
           (* See the comment in {!eval_loop} *)

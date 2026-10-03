@@ -1,5 +1,6 @@
 module
 public import Aeneas.Std.Core.Cmp
+public import Aeneas.Std.Core.Ops
 public import Aeneas.Std.Primitives
 public import Aeneas.Std.Range
 public import Aeneas.Std.Scalar.Core
@@ -81,6 +82,9 @@ def core.iter.traits.iterator.Iterator.take.default
 structure core.iter.traits.iterator.Iterator (Self : Type) (Self_Item : Type)
   where
   next : Self → Result ((Option Self_Item) × Self)
+  /-- Required implementation: no generic-next fallback for arbitrary overrides. -/
+  fold : {B F : Type} → core.ops.function.FnMut F (B × Self_Item) B →
+    Self → B → F → Result B
   step_by : Self → Usize → Result (core.iter.adapters.step_by.StepBy Self) := core.iter.traits.iterator.Iterator.step_by.default
   enumerate : Self → Result (core.iter.adapters.enumerate.Enumerate Self) := core.iter.traits.iterator.Iterator.enumerate.default
   take : Self → Usize → Result (core.iter.adapters.take.Take Self) := core.iter.traits.iterator.Iterator.take.default
@@ -91,6 +95,86 @@ structure core.iter.traits.iterator.Iterator (Self : Type) (Self_Item : Type)
   -- `Iterator` to `SimpleIterator`.
   -- rev : Self → Result (core.iter.adapters.rev.Rev Self) -- this leads to a circularity
   -- TODO: collect
+
+/-- The actual Iterator::fold default (pinned iterator.rs:2674):
+call next, then call the current FnMut, retaining its returned closure state.
+Only instances using this native default may select this helper. -/
+def core.iter.traits.iterator.Iterator.fold.default
+    {I Item B F : Type}
+    (next : I → Result (Option Item × I))
+    (FnMutInst : core.ops.function.FnMut F (B × Item) B)
+    (iter : I) (acc : B) (f : F) : Result B := do
+  let (item, iter) ← next iter
+  match item with
+  | none => .ok acc
+  | some item =>
+    let (acc, f) ← FnMutInst.call_mut f (acc, item)
+    core.iter.traits.iterator.Iterator.fold.default next FnMutInst iter acc f
+partial_fixpoint
+
+theorem core.iter.traits.iterator.Iterator.fold.default_none
+    {I Item B F : Type} (next : I → Result (Option Item × I))
+    (fnm : core.ops.function.FnMut F (B × Item) B)
+    (iter rest : I) (acc : B) (f : F) (h : next iter = .ok (none, rest)) :
+    core.iter.traits.iterator.Iterator.fold.default next fnm iter acc f = .ok acc := by
+  rw [core.iter.traits.iterator.Iterator.fold.default]
+  simp only [h, bind_tc_ok]
+
+theorem core.iter.traits.iterator.Iterator.fold.default_next_fail
+    {I Item B F : Type} (next : I → Result (Option Item × I))
+    (fnm : core.ops.function.FnMut F (B × Item) B)
+    (iter : I) (acc : B) (f : F) (e : Error) (h : next iter = .fail e) :
+    core.iter.traits.iterator.Iterator.fold.default next fnm iter acc f = .fail e := by
+  rw [core.iter.traits.iterator.Iterator.fold.default]
+  simp only [h, bind_tc_fail]
+
+theorem core.iter.traits.iterator.Iterator.fold.default_next_div
+    {I Item B F : Type} (next : I → Result (Option Item × I))
+    (fnm : core.ops.function.FnMut F (B × Item) B)
+    (iter : I) (acc : B) (f : F) (h : next iter = .div) :
+    core.iter.traits.iterator.Iterator.fold.default next fnm iter acc f = .div := by
+  rw [core.iter.traits.iterator.Iterator.fold.default]
+  simp only [h, bind_tc_div]
+
+theorem core.iter.traits.iterator.Iterator.fold.default_callback_fail
+    {I Item B F : Type} (next : I → Result (Option Item × I))
+    (fnm : core.ops.function.FnMut F (B × Item) B)
+    (iter rest : I) (acc : B) (f : F) (item : Item) (e : Error)
+    (hn : next iter = .ok (some item, rest))
+    (hf : fnm.call_mut f (acc, item) = .fail e) :
+    core.iter.traits.iterator.Iterator.fold.default next fnm iter acc f = .fail e := by
+  rw [core.iter.traits.iterator.Iterator.fold.default]
+  simp only [hn, bind_tc_ok, hf, bind_tc_fail]
+
+theorem core.iter.traits.iterator.Iterator.fold.default_callback_div
+    {I Item B F : Type} (next : I → Result (Option Item × I))
+    (fnm : core.ops.function.FnMut F (B × Item) B)
+    (iter rest : I) (acc : B) (f : F) (item : Item)
+    (hn : next iter = .ok (some item, rest))
+    (hf : fnm.call_mut f (acc, item) = .div) :
+    core.iter.traits.iterator.Iterator.fold.default next fnm iter acc f = .div := by
+  rw [core.iter.traits.iterator.Iterator.fold.default]
+  simp only [hn, bind_tc_ok, hf, bind_tc_div]
+
+theorem core.iter.traits.iterator.Iterator.fold.default_callback_state
+    {I Item B F : Type} (next : I → Result (Option Item × I))
+    (fnm : core.ops.function.FnMut F (B × Item) B)
+    (iter rest : I) (acc acc' : B) (f f' : F) (item : Item)
+    (hn : next iter = .ok (some item, rest))
+    (hf : fnm.call_mut f (acc, item) = .ok (acc', f')) :
+    core.iter.traits.iterator.Iterator.fold.default next fnm iter acc f =
+      core.iter.traits.iterator.Iterator.fold.default next fnm rest acc' f' := by
+  rw [core.iter.traits.iterator.Iterator.fold.default]
+  simp only [hn, bind_tc_ok, hf]
+
+/-- The actual default, not a fallback for an implementation override. -/
+@[trait_default, rust_fun "core::iter::traits::iterator::Iterator::fold"]
+def core.iter.traits.iterator.Iterator.fold.trait_default
+    {I Item B F : Type}
+    (IteratorInst : core.iter.traits.iterator.Iterator I Item)
+    (FnMutInst : core.ops.function.FnMut F (B × Item) B)
+    (iter : I) (acc : B) (f : F) : Result B :=
+  core.iter.traits.iterator.Iterator.fold.default IteratorInst.next FnMutInst iter acc f
 
 @[trait_default, rust_fun "core::iter::traits::iterator::Iterator::step_by"]
 def core.iter.traits.iterator.Iterator.step_by.trait_default
@@ -128,8 +212,7 @@ def core.iter.adapters.step_by.skipN
     | none => .ok iter
     | some _ => core.iter.adapters.step_by.skipN iterInst iter n
 
-@[rust_fun
-  "core::iter::adapters::step_by::{core::iter::traits::iterator::Iterator<core::iter::adapters::step_by::StepBy<@I>, @Clause0_Item>}::next"]
+-- Native binding deliberately absent in this supported-subset prototype.
 def core.iter.adapters.step_by.IteratorStepBy.next
   {I : Type} {Item : Type}
   (IteratorInst : core.iter.traits.iterator.Iterator I Item) :
@@ -143,19 +226,8 @@ def core.iter.adapters.step_by.IteratorStepBy.next
       let iter ← core.iter.adapters.step_by.skipN IteratorInst iter (self.step_by.val - 1)
       .ok (some item, { iter, step_by := self.step_by })
 
-@[reducible, rust_trait_impl
-  "core::iter::traits::iterator::Iterator<core::iter::adapters::step_by::StepBy<@I>, @Clause0_Item>"]
-impl_def core.iter.traits.iterator.IteratorStepBy {I : Type} {Item : Type}
-  (IteratorInst : core.iter.traits.iterator.Iterator I Item) :
-  core.iter.traits.iterator.Iterator (core.iter.adapters.step_by.StepBy I) Item := {
-  next := core.iter.adapters.step_by.IteratorStepBy.next IteratorInst
-  step_by := core.iter.traits.iterator.Iterator.step_by.trait_default
-    (core.iter.traits.iterator.IteratorStepBy IteratorInst)
-  enumerate := core.iter.traits.iterator.Iterator.enumerate.trait_default
-    (core.iter.traits.iterator.IteratorStepBy IteratorInst)
-  take := core.iter.traits.iterator.Iterator.take.trait_default
-    (core.iter.traits.iterator.IteratorStepBy IteratorInst)
-}
+-- IteratorStepBy is deliberately unregistered in this isolated candidate.
+-- Its native fold dispatch requires unsupported specialization interfaces.
 
 @[rust_trait "core::iter::traits::accum::Sum"]
 structure core.iter.traits.accum.Sum (Self : Type) (A : Type) where
@@ -214,11 +286,15 @@ structure core.iter.traits.collect.Extend (Self : Type) (A : Type) where
 structure core.iter.traits.double_ended.DoubleEndedIterator (Self : Type) (Item : Type) where
   iteratorInst : core.iter.traits.iterator.Iterator Self Item
   next_back : Self → Result ((Option Item) × Self)
+  /-- Required implementation: an override must retain its actual dispatch. -/
+  rfold : {B F : Type} → core.ops.function.FnMut F (B × Item) B →
+    Self → B → F → Result B
 
 @[rust_trait "core::iter::traits::exact_size::ExactSizeIterator"
   (parentClauses := ["iteratorInst"])]
 structure core.iter.traits.exact_size.ExactSizeIterator (Self : Type) (Item : Type) where
   iteratorInst : core.iter.traits.iterator.Iterator Self Item
+  len : Self → Result Usize
 
 -- ============================================================================
 -- Generic Step operations for UScalar types
@@ -540,12 +616,70 @@ def core.iter.adapters.enumerate.IteratorEnumerate.next
       let count' ← self.count + 1#usize
       ok (some (self.count, a), { iter := iter', count := count' })
 
+/-- Pinned enumerate.rs:129 delegates to the inner fold override.  The user
+callback runs before the checked counter increment, and its new state is kept.
+This candidate targets the private full-MIR sysroot configuration, which retains
+checked arithmetic. The archived distributed-MIR variant uses wrapping arithmetic. -/
+def core.iter.adapters.enumerate.foldCall
+    {Item B F : Type}
+    (FnMutInst : core.ops.function.FnMut F (B × (Usize × Item)) B)
+    (state : Usize × F) (args : B × Item) : Result (B × (Usize × F)) := do
+  let (acc, f) ← FnMutInst.call_mut state.2 (args.1, (state.1, args.2))
+  let count ← state.1 + 1#usize
+  .ok (acc, (count, f))
+
+theorem core.iter.adapters.enumerate.foldCall_fail
+    {Item B F : Type}
+    (fnm : core.ops.function.FnMut F (B × (Usize × Item)) B)
+    (state : Usize × F) (args : B × Item) (e : Error)
+    (h : fnm.call_mut state.2 (args.1, (state.1, args.2)) = .fail e) :
+    core.iter.adapters.enumerate.foldCall fnm state args = .fail e := by
+  simp only [core.iter.adapters.enumerate.foldCall, h, bind_tc_fail]
+
+theorem core.iter.adapters.enumerate.foldCall_div
+    {Item B F : Type}
+    (fnm : core.ops.function.FnMut F (B × (Usize × Item)) B)
+    (state : Usize × F) (args : B × Item)
+    (h : fnm.call_mut state.2 (args.1, (state.1, args.2)) = .div) :
+    core.iter.adapters.enumerate.foldCall fnm state args = .div := by
+  simp only [core.iter.adapters.enumerate.foldCall, h, bind_tc_div]
+
+theorem core.iter.adapters.enumerate.foldCall_state
+    {Item B F : Type}
+    (fnm : core.ops.function.FnMut F (B × (Usize × Item)) B)
+    (state : Usize × F) (args : B × Item) (acc : B) (f : F) (count : Usize)
+    (hf : fnm.call_mut state.2 (args.1, (state.1, args.2)) = .ok (acc, f))
+    (hc : (state.1 + 1#usize : Result Usize) = .ok count) :
+    core.iter.adapters.enumerate.foldCall fnm state args = .ok (acc, (count, f)) := by
+  simp only [core.iter.adapters.enumerate.foldCall, hf, hc, bind_tc_ok]
+
+def core.iter.adapters.enumerate.foldFnMut
+    {Item B F : Type}
+    (FnMutInst : core.ops.function.FnMut F (B × (Usize × Item)) B) :
+    core.ops.function.FnMut (Usize × F) (B × Item) B := {
+  FnOnceInst := { call_once := fun state args => do
+    let (acc, _) ← core.iter.adapters.enumerate.foldCall FnMutInst state args
+    .ok acc }
+  call_mut := core.iter.adapters.enumerate.foldCall FnMutInst
+}
+
+@[rust_fun
+  "core::iter::adapters::enumerate::{core::iter::traits::iterator::Iterator<core::iter::adapters::enumerate::Enumerate<@I>, (usize, @Clause0_Item)>}::fold"]
+def core.iter.adapters.enumerate.IteratorEnumerate.fold
+    {I Item B F : Type}
+    (IteratorInst : core.iter.traits.iterator.Iterator I Item)
+    (FnMutInst : core.ops.function.FnMut F (B × (Usize × Item)) B)
+    (self : core.iter.adapters.enumerate.Enumerate I) (init : B) (f : F) : Result B :=
+  IteratorInst.fold (core.iter.adapters.enumerate.foldFnMut FnMutInst)
+    self.iter init (self.count, f)
+
 @[reducible, rust_trait_impl
   "core::iter::traits::iterator::Iterator<core::iter::adapters::enumerate::Enumerate<@I>, (usize, @Clause0_Item)>"]
 impl_def core.iter.traits.iterator.IteratorEnumerate {I : Type} {Item : Type}
     (IteratorInst : core.iter.traits.iterator.Iterator I Item) :
     core.iter.traits.iterator.Iterator (core.iter.adapters.enumerate.Enumerate I) (Usize × Item) := {
   next := core.iter.adapters.enumerate.IteratorEnumerate.next IteratorInst
+  fold := core.iter.adapters.enumerate.IteratorEnumerate.fold IteratorInst
   step_by := core.iter.traits.iterator.Iterator.step_by.trait_default
     (core.iter.traits.iterator.IteratorEnumerate IteratorInst)
   enumerate := core.iter.traits.iterator.Iterator.enumerate.trait_default
@@ -554,13 +688,15 @@ impl_def core.iter.traits.iterator.IteratorEnumerate {I : Type} {Item : Type}
     (core.iter.traits.iterator.IteratorEnumerate IteratorInst)
 }
 
+-- Enumerate.next_back is extracted from its actual full-MIR sysroot body.
+-- No handwritten model or native binding is installed for that method.
+
 -- ============================================================================
 -- Take.next — generic over any inner iterator
 -- ============================================================================
 -- Model for `Iterator::next` on `Take<I>`
 
-@[rust_fun
-  "core::iter::adapters::take::{core::iter::traits::iterator::Iterator<core::iter::adapters::take::Take<@I>, @Clause0_Item>}::next"]
+-- Native binding deliberately absent in this supported-subset prototype.
 def core.iter.adapters.take.IteratorTake.next
     {I : Type} {Item : Type}
     (IteratorInst : core.iter.traits.iterator.Iterator I Item)
@@ -573,19 +709,8 @@ def core.iter.adapters.take.IteratorTake.next
     let (opt, iter') ← IteratorInst.next self.iter
     ok (opt, { iter := iter', n := n' })
 
-@[reducible, rust_trait_impl
-  "core::iter::traits::iterator::Iterator<core::iter::adapters::take::Take<@I>, @Clause0_Item>"]
-impl_def core.iter.traits.iterator.IteratorTake {I : Type} {Item : Type}
-    (IteratorInst : core.iter.traits.iterator.Iterator I Item) :
-    core.iter.traits.iterator.Iterator (core.iter.adapters.take.Take I) Item := {
-  next := core.iter.adapters.take.IteratorTake.next IteratorInst
-  step_by := core.iter.traits.iterator.Iterator.step_by.trait_default
-    (core.iter.traits.iterator.IteratorTake IteratorInst)
-  enumerate := core.iter.traits.iterator.Iterator.enumerate.trait_default
-    (core.iter.traits.iterator.IteratorTake IteratorInst)
-  take := core.iter.traits.iterator.Iterator.take.trait_default
-    (core.iter.traits.iterator.IteratorTake IteratorInst)
-}
+-- IteratorTake is deliberately unregistered in this isolated candidate.
+-- Its native fold dispatch requires unsupported specialization interfaces.
 
 @[rust_fun
   "core::iter::range::{core::iter::traits::iterator::Iterator<core::ops::range::Range<@A>, @A>}::next"]
@@ -608,6 +733,8 @@ impl_def core.iter.traits.iterator.IteratorRange {A : Type}
   (StepInst : core.iter.range.Step A) : core.iter.traits.iterator.Iterator
   (core.ops.range.Range A) A := {
   next := core.iter.range.IteratorRange.next StepInst
+  fold := core.iter.traits.iterator.Iterator.fold.default
+    (core.iter.range.IteratorRange.next StepInst)
   step_by := core.iter.traits.iterator.Iterator.step_by.trait_default
     (core.iter.traits.iterator.IteratorRange StepInst)
   enumerate := core.iter.traits.iterator.Iterator.enumerate.trait_default

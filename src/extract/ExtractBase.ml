@@ -937,6 +937,12 @@ let unop_name (unop : unop) : string =
       match backend () with
       | Lean -> "-."
       | _ -> int_name int_ty ^ "_neg")
+  | SliceLen -> (
+      match backend () with
+      | Lean -> "Aeneas.Std.Slice.len"
+      | FStar | Coq | HOL4 ->
+          raise
+            (Failure "Shared-slice metadata is supported only for Lean"))
   | ArrayToSlice -> (
       match backend () with
       | Lean -> "Std.Array.to_slice"
@@ -1136,6 +1142,10 @@ let builtin_adts () : (builtin_ty * string) list =
      with user-defined types *)
   match backend () with
   | Lean ->
+      (* Keep flag-off name allocation unchanged: these logical sums are only
+         introduced by the experimental multi-exit translation. *)
+      (if !Config.multi_exit_loops then [ (TSum, "Sum") ] else [])
+      @
       [
         (TResult, "Result");
         (TLoopResult, "ControlFlow");
@@ -1190,6 +1200,10 @@ let builtin_variants () : (builtin_ty * VariantId.id * string) list =
         (TFuel, fuel_succ_id, "S");
       ]
   | Lean ->
+      (if !Config.multi_exit_loops then
+         [ (TSum, sum_left_id, "Sum.inl"); (TSum, sum_right_id, "Sum.inr") ]
+       else [])
+      @
       [
         (TResult, result_ok_id, "ok");
         (TResult, result_fail_id, "fail");
@@ -1248,6 +1262,12 @@ let builtin_pure_functions () : (pure_builtin_fun_id * string) list =
         (Fail, "fail_");
         (Assert, "massert");
         (Discriminant, "read_discriminant");
+        (SliceZipNext, "core.iter.adapters.zip.SliceZip.next");
+        (SliceZipFold, "core.iter.adapters.zip.SliceZip.fold");
+        (SliceVecZipNext, "core.iter.adapters.zip.SliceVecZip.next");
+        (SliceVecZipFold, "core.iter.adapters.zip.SliceVecZip.fold");
+        (VecSliceZipNext, "core.iter.adapters.zip.VecSliceZip.next");
+        (VecSliceZipFold, "core.iter.adapters.zip.VecSliceZip.fold");
         (UpdateAtIndex Slice, "Slice.update");
         (UpdateAtIndex Array, "Array.update");
         (IndexAtIndex Slice, "Slice.index_usize");

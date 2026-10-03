@@ -234,6 +234,11 @@ type bs_ctx = {
           We initialize this at [None]. *)
   mk_continue : (bs_ctx -> texpr -> texpr) option;
   mk_break : (bs_ctx -> texpr -> texpr) option;
+  mk_loop_exit : (bs_ctx -> V.loop_id -> int -> texpr -> texpr) option;
+      (** Inject one typed exit packet for the active multi-exit loop. The loop
+          id and exit index are checked, so an outward exit cannot accidentally
+          target a nested loop's output type. This hook is disabled inside an
+          ordinary joined expression, whose output is only its normal packet. *)
   mut_borrow_to_consumed : texpr V.BorrowId.Map.t;
       (** A map from mutable borrows consumed by region abstractions to consumed
           values.

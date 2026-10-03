@@ -403,6 +403,17 @@ let env_find_abs (env : env) (pred : abs -> bool) : abs option =
 let env_lookup_abs_opt (env : env) (abs_id : AbsId.id) : abs option =
   env_find_abs env (fun abs -> abs.abs_id = abs_id)
 
+(** Update only regular parent sets in the remaining current frame. Fresh
+    abstractions may have been reordered independently of parent topology. *)
+let rec map_remaining_parents (f : AbsId.Set.t -> AbsId.Set.t)
+    (env : env) : env =
+  match env with
+  | [] -> []
+  | EFrame :: _ -> env
+  | EAbs abs :: rest ->
+      EAbs { abs with parents = f abs.parents } :: map_remaining_parents f rest
+  | binding :: rest -> binding :: map_remaining_parents f rest
+
 (** Remove an abstraction from the context, as well as all the references to
     this abstraction (for instance, remove the abs id from all the parent sets
     of all the other abstractions). *)
@@ -416,7 +427,13 @@ let env_remove_abs (span : Meta.span) (env : env) (abs_id : AbsId.id) :
         let env, abs_opt = remove env in
         (EBinding (bv, v) :: env, abs_opt)
     | EAbs abs :: env ->
-        if abs.abs_id = abs_id then (env, Some abs)
+        if abs.abs_id = abs_id then
+          let env =
+            if Sys.getenv_opt "AENEAS_EXPERIMENTAL_ALL_FRAME_PARENTS" = Some "1"
+            then map_remaining_parents (AbsId.Set.remove abs_id) env
+            else env
+          in
+          (env, Some abs)
         else
           let env, abs_opt = remove env in
           (* Update the parents set *)
@@ -441,7 +458,16 @@ let env_subst_abs (span : Meta.span) (env : env) (abs_id : AbsId.id)
         let env, opt_abs = update env in
         (EBinding (bv, v) :: env, opt_abs)
     | EAbs abs :: env ->
-        if abs.abs_id = abs_id then (EAbs nabs :: env, Some abs)
+        if abs.abs_id = abs_id then
+          let env =
+            if Sys.getenv_opt "AENEAS_EXPERIMENTAL_ALL_FRAME_PARENTS" = Some "1"
+            then map_remaining_parents (fun parents ->
+              if AbsId.Set.mem abs_id parents then
+                AbsId.Set.add nabs.abs_id (AbsId.Set.remove abs_id parents)
+              else parents) env
+            else env
+          in
+          (EAbs nabs :: env, Some abs)
         else
           let env, opt_abs = update env in
           (* Update the parents set *)

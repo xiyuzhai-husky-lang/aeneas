@@ -762,9 +762,7 @@ and eval_statement_raw (config : config) (st : statement) : stl_cm_fun =
                 | RawPtr _ ->
                     let p = S.mk_mplace st.span p ctx in
                     let rp = rvalue_get_place rvalue in
-                    let rp =
-                      Option.map (fun rp -> S.mk_mplace st.span rp ctx) rp
-                    in
+                    let rp = S.mk_opt_mplace st.span rp ctx in
                     S.synthesize_assignment ctx p rv rp
               in
               let ctx, cc = comp cc (assign_to_place config st.span rv p ctx) in

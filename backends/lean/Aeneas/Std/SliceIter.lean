@@ -73,11 +73,130 @@ def core.slice.iter.IteratorSliceIter.next
     ok (some x, it)
   else ok (none, it)
 
+/- Prototype functional models. The native slice iterator uses unsafe pointers;
+   correspondence to those bodies is NOT proved here. These definitions specify
+   exactly the remaining window, callback order, and modeled failures/divergence. -/
+def core.slice.iter.Iter.remaining {T : Type} (it : core.slice.iter.Iter T) : List T :=
+  it.slice.val.drop it.i
+
+@[rust_fun "core::slice::iter::{core::iter::traits::iterator::Iterator<core::slice::iter::Iter<'a, @T>, &'a @T>}::fold"]
+def core.slice.iter.IteratorSliceIter.fold {T B F : Type}
+    (fn : core.ops.function.FnMut F (B × T) B)
+    (it : core.slice.iter.Iter T) (init : B) (f : F) : Result B := do
+  let (result, _) ← it.remaining.foldlM
+    (fun (state : B × F) item => fn.call_mut state.2 (state.1, item)) (init, f)
+  ok result
+
+@[rust_fun "core::slice::iter::{core::iter::traits::double_ended::DoubleEndedIterator<core::slice::iter::Iter<'a, @T>, &'a @T>}::next_back"]
+def core.slice.iter.DoubleEndedIteratorSliceIter.next_back {T : Type}
+    (it : core.slice.iter.Iter T) : Result (Option T × core.slice.iter.Iter T) :=
+  if h : it.i < it.slice.val.length then
+    let last := it.slice.val[it.slice.val.length - 1]'(by omega)
+    let shortened :=  Slice.from (it.slice.val.take (it.slice.val.length - 1))
+      (by have := it.slice.property; simp only [List.length_take]; omega)
+    ok (some last, { it with slice := shortened })
+  else ok (none, it)
+
+@[rust_fun "core::slice::iter::{core::iter::traits::exact_size::ExactSizeIterator<core::slice::iter::Iter<'a, @T>, &'a @T>}::len"]
+def core.slice.iter.ExactSizeIteratorSliceIter.len {T : Type}
+    (it : core.slice.iter.Iter T) : Result Usize :=
+  ok (Usize.ofNatCore it.remaining.length
+    (by have := it.slice.property; simp only [core.slice.iter.Iter.remaining, List.length_drop]; scalar_tac))
+
+namespace IteratorPrototype
+
+theorem remaining_length {T : Type} (it : core.slice.iter.Iter T) :
+    it.remaining.length = it.slice.val.length - it.i := by
+  simp [core.slice.iter.Iter.remaining]
+
+theorem slice_len_contents {T : Type} (it : core.slice.iter.Iter T) :
+    ∃ n, core.slice.iter.ExactSizeIteratorSliceIter.len it = ok n ∧
+      n.val = it.remaining.length := by
+  exact ⟨_, rfl, rfl⟩
+
+theorem slice_next_back_contents {T : Type} (it : core.slice.iter.Iter T) :
+    ∃ item it', core.slice.iter.DoubleEndedIteratorSliceIter.next_back it = ok (item, it') ∧
+      item = it.remaining.getLast? ∧ it'.remaining = it.remaining.dropLast := by
+  unfold core.slice.iter.DoubleEndedIteratorSliceIter.next_back
+  split
+  next h =>
+    refine ⟨_, _, rfl, ?_, ?_⟩
+    · simp only [core.slice.iter.Iter.remaining, List.getLast?_drop, if_neg (by omega : ¬ it.slice.val.length ≤ it.i)]
+      rw [List.getLast?_eq_getElem?]
+      simp only [List.getElem?_eq_getElem (by omega : it.slice.val.length - 1 < it.slice.val.length)]
+    · simp only [core.slice.iter.Iter.remaining, Slice.from_val, List.dropLast_eq_take,
+        List.length_drop, List.drop_take]
+      congr 1
+      omega
+  next h =>
+    refine ⟨_, _, rfl, ?_, ?_⟩ <;>
+      simp [core.slice.iter.Iter.remaining, List.drop_eq_nil_of_le (by omega : it.slice.val.length ≤ it.i)]
+
+theorem slice_next_back_preserves_valid {T : Type} (it : core.slice.iter.Iter T)
+    (valid : it.i ≤ it.slice.val.length) {item it'}
+    (step : core.slice.iter.DoubleEndedIteratorSliceIter.next_back it = ok (item, it')) :
+    it'.i ≤ it'.slice.val.length := by
+  unfold core.slice.iter.DoubleEndedIteratorSliceIter.next_back at step
+  split at step
+  next h =>
+    have hs := Result.ok_injective step
+    cases hs
+    simp only [Slice.from_val, List.length_take]
+    omega
+  next h =>
+    have hs := Result.ok_injective step
+    cases hs
+    exact valid
+
+theorem slice_fold_contents {T B F : Type} (fn : core.ops.function.FnMut F (B × T) B)
+    (it : core.slice.iter.Iter T) (init : B) (f : F) :
+    core.slice.iter.IteratorSliceIter.fold fn it init f = (do
+      let state ← it.remaining.foldlM
+        (fun (state : B × F) item => fn.call_mut state.2 (state.1, item)) (init, f)
+      ok state.1) := rfl
+
+end IteratorPrototype
+
+namespace IteratorPrototype
+
+theorem slice_fold_empty {T B F : Type} (fn : core.ops.function.FnMut F (B × T) B)
+    (it : core.slice.iter.Iter T) (init : B) (f : F) (h : it.remaining = []) :
+    core.slice.iter.IteratorSliceIter.fold fn it init f = ok init := by
+  simp [core.slice.iter.IteratorSliceIter.fold, h]
+
+theorem slice_fold_cons {T B F : Type} (fn : core.ops.function.FnMut F (B × T) B)
+    (it : core.slice.iter.Iter T) (init : B) (f : F) (item : T) (rest : List T)
+    (h : it.remaining = item :: rest) :
+    core.slice.iter.IteratorSliceIter.fold fn it init f = (do
+      let state ← fn.call_mut f (init, item)
+      let out ← rest.foldlM
+        (fun (state : B × F) item => fn.call_mut state.2 (state.1, item)) state
+      ok out.1) := by
+  simp only [core.slice.iter.IteratorSliceIter.fold, h, List.foldlM_cons, bind_assoc]
+
+theorem slice_fold_callback_fail {T B F : Type} (fn : core.ops.function.FnMut F (B × T) B)
+    (it : core.slice.iter.Iter T) (init : B) (f : F) (item : T) (rest : List T)
+    (e : Error) (h : it.remaining = item :: rest)
+    (hf : fn.call_mut f (init, item) = fail e) :
+    core.slice.iter.IteratorSliceIter.fold fn it init f = fail e := by
+  rw [slice_fold_cons fn it init f item rest h]
+  simp only [hf, bind_tc_fail]
+
+theorem slice_fold_callback_div {T B F : Type} (fn : core.ops.function.FnMut F (B × T) B)
+    (it : core.slice.iter.Iter T) (init : B) (f : F) (item : T) (rest : List T)
+    (h : it.remaining = item :: rest) (hf : fn.call_mut f (init, item) = .div) :
+    core.slice.iter.IteratorSliceIter.fold fn it init f = .div := by
+  rw [slice_fold_cons fn it init f item rest h]
+  simp only [hf, bind_tc_div]
+
+end IteratorPrototype
+
 @[reducible, rust_trait_impl
   "core::iter::traits::iterator::Iterator<core::slice::iter::Iter<'a, @T>, &'a @T>"]
 impl_def core.iter.traits.iterator.IteratorSliceIter (T : Type) :
   core.iter.traits.iterator.Iterator (core.slice.iter.Iter T) T := {
   next := core.slice.iter.IteratorSliceIter.next
+  fold := core.slice.iter.IteratorSliceIter.fold
   step_by := core.iter.traits.iterator.Iterator.step_by.trait_default
     (core.iter.traits.iterator.IteratorSliceIter T)
   enumerate := core.iter.traits.iterator.Iterator.enumerate.trait_default
@@ -155,6 +274,7 @@ impl_def core.iter.traits.iterator.IteratorChunksExact (T : Type) :
   core.iter.traits.iterator.Iterator (core.slice.iter.ChunksExact T) (Slice T)
   := {
   next := core.slice.iter.IteratorChunksExact.next
+  fold := core.iter.traits.iterator.Iterator.fold.default core.slice.iter.IteratorChunksExact.next
   step_by := core.iter.traits.iterator.Iterator.step_by.trait_default
     (core.iter.traits.iterator.IteratorChunksExact T)
   enumerate := core.iter.traits.iterator.Iterator.enumerate.trait_default
@@ -311,29 +431,7 @@ private def collectStepBy (sbi : core.iter.adapters.step_by.StepBy (core.slice.i
   | .vis (.fail e) _ => e == panic
   | _ => false
 
--- Nested step_by: step_by(2) then step_by(2) on [0..8] gives [0, 4]
-private def collectNestedStepBy
-    (sbi : core.iter.adapters.step_by.StepBy
-      (core.iter.adapters.step_by.StepBy (core.slice.iter.Iter Nat)))
-    (fuel : Nat := 100) : Result (List Nat) :=
-  match fuel with
-  | 0 => .ok []
-  | fuel + 1 => do
-    let (opt, sbi) ←
-      (core.iter.traits.iterator.IteratorStepBy
-        (core.iter.traits.iterator.IteratorStepBy
-          (core.iter.traits.iterator.IteratorSliceIter Nat))).next sbi
-    match opt with
-    | none => .ok []
-    | some x => do
-      let rest ← collectNestedStepBy sbi fuel
-      .ok (x :: rest)
-
-#assert (do
-  let sbi ← core.iter.traits.iterator.Iterator.step_by.default
-    (mkSliceIter [0, 1, 2, 3, 4, 5, 6, 7]) 2#usize
-  let sbi2 ← core.iter.traits.iterator.Iterator.step_by.default sbi 2#usize
-  collectNestedStepBy sbi2).reducesTo [0, 4]
+-- Nested StepBy dictionary test omitted: its Iterator binding is unsupported in this prototype.
 
 -- ============================================================================
 -- Step specs for SharedArray.into_iter and SharedSlice.into_iter

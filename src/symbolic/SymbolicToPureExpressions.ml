@@ -9,6 +9,42 @@ open SymbolicToPureAbs
 (** The local logger *)
 let log = Logging.symbolic_to_pure_expressions_log
 
+(** A narrowly filtered loop continuation, not a general higher-level ending.
+    The original loop packet translator already omitted this exact unit function.
+    Validate native subject types including metadata which ordinary visitors skip. *)
+let is_filtered_shared_loop_level (span : Meta.span) (crate : A.crate)
+    (type_infos : TypesAnalysis.type_infos) (abs_level : V.abs_level)
+    (abs : V.abs) ~(has_binding : bool) ~(is_ignored : bool) : bool =
+  let canonical_unit ty = T.equal_ty ty TypesUtils.mk_unit_ty in
+  let shape =
+    match (abs.kind, abs.cont) with
+    | V.Loop loop_id,
+      Some { input = Some { value = V.EApp (V.ELoop (aid, lid), [ [] ]); ty = ity };
+             output = Some { value = V.EAdt { borrow_proj = true; variant_id = None; fields = [] }; ty = oty } } ->
+        aid = abs.abs_id && lid = loop_id && canonical_unit ity && canonical_unit oty
+    | _ -> false
+  in
+  if abs_level <= 0 || has_binding || not is_ignored || not shape then false
+  else (
+    let visitor = object (self)
+      inherit [_] V.iter_tavalue as super
+      method! visit_ty () ty =
+        ignore (InterpMatchCtxs.validate_symbolic_hierarchy_type span crate type_infos ty);
+        super#visit_ty () ty
+      method! visit_mvalue () v = self#visit_tvalue () v; super#visit_mvalue () v
+      method! visit_msymbolic_value () v = self#visit_symbolic_value () v; super#visit_msymbolic_value () v
+      method! visit_mconsumed_symb () v = self#visit_ty () v.proj_ty; super#visit_mconsumed_symb () v
+      method! visit_mgiven_back_symb () v = self#visit_ty () v.proj_ty; super#visit_mgiven_back_symb () v
+      method! visit_ended_proj_borrow_meta () v =
+        self#visit_msymbolic_value () v.given_back; super#visit_ended_proj_borrow_meta () v
+      method! visit_aended_mut_borrow_meta () v =
+        self#visit_msymbolic_value () v.given_back; super#visit_aended_mut_borrow_meta () v
+      method! visit_eended_mut_borrow_meta () v =
+        self#visit_msymbolic_value () v.given_back; super#visit_eended_mut_borrow_meta () v
+    end in
+    List.iter (visitor#visit_tavalue ()) abs.avalues;
+    true)
+
 let translate_fn_ptr_kind (ctx : bs_ctx) (id : A.fn_ptr_kind) : fn_ptr_kind =
   match id with
   | T.Fun fun_id -> FunId fun_id
@@ -219,6 +255,77 @@ let compute_back_fun_name (ctx : bs_ctx) (decl : LlbcAst.fun_decl) : string =
           (* We shouldn't get there *)
           [%craise] decl.item_meta.span "Unexpected")
 
+(** Bind one loop packet independently of every other exit. Keep the same
+    filtering of unit borrow continuations as the existing single-exit path. *)
+let bind_loop_packet (ctx : bs_ctx) (absl : V.abs list)
+    (values : V.symbolic_value list) : bs_ctx * tpat list * tpat list =
+  let abs_tys = List.map (abs_to_ty ctx) absl in
+  let abs_tys, ignored =
+    List.partition_map
+      (fun (abs, ty) ->
+        match ty with
+        | Some ty -> Left (abs.V.abs_id, ty)
+        | None -> Right abs.V.abs_id)
+      (List.combine absl abs_tys)
+  in
+  let ctx, abs_vars =
+    List.fold_left_map
+      (fun ctx (aid, ty) ->
+        let ctx, fvar = fresh_var (Some "back") ty ctx in
+        (ctx, (aid, fvar)))
+      ctx abs_tys
+  in
+  let abs_infos =
+    List.map
+      (fun (aid, fv) ->
+        (aid, { fvar = mk_texpr_from_fvar fv; can_fail = false }))
+      abs_vars
+  in
+  let ctx =
+    { ctx with
+      abs_id_to_info = V.AbsId.Map.add_list abs_infos ctx.abs_id_to_info;
+      ignored_abs_ids = V.AbsId.Set.add_list ignored ctx.ignored_abs_ids }
+  in
+  let ctx, value_vars = fresh_vars_for_symbolic_values values ctx in
+  let pats = List.map (mk_tpat_from_fvar None) in
+  (ctx, pats (List.map snd abs_vars), pats value_vars)
+
+(** A deterministic, right-associated sum. A single exit needs no tag. Empty
+    exit sets are rejected instead of inventing an inhabitant. *)
+let rec loop_exit_sum_ty span = function
+  | [] -> [%craise] span "A multi-exit loop has no reachable exit"
+  | [ty] -> ty
+  | ty :: tys -> mk_sum_ty ty (loop_exit_sum_ty span tys)
+
+let rec inject_loop_exit span tys index (packet : texpr) : texpr =
+  [%cassert] span (index >= 0) "Negative loop exit index";
+  match tys, index with
+  | [ty], 0 ->
+      [%sanity_check] span (packet.ty = ty);
+      packet
+  | ty :: (_ :: _ as rest), 0 ->
+      [%sanity_check] span (packet.ty = ty);
+      mk_sum_left_texpr span packet (loop_exit_sum_ty span rest)
+  | ty :: (_ :: _ as rest), index ->
+      mk_sum_right_texpr span ty (inject_loop_exit span rest (index - 1) packet)
+  | _ -> [%craise] span "Loop exit index is outside the recorded exit set"
+
+let rec loop_exit_pattern span tys index (packet : tpat) : tpat =
+  [%cassert] span (index >= 0) "Negative loop exit pattern index";
+  match tys, index with
+  | [ty], 0 ->
+      [%sanity_check] span (packet.ty = ty);
+      packet
+  | ty :: (_ :: _ as rest), 0 ->
+      [%sanity_check] span (packet.ty = ty);
+      mk_adt_pat (mk_sum_ty ty (loop_exit_sum_ty span rest))
+        (Some sum_left_id) [packet]
+  | ty :: (_ :: _ as rest), index ->
+      let inner = loop_exit_pattern span rest (index - 1) packet in
+      mk_adt_pat (mk_sum_ty ty (loop_exit_sum_ty span rest))
+        (Some sum_right_id) [inner]
+  | _ -> [%craise] span "Loop exit pattern is outside the recorded exit set"
+
 let rec translate_expr (e : S.expr) (ctx : bs_ctx) : texpr =
   [%ldebug "e:\n" ^ bs_ctx_expr_to_string ctx e];
   match e with
@@ -244,6 +351,9 @@ let rec translate_expr (e : S.expr) (ctx : bs_ctx) : texpr =
       (* Translate the end of a function (this is introduced when we reach a [return] statement). *)
       translate_forward_end return_value ectx e back_e ctx
   | Loop loop -> translate_loop loop ctx
+  | LoopMulti loop -> translate_multi_loop loop ctx
+  | LoopExit (ectx, loop_id, exit_index, output_values, output_abs) ->
+      translate_loop_exit ctx ectx loop_id exit_index output_values output_abs
   | Error (span, msg) -> translate_error span msg
   | LoopContinue (ectx, loop_id, input_values, input_abs) ->
       translate_continue_break ctx ~continue:true ectx loop_id input_values
@@ -388,7 +498,11 @@ and translate_function_call_aux (call : S.call) (e : S.expr) (ctx : bs_ctx) :
     List.fold_left (register_consumed_mut_borrows call.ctx) ctx call.args
   in
   (* Translate the function call *)
-  let generics = ctx_translate_fwd_generic_args ctx call.generics in
+  let applied = match call.call_id with
+    | S.Fun (T.Fun id, _) -> AppliedZipDispatch.classify_function_checked (Some ctx.span) ctx.decls_ctx.crate id call.generics
+    | _ -> None in
+  let model_generics = match applied with None -> call.generics | Some (_, g) -> g in
+  let generics = ctx_translate_fwd_generic_args ctx model_generics in
   let args =
     let args = List.map (tvalue_to_texpr ctx call.ctx) call.args in
     let args_mplaces =
@@ -410,7 +524,14 @@ and translate_function_call_aux (call : S.call) (e : S.expr) (ctx : bs_ctx) :
     | S.Fun (fid, call_id) ->
         (* Regular function call *)
         let fid_t = translate_fn_ptr_kind ctx fid in
-        let func = Fun (FromLlbc (fid_t, None)) in
+        let func = match applied with
+          | None -> Fun (FromLlbc (fid_t, None))
+          | Some ((AppliedZipDispatch.SliceSlice, AppliedBuiltins.Next), _) -> Fun (Pure SliceZipNext)
+          | Some ((AppliedZipDispatch.SliceSlice, AppliedBuiltins.Fold), _) -> Fun (Pure SliceZipFold)
+          | Some ((AppliedZipDispatch.SliceVec, AppliedBuiltins.Next), _) -> Fun (Pure SliceVecZipNext)
+          | Some ((AppliedZipDispatch.SliceVec, AppliedBuiltins.Fold), _) -> Fun (Pure SliceVecZipFold)
+          | Some ((AppliedZipDispatch.VecSlice, AppliedBuiltins.Next), _) -> Fun (Pure VecSliceZipNext)
+          | Some ((AppliedZipDispatch.VecSlice, AppliedBuiltins.Fold), _) -> Fun (Pure VecSliceZipFold) in
         (* Retrieve the effect information about this function (can fail,
          * takes a state as input, etc.) *)
         let effect_info = get_fun_effect_info ctx fid_t None in
@@ -522,7 +643,26 @@ and translate_function_call_aux (call : S.call) (e : S.expr) (ctx : bs_ctx) :
         let ctx =
           { ctx with calls = V.FunCallId.Map.add call_id call ctx.calls }
         in
+        (match applied with
+         | Some ((_, AppliedBuiltins.Fold), _) ->
+             [%cassert] ctx.span (back_funs = [])
+               "Applied slice Zip.fold does not support extra backward callback components"
+         | _ -> ());
         (ctx, func, effect_info, args, back_funs, dest)
+    | S.SliceLen -> (
+        [%sanity_check] ctx.span !Config.multi_exit_loops;
+        match args with
+        | [ arg ] ->
+            let _element_ty = ty_as_slice ctx.span arg.ty in
+            [%sanity_check] ctx.span
+              (call.dest.sv_ty = T.TScalar (TInteger (Unsigned Usize)));
+            let effect_info =
+              { can_fail = false; can_diverge = false; is_rec = false }
+            in
+            let ctx, dest = fresh_var_for_symbolic_value call.dest ctx in
+            let dest = mk_tpat_from_fvar dest_mplace dest in
+            (ctx, Unop SliceLen, effect_info, args, [], dest)
+        | _ -> [%craise] ctx.span "Shared-slice length expects one slice")
     | S.Unop E.Not -> (
         match args with
         | [ arg ] ->
@@ -1261,6 +1401,31 @@ and translate_end_abstraction_synth_ret (ectx : C.eval_ctx) (abs : V.abs)
 and translate_end_abstraction_join_or_loop (ectx : C.eval_ctx) (abs : V.abs)
     (abs_level : abs_level) (e : S.expr) (ctx : bs_ctx) : texpr =
   let span = ctx.span in
+  if abs_level <> 0 &&
+     Sys.getenv_opt "AENEAS_EXPERIMENTAL_FILTERED_SHARED_LOOP_LEVEL" = Some "1"
+  then (
+    [%cassert] span
+      (is_filtered_shared_loop_level span ctx.decls_ctx.crate ctx.type_ctx.type_infos
+         abs_level abs
+         ~has_binding:(V.AbsId.Map.mem abs.abs_id ctx.abs_id_to_info)
+         ~is_ignored:(V.AbsId.Set.mem abs.abs_id ctx.ignored_abs_ids))
+      "Unsupported higher-level loop continuation";
+    let consumed = abs_to_consumed ctx ectx abs abs_level in
+    let ctx, outputs = abs_to_given_back None abs abs_level ctx in
+    [%cassert] span (consumed = [] && outputs = [])
+      "Higher-level loop continuation has a payload";
+    let input = Option.get (Option.get abs.cont).input in
+    let ctx, can_fail, unit_e =
+      einput_to_texpr ctx ectx abs.regions.owned empty_bound_borrows_loans
+        (ref V.AbsFVarId.Map.empty) 0 input
+    in
+    [%cassert] span ((not can_fail) && unit_e = mk_unit_texpr)
+      "Higher-level loop continuation was not already filtered";
+    if Sys.getenv_opt "AENEAS_TRACE_FILTERED_SHARED_LOOP_LEVEL" = Some "1" then
+      Printf.eprintf "FILTERED_SHARED_LOOP_LEVEL abs=%s level=%d\n%!"
+        (V.AbsId.to_string abs.abs_id) abs_level;
+    translate_expr e ctx)
+  else (
   [%cassert] span (abs_level = 0) "Unimplemented";
   (* Compute the input and output values *)
   let back_inputs = abs_to_consumed ctx ectx abs abs_level in
@@ -1311,7 +1476,7 @@ and translate_end_abstraction_join_or_loop (ectx : C.eval_ctx) (abs : V.abs)
         "About to reconstruct let-bindings:" ^ "\n- output: "
         ^ tpat_to_string ctx output ^ "\n- call: " ^ texpr_to_string ctx call
         ^ "\n- next:\n" ^ texpr_to_string ctx next_e];
-      [%add_loc] mk_closed_checked_let ctx can_fail output call next_e
+      [%add_loc] mk_closed_checked_let ctx can_fail output call next_e)
 
 and translate_end_abstraction_with_cont (ectx : C.eval_ctx) (abs : V.abs)
     (abs_level : abs_level) (e : S.expr) (ctx : bs_ctx) : texpr =
@@ -1608,8 +1773,20 @@ and translate_intro_symbolic (ectx : C.eval_ctx) (p : S.mplace option)
         (e, false)
     | VaFnDef { kind; generics } ->
         let id = translate_fn_ptr_kind ctx kind in
-        let generics = ctx_translate_fwd_generic_args ctx generics in
-        let func = Fun (FromLlbc (id, None)) in
+        let applied = match kind with
+          | T.Fun fid -> AppliedZipDispatch.classify_function_checked (Some ctx.span) ctx.decls_ctx.crate fid generics
+          | _ -> None in
+        let translated_generics = ctx_translate_fwd_generic_args ctx generics in
+        let model_generics = match applied with None -> generics | Some (_, g) -> g in
+        let generics = ctx_translate_fwd_generic_args ctx model_generics in
+        let func = match applied with
+          | None -> Fun (FromLlbc (id, None))
+          | Some ((AppliedZipDispatch.SliceSlice, AppliedBuiltins.Next), _) -> Fun (Pure SliceZipNext)
+          | Some ((AppliedZipDispatch.SliceSlice, AppliedBuiltins.Fold), _) -> Fun (Pure SliceZipFold)
+          | Some ((AppliedZipDispatch.SliceVec, AppliedBuiltins.Next), _) -> Fun (Pure SliceVecZipNext)
+          | Some ((AppliedZipDispatch.SliceVec, AppliedBuiltins.Fold), _) -> Fun (Pure SliceVecZipFold)
+          | Some ((AppliedZipDispatch.VecSlice, AppliedBuiltins.Next), _) -> Fun (Pure VecSliceZipNext)
+          | Some ((AppliedZipDispatch.VecSlice, AppliedBuiltins.Fold), _) -> Fun (Pure VecSliceZipFold) in
         let qualif = Qualif { id = FunOrOp func; generics } in
         let ty =
           match kind with
@@ -1629,7 +1806,7 @@ and translate_intro_symbolic (ectx : C.eval_ctx) (p : S.mplace option)
                    sg.sg.back_effect_info)
                 "Unimplemented";
               (* Substitute *)
-              let subst = make_subst_from_generics sg.sg.generics generics in
+              let subst = make_subst_from_generics sg.sg.generics translated_generics in
               ty_substitute subst sg.ty
           | T.TraitMethod _ -> [%craise] ctx.span "Unimplemented"
         in
@@ -1974,6 +2151,7 @@ and translate_loop (loop : S.loop) (ctx0 : bs_ctx) : texpr =
         mk_return = None;
         mk_continue = Some mk_continue;
         mk_break = Some mk_break;
+        mk_loop_exit = None;
       }
     in
 
@@ -2015,6 +2193,113 @@ and translate_loop (loop : S.loop) (ctx0 : bs_ctx) : texpr =
 
   (* Create the let-binding *)
   [%add_loc] mk_closed_checked_let ctx true output loop_e next_e
+
+(** Lower distinct symbolic exit contexts without joining their live values.
+    Every exit carries its own values and borrow continuations. A multi-variant
+    packet is one atomic loop output; the normal tuple convention is retained
+    only for the one-exit case. *)
+and translate_multi_loop (loop : S.multi_loop) (ctx0 : bs_ctx) : texpr =
+  let loop_id = V.LoopId.Map.find loop.loop_id ctx0.loop_ids_map in
+  let input_abs =
+    List.filter_map (translate_abs_to_cont ctx0 loop.ctx)
+      (List.map
+         (fun (abs : V.abs) -> V.AbsId.Map.find abs.abs_id loop.input_abs_to_abs)
+         loop.input_abs)
+  in
+  let input_values =
+    List.map (tvalue_to_texpr ctx0 loop.ctx)
+      (List.map
+         (fun (sv : V.symbolic_value) ->
+           V.SymbolicValueId.Map.find sv.sv_id loop.input_value_to_value)
+         loop.input_svalues)
+  in
+  let inputs = input_abs @ input_values in
+  let exit_bindings =
+    List.map
+      (fun (exit : S.loop_exit) ->
+        let ctx, abs_pats, value_pats =
+          bind_loop_packet ctx0 exit.exit_abs exit.exit_svalues
+        in
+        let packet = mk_simpl_tuple_pat (value_pats @ abs_pats) in
+        (ctx, packet, value_pats, abs_pats, exit.exit_expr))
+      loop.exits
+  in
+  let packet_tys =
+    List.map (fun (_, (packet : tpat), _, _, _) -> packet.ty) exit_bindings
+  in
+  let output_ty = loop_exit_sum_ty loop.span packet_tys in
+  let continue_ty = mk_simpl_tuple_ty (List.map (fun (e : texpr) -> e.ty) inputs) in
+  let loop_body =
+    let ctx, input_conts, input_pats =
+      bind_loop_packet ctx0 loop.input_abs loop.input_svalues
+    in
+    let mk_loop_exit ctx emitted_loop_id exit_index packet =
+      [%cassert] ctx.span (emitted_loop_id = loop.loop_id)
+        "Loop exit does not target the active multi-exit loop";
+      let packet = inject_loop_exit ctx.span packet_tys exit_index packet in
+      mk_break_texpr ctx.span continue_ty packet
+    in
+    let ctx =
+      { ctx with
+        mk_panic = Some (mk_loop_result_fail_texpr_with_error_id ctx.span
+          continue_ty output_ty error_failure_id);
+        mk_return = None;
+        mk_continue = Some (fun ctx packet ->
+          mk_continue_texpr ctx.span packet output_ty);
+        mk_break = None;
+        mk_loop_exit = Some mk_loop_exit }
+    in
+    let body = translate_expr loop.loop_expr ctx in
+    let inputs, loop_body = close_binders ctx.span (input_conts @ input_pats) body in
+    { inputs; loop_body }
+  in
+  let output_tys, num_output_values =
+    match exit_bindings with
+    | [(_, _, values, conts, _)] ->
+        (List.map (fun (p : tpat) -> p.ty) (values @ conts), List.length values)
+    | _ -> ([output_ty], 1)
+  in
+  let pure_loop : loop =
+    { loop_id; span = loop.span; output_tys; num_output_values;
+      inputs; num_input_conts = List.length input_abs; loop_body; to_rec = false }
+  in
+  [%sanity_check] loop.span
+    (List.length pure_loop.loop_body.inputs = List.length pure_loop.inputs);
+  let loop_e : texpr = { e = Loop pure_loop; ty = mk_result_ty output_ty } in
+  match exit_bindings with
+  | [(ctx, packet, _, _, next)] ->
+      let next_e = translate_expr next ctx in
+      [%add_loc] mk_closed_checked_let ctx true packet loop_e next_e
+  | _ ->
+      let ctx, exit_var = fresh_var (Some "loop_exit") output_ty ctx0 in
+      let branches =
+        List.mapi
+          (fun index (branch_ctx, packet, _, _, next) ->
+            let pat = loop_exit_pattern loop.span packet_tys index packet in
+            let branch = translate_expr next branch_ctx in
+            close_branch loop.span pat branch)
+          exit_bindings
+      in
+      let first = [%unwrap_with_span] loop.span (List.nth_opt branches 0)
+          "A multi-exit loop has no branch" in
+      [%sanity_check] loop.span
+        (List.for_all (fun (b : match_branch) -> b.branch.ty = first.branch.ty) branches);
+      let next_e : texpr =
+        { e = Switch (mk_texpr_from_fvar exit_var, Match branches);
+          ty = first.branch.ty }
+      in
+      [%add_loc] mk_closed_checked_let ctx true (mk_tpat_from_fvar None exit_var)
+        loop_e next_e
+
+and translate_loop_exit (ctx : bs_ctx) (ectx : C.eval_ctx)
+    (loop_id : V.loop_id) (exit_index : int) (output_values : V.tvalue list)
+    (output_abs : V.abs list) : texpr =
+  let values = List.map (tvalue_to_texpr ctx ectx) output_values in
+  let conts = List.filter_map (translate_abs_to_cont ctx ectx) output_abs in
+  let packet = mk_simpl_tuple_texpr ctx.span (values @ conts) in
+  let mk = [%unwrap_with_span] ctx.span ctx.mk_loop_exit
+      "Loop exit reached a context without a typed exit handler" in
+  mk ctx loop_id exit_index packet
 
 and translate_continue_break (ctx : bs_ctx) ~(continue : bool)
     (ectx : C.eval_ctx) (_loop_id : V.loop_id) (input_values : V.tvalue list)
@@ -2117,6 +2402,7 @@ and translate_let (ctx0 : bs_ctx) (lete : S.let_expr) : texpr =
         mk_return = None;
         mk_continue = None;
         mk_break = None;
+        mk_loop_exit = None;
       }
     in
 

@@ -282,7 +282,7 @@ let fun_builtin_filter_types_trait_clauses (ty_to_string : 'a -> string)
     match FunDeclId.Map.find_opt id ctx.funs_filter_trait_clauses_map with
     | None -> Result.Ok clauses
     | Some filter ->
-        if List.length filter <> List.length types then (
+        if List.length filter <> List.length clauses then (
           let decl =
             [%silent_unwrap_opt_span] None (ctx_lookup_fun_decl_info ctx id)
           in
@@ -566,7 +566,7 @@ let extract_unop (span : Meta.span)
     (extract_expr : inside:bool -> texpr -> unit) (fmt : F.formatter)
     ~(inside : bool) (unop : unop) (arg : texpr) : unit =
   match unop with
-  | Not _ | Neg _ | ArrayToSlice ->
+  | Not _ | Neg _ | ArrayToSlice | SliceLen ->
       let unop = unop_name unop in
       if inside then F.pp_print_string fmt "(";
       F.pp_print_string fmt unop;
@@ -979,6 +979,19 @@ and extract_function_call (span : Meta.span) (ctx : extraction_ctx)
           in
 
           [%sanity_check] trait_decl.item_meta.span (lp_id = None);
+          (* Never turn an omitted dictionary method, including an override,
+             into a call to a default implementation. Fail before emission. *)
+          (if !filter_trait_impl_methods then
+             match trait_decl.builtin_info with
+             | None -> ()
+             | Some info ->
+                 let meth = List.find
+                   (fun (meth : trait_method) -> meth.method_id = method_name)
+                   trait_decl.methods in
+                 if not (List.mem_assoc meth.item_name info.methods) then
+                   [%craise] span
+                     ("Unsupported omitted trait-method projection: "
+                      ^ trait_decl.name ^ "::" ^ meth.item_name));
           extract_trait_ref trait_decl.item_meta.span ctx fmt
             TypeDeclId.Set.empty ~inside:true trait_ref;
           let fun_name =
@@ -1046,6 +1059,10 @@ and extract_function_call (span : Meta.span) (ctx : extraction_ctx)
           | Pure ToResult ->
               Some
                 { explicit_types = [ Implicit ]; explicit_const_generics = [] }
+          | Pure (SliceZipNext | SliceVecZipNext | VecSliceZipNext) ->
+              Some { explicit_types = [Implicit; Implicit]; explicit_const_generics = [] }
+          | Pure (SliceZipFold | SliceVecZipFold | VecSliceZipFold) ->
+              Some { explicit_types = [Implicit; Implicit; Implicit; Implicit]; explicit_const_generics = [] }
           | Pure ResultUnwrapMut ->
               Some
                 {
@@ -2863,13 +2880,17 @@ let extract_trait_decl_method_names (ctx : extraction_ctx)
           (fun meth ->
             match StringMap.find_opt meth.item_name funs_map with
             | None ->
+                (* An explicit supported-subset mode may erase a dictionary
+                   field. Projection emission below rejects every use of such
+                   a field; instance emission already filters it in this mode. *)
+                (if not !filter_trait_impl_methods then
                 [%warn] trait_decl.item_meta.span
                   ("When retrieving the builtin information for trait decl '"
                  ^ trait_decl.name
                  ^ "', could not find the information for item '"
                  ^ meth.item_name ^ "'. The model defined in the "
                  ^ Config.backend_name ()
-                 ^ " library seems to be missing the corresponding field.");
+                 ^ " library seems to be missing the corresponding field."));
                 (* Use the LLBC definition to compute the name *)
                 let default_id, fun_name = compute_item_name meth in
                 (meth.method_id, default_id, fun_name)

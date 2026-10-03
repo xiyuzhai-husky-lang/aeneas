@@ -35,6 +35,7 @@ type break_ctx =
   | Multiple of (eval_ctx * abs list)  (** We joined multiple break contexts *)
 
 val compute_loop_break_context :
+  ?exit_kind:Cps.statement_eval_res ->
   config ->
   Meta.span ->
   LoopId.id ->

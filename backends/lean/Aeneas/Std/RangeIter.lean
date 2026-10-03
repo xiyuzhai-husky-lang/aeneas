@@ -559,22 +559,13 @@ def core.ops.range.Range.Insts.DoubleEndedIterator
   := {
   iteratorInst := core.iter.traits.iterator.IteratorRange StepInst
   next_back := core.ops.range.Range.Insts.CoreIterTraitsDoubleEndedIterator.next_back StepInst
+  -- Range does not override rfold (pinned range.rs:1321).
+  rfold := core.iter.traits.iterator.Iterator.fold.default
+    (core.ops.range.Range.Insts.CoreIterTraitsDoubleEndedIterator.next_back StepInst)
 }
 
 
-@[reducible,
-  rust_trait_impl "core::iter::traits::iterator::Iterator<core::ops::range::RangeInclusive<@A>, @A>"]
-impl_def core.ops.range.RangeInclusive.Insts.CoreIterTraitsIteratorIterator
-  {A : Type} (StepInst : core.iter.range.Step A) :
-  core.iter.traits.iterator.Iterator (core.ops.range.RangeInclusive A) A := {
-  next :=
-    core.ops.range.RangeInclusive.Insts.CoreIterTraitsIteratorIterator.next StepInst
-  step_by := core.iter.traits.iterator.Iterator.step_by.trait_default
-    (core.ops.range.RangeInclusive.Insts.CoreIterTraitsIteratorIterator StepInst)
-  enumerate := core.iter.traits.iterator.Iterator.enumerate.trait_default
-    (core.ops.range.RangeInclusive.Insts.CoreIterTraitsIteratorIterator StepInst)
-  take := core.iter.traits.iterator.Iterator.take.trait_default
-    (core.ops.range.RangeInclusive.Insts.CoreIterTraitsIteratorIterator StepInst)
-}
+-- RangeInclusive Iterator is deliberately unregistered in this isolated candidate.
+-- Its fold uses checked-Step/TrustedStep specialization not represented by this ABI.
 
 end Aeneas.Std

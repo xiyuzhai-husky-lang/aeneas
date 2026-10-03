@@ -267,23 +267,25 @@ let compute_tevalue_proj_kind (span : Meta.span) (type_infos : type_infos)
   let visitor =
     object (self)
       inherit [_] InterpBorrowsCore.iter_tavalue_with_levels as super
-      method incr_level (level, ty) = (level + 1, ty)
+      (* Crossing a history edge loses the typed-wrapper provenance. Each
+         active or ended child carries its own original projection type. *)
+      method incr_level (level, ty, _) = (level + 1, ty, false)
       method! visit_ELet _ _ = [%internal_error] span
 
-      method! visit_tevalue (level, _) ev =
+      method! visit_tevalue (level, _, _) ev =
         (* Remember the type of the current value *)
-        super#visit_tevalue (level, ev.ty) ev
+        super#visit_tevalue (level, ev.ty, true) ev
 
-      method! visit_adt_evalue (level, ty) av =
+      method! visit_adt_evalue (level, ty, typed_root) av =
         if ty_has_mut_region ty then
           if
             (* TODO: problem with nested borrows *)
             av.borrow_proj
           then set_has_mut_borrows level
           else set_has_mut_loans level;
-        super#visit_adt_evalue (level, ty) av
+        super#visit_adt_evalue (level, ty, typed_root) av
 
-      method! visit_ELoan (level, ty) lc =
+      method! visit_ELoan (level, ty, typed_root) lc =
         set_has_loans level;
         begin
           match lc with
@@ -291,9 +293,9 @@ let compute_tevalue_proj_kind (span : Meta.span) (type_infos : type_infos)
           | EMutLoan _ | EEndedMutLoan _ -> set_has_mut_loans level
         end;
         (* Continue exploring as a sanity check: we want to make sure we don't find borrows *)
-        super#visit_ELoan (level, ty) lc
+        super#visit_ELoan (level, ty, typed_root) lc
 
-      method! visit_EBorrow (level, ty) bc =
+      method! visit_EBorrow (level, ty, typed_root) bc =
         set_has_borrows level;
         begin
           match bc with
@@ -301,61 +303,55 @@ let compute_tevalue_proj_kind (span : Meta.span) (type_infos : type_infos)
           | EMutBorrow _ | EEndedMutBorrow _ -> set_has_mut_borrows level
         end;
         (* Continue exploring as a sanity check: we want to make sure we don't find loans *)
-        super#visit_EBorrow (level, ty) bc
+        super#visit_EBorrow (level, ty, typed_root) bc
 
-      method! visit_EFVar (level, ty) _ =
+      method! visit_EFVar (level, ty, _) _ =
         if ty_has_mut_region ty then (
           (* It may seem counterintuitive, but we consider the free variables
              as a **loan** (because it binds an input loan). *)
           set_has_loans level;
           set_has_mut_loans level)
 
-      method! visit_EValue (level, _ty) _ _ =
+      method! visit_EValue (level, _ty, _) _ _ =
         (* An EValue is essentially an ended loan: it is a concrete value
            consumed by the backward function. We treat it as a mutable loan
            so that the containing ADT is not classified as UnknownProj. *)
         set_has_mut_loans level
 
-      method! visit_ESymbolic (level, ty) pm eproj =
+      method! visit_ESymbolic (level, ty, typed_root) pm proj =
         [%sanity_check] span (pm = PNone);
-        match eproj with
-        | V.EEndedProjLoans _ ->
-            set_has_loans level;
-            (* We need to check wether the projected loans are mutable or not *)
-            if ty_has_mut_region ty then set_has_mut_loans level;
-            (* Continue exploring (same reasons as above) *)
-            super#visit_ESymbolic (level, ty) pm eproj
-        | EProjLoans _ ->
-            set_has_loans level;
-            (* We need to check wether the projected loans are mutable or not *)
-            if ty_has_mut_region ty then set_has_mut_loans level;
-            (* Continue exploring (same reasons as above) *)
-            super#visit_ESymbolic (level, ty) pm eproj
-        | EEndedProjBorrows _ ->
-            set_has_borrows level;
-            (* We need to check wether the projected borrows are mutable or not *)
-            if ty_has_mut_region ty then set_has_mut_borrows level;
-            (* Continue exploring (same reasons as above) *)
-            super#visit_ESymbolic (level, ty) pm eproj
-        | EProjBorrows _ ->
-            set_has_borrows level;
-            (* We need to check wether the projected loans are mutable or not *)
-            if ty_has_mut_region ty then set_has_mut_borrows level;
-            (* Continue exploring (same reasons as above) *)
-            super#visit_ESymbolic (level, ty) pm eproj
-        | EEmpty ->
-            (* Continue exploring (same reasons as above) *)
-            super#visit_ESymbolic (level, ty) pm eproj
+        super#visit_ESymbolic (level, ty, typed_root) pm proj
 
-      method! visit_EMutBorrowInput (level, ty) x =
+      method! visit_eproj (level, ty, typed_root) proj =
+        let proj_ty =
+          match proj with
+          | EProjLoans p -> if typed_root then ty else p.proj.proj_ty
+          | EProjBorrows p -> if typed_root then ty else p.proj.proj_ty
+          | EEndedProjLoans p -> if typed_root then ty else p.proj_ty
+          | EEndedProjBorrows p -> if typed_root then ty else p.proj_ty
+          | EEmpty -> ty
+        in
+        if level = abs_level then begin
+          match proj with
+          | EProjLoans _ | EEndedProjLoans _ ->
+              set_has_loans level;
+              if ty_has_mut_region proj_ty then set_has_mut_loans level
+          | EProjBorrows _ | EEndedProjBorrows _ ->
+              set_has_borrows level;
+              if ty_has_mut_region proj_ty then set_has_mut_borrows level
+          | EEmpty -> ()
+        end;
+        super#visit_eproj (level, proj_ty, typed_root) proj
+
+      method! visit_EMutBorrowInput (level, ty, typed_root) x =
         let r, _, _ = TypesUtils.ty_get_ref ty in
         if keep_region r then (
           set_has_loans level;
           set_has_mut_loans level);
-        self#visit_tevalue (level, ty) x
+        self#visit_tevalue (level, ty, typed_root) x
     end
   in
-  visitor#visit_tevalue (current_level, ev.ty) ev;
+  visitor#visit_tevalue (current_level, ev.ty, true) ev;
   [%cassert] span ((not !has_borrows) || not !has_loans) "Unreachable";
   let to_borrow_kind b = if b then BMut else BShared in
   if !has_borrows then BorrowProj (to_borrow_kind !has_mut_borrows)
@@ -801,7 +797,7 @@ let einput_to_texpr (ctx : bs_ctx) (ectx : C.eval_ctx) (rids : T.RegionId.Set.t)
                 bound_inputs.symbolic
             in
             (ctx, false, e)
-        | V.EEndedProjLoans { proj = msv; consumed = []; borrows = [] } ->
+        | V.EEndedProjLoans { proj_ty = _; proj = msv; consumed = []; borrows = [] } ->
             (* The symbolic value was left unchanged.
 
                We're using the projection type as the type of the symbolic value -
@@ -810,7 +806,7 @@ let einput_to_texpr (ctx : bs_ctx) (ectx : C.eval_ctx) (rids : T.RegionId.Set.t)
             let out = Some (symbolic_value_to_texpr ctx msv) in
             (ctx, false, out)
         | V.EEndedProjLoans
-            { proj = _; consumed = [ (mnv, child_aproj) ]; borrows = [] } ->
+            { proj_ty = _; proj = _; consumed = [ (mnv, child_aproj) ]; borrows = [] } ->
             [%sanity_check] ctx.span (child_aproj = EEmpty);
             (* TODO: check that the updated symbolic values covers all the cases
                (part of the symbolic value might have been updated, and the rest
@@ -1056,8 +1052,16 @@ let abs_cont_to_texpr_aux (ctx : bs_ctx) (ectx : C.eval_ctx) (abs : V.abs)
      we need to do this to fix the order of the *inputs* (the order given
      by the abstraction expression itself is arbitrary)
   *)
+  let explicit_signature =
+    if InterpSharedPacketSignature.enabled ()
+       && InterpSharedPacketSignature.needs_explicit_signature abs then
+      Some (InterpSharedPacketSignature.check span ectx abs)
+    else None
+  in
   let bound_inputs, inputs =
-    register_inputs ctx abs.regions.owned abs.avalues
+    match explicit_signature with
+    | Some _ -> (empty_bound_borrows_loans, [])
+    | None -> register_inputs ctx abs.regions.owned abs.avalues
   in
 
   (* Translate the abstraction expression *)
@@ -1074,7 +1078,24 @@ let abs_cont_to_texpr_aux (ctx : bs_ctx) (ectx : C.eval_ctx) (abs : V.abs)
   (* Go through the *avalues* to compute the order of the *outputs*. Same remark
      as with the inputs: we do this to fix the order *)
   let outputs =
-    register_outputs ctx bound_outputs abs.regions.owned abs.avalues
+    match explicit_signature with
+    | Some _ ->
+        (* This expression may contain EError for a missing original symbolic
+           binding. Validate with the real Pure context before the final unit
+           elimination; the optional global Pure-check switch is not used. *)
+        let tc_ctx = mk_type_check_ctx ctx in
+        PureTypeCheck.check_texpr span tc_ctx input_e;
+        ignore (PureTypeCheck.check_tpat span tc_ctx pat);
+        InterpSharedPacketSignature.require span (pat.ty = input_e.ty)
+          "translated E input and output pattern types disagree";
+        (* Empty A registration is not permission to discard runtime values
+           produced by the unmodified E translation above. *)
+        InterpSharedPacketSignature.require span
+          (V.BorrowId.Map.is_empty bound_outputs.concrete
+           && NormSymbProjMap.is_empty bound_outputs.symbolic)
+          "empty A interface produced nonempty E output bindings";
+        []
+    | None -> register_outputs ctx bound_outputs abs.regions.owned abs.avalues
   in
 
   if inputs = [] && outputs = [] then None
@@ -1210,7 +1231,7 @@ and eproj_to_given_back_aux (_abs_level : abs_level)
     (ty : T.ty) (ctx : bs_ctx) : bs_ctx * tpat option =
   match eproj with
   | V.EEndedProjLoans _ -> [%craise] ctx.span "Unreachable"
-  | EEndedProjBorrows { mvalues = mv; loans } ->
+  | EEndedProjBorrows { proj_ty = _; mvalues = mv; loans } ->
       [%cassert] ctx.span (loans = []) "Unreachable";
       (* Return the meta-value *)
       let ctx, var = fresh_var_for_symbolic_value mv.given_back ctx in

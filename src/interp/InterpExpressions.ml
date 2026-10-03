@@ -346,6 +346,11 @@ let prepare_eval_operand_reorganize (config : config) (span : Meta.span)
   | Constant _ ->
       (* No need to reorganize the context *)
       (ctx, fun e -> e)
+  | Copy p when Option.is_some (shared_slice_metadata_base p) ->
+      (* Read the live reference itself; never access metadata as a writable
+         place, copy its referent, or manufacture a new borrow. *)
+      let base = Option.get (shared_slice_metadata_base p) in
+      access_rplace_reorganize config span false Read base ctx
   | Copy p ->
       (* Access the value *)
       let access = Read in
@@ -545,6 +550,21 @@ let eval_operand_no_reorganize (config : config) (span : Meta.span)
           [%craise] span
             ("Found unexpected constant: " ^ constant_expr_to_string ctx cv)
     end
+  | Copy p when Option.is_some (shared_slice_metadata_base p) ->
+      let base = Option.get (shared_slice_metadata_base p) in
+      (* The only admitted shape is &[T] -> usize. This symbolic operation is
+         pure and the context snapshot retains the existing reference/loan. *)
+      [%cassert] span (config.mode = SymbolicMode)
+        "Shared-slice metadata is supported only in symbolic mode";
+      [%cassert] span (Config.backend () = Lean)
+        "Shared-slice metadata is supported only for the Lean backend";
+      let _, arg = read_place_check span Read base ctx in
+      let dest = mk_fresh_symbolic_value span ctx p.ty in
+      let cc =
+        synthesize_slice_len span ctx arg (mk_opt_mplace span (Some base) ctx)
+          dest
+      in
+      (mk_tvalue_from_symbolic_value dest, ctx, cc)
   | Copy p ->
       (* Access the value *)
       let access = Read in

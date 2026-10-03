@@ -39,6 +39,9 @@ type call_id =
       (** A "regular" function (i.e., a function which is not a primitive
           operation) *)
   | Unop of unop
+  | SliceLen
+      (** Pure length of a shared slice reference, introduced only by the
+          guarded safe metadata read. No pointer or allocation semantics. *)
   | Binop of binop
 [@@deriving show, ord]
 
@@ -230,6 +233,10 @@ type expr =
       (Contexts.eval_ctx[@opaque]) * loop_id * tvalue list * abs list
   | LoopBreak of (Contexts.eval_ctx[@opaque]) * loop_id * tvalue list * abs list
   | Loop of loop  (** Loop: call to a loop *)
+  | LoopExit of (Contexts.eval_ctx[@opaque]) * loop_id * int * tvalue list * abs list
+      (** An exit packet of the current loop. The index identifies a branch of
+          [multi_loop.exits]; different control targets never share a context. *)
+  | LoopMulti of multi_loop
   | Let of let_expr  (** A let binding. See the comments for [let_expr]. *)
   | Join of (Contexts.eval_ctx[@opaque]) * tvalue list * abs list
       (** The output of an expression which is bound (this is the result of
@@ -294,6 +301,24 @@ and loop = {
   loop_expr : expr;  (** The symbolically executed loop body *)
   next_expr : expr;  (** The expression for *after* the loop call *)
   span : Meta.span;  (** Information about the origin of the loop body *)
+}
+
+and multi_loop = {
+  ctx : (Contexts.eval_ctx[@opaque]);
+  loop_id : loop_id;
+  input_svalues : symbolic_value list;
+  input_abs : abs list;
+  input_value_to_value : tvalue symbolic_value_id_map;
+  input_abs_to_abs : abs abs_id_map;
+  loop_expr : expr;
+  exits : loop_exit list;
+  span : Meta.span;
+}
+
+and loop_exit = {
+  exit_svalues : symbolic_value list;
+  exit_abs : abs list;
+  exit_expr : expr;
 }
 
 (** A let-binding.

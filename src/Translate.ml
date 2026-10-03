@@ -182,6 +182,11 @@ let translate_function_to_pure_aux (trans_ctx : trans_ctx)
                 | None -> m := LoopId.Map.add loop.loop_id (fresh_loop_id ()) !m
               in
               super#visit_loop env loop
+
+            method! visit_multi_loop env (loop : SA.multi_loop) =
+              if not (LoopId.Map.mem loop.loop_id !m) then
+                m := LoopId.Map.add loop.loop_id (fresh_loop_id ()) !m;
+              super#visit_multi_loop env loop
           end
         in
         visitor#visit_expr () ast;
@@ -222,6 +227,7 @@ let translate_function_to_pure_aux (trans_ctx : trans_ctx)
       mk_panic = None;
       mk_continue = None;
       mk_break = None;
+      mk_loop_exit = None;
       mut_borrow_to_consumed = BorrowId.Map.empty;
       var_id_to_default = Pure.FVarId.Map.empty;
       abs_id_to_info = AbsId.Map.empty;
@@ -394,7 +400,10 @@ let translate_crate_to_pure (crate : crate) (marked_ids : marked_ids) :
               ^ Errors.raw_span_to_string fdef.item_meta.span
               ^ compute_local_uses_error_message trans_ctx (IdFun fdef.def_id));
             None)
-        (FunDeclId.Map.values trans_ctx.fun_ctx.to_extract)
+        (FunDeclId.Map.values
+          (FunDeclId.Map.union (fun _ current _ -> Some current)
+            trans_ctx.fun_ctx.to_extract
+            (AppliedBuiltinUses.signature_dependencies trans_ctx.crate)))
     in
 
     let method_sigs =

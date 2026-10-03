@@ -89,6 +89,7 @@ type borrow_or_proj =
 val collapse_ctx :
   config ->
   Meta.span ->
+  ?recorded_shared_leaves:InterpRecordedSharedLeaf.right_shared_leaf list ref option ->
   ?sequence:(abs_id * abs_id * abs_id) list ref option ->
   ?shared_borrows_seq:
     (abs_id * int * proj_marker * borrow_or_proj * ty) list ref option ->
@@ -113,9 +114,16 @@ val collapse_ctx :
     before calling [collapse_ctx_no_markers_following_sequence]. *)
 val collapse_ctx_no_markers_following_sequence :
   Meta.span ->
+  ?recorded_shared_leaves:InterpRecordedSharedLeaf.right_shared_leaf list ->
+  ?recorded_fixed_aids:AbsId.Set.t option ->
   (abs_id * abs_id * abs_id) list ->
   (abs_id * int * proj_marker * borrow_or_proj * ty) list ->
   abs_kind ->
   with_abs_conts:bool ->
   eval_ctx ->
   eval_ctx
+
+(** Restricted analysis-only dead shared projector ending; default-off. *)
+val end_dead_shared_analysis_projections :
+  Meta.span -> with_abs_conts:bool -> recording:bool -> AbsId.Set.t ->
+  eval_ctx -> eval_ctx

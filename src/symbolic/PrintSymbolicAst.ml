@@ -10,6 +10,7 @@ let call_id_to_string (env : fmt_env) (call_id : call_id) : string =
   | Fun (fid, call_id) ->
       fn_ptr_kind_to_string env fid ^ "@" ^ FunCallId.to_string call_id
   | Unop unop -> unop_to_string env unop
+  | SliceLen -> "shared_slice_len"
   | Binop binop -> binop_to_string binop
 
 let call_to_string (env : fmt_env) (indent : string) (call : call) : string =
@@ -111,6 +112,18 @@ let rec expr_to_string (env : fmt_env) (indent : string) (indent_incr : string)
       ^ "fwd_end =\n" ^ fwd_end ^ "\n" ^ indent1 ^ "backs =\n" ^ indent1 ^ backs
       ^ "\n" ^ indent ^ "}"
   | Loop loop -> loop_to_string env indent indent_incr loop
+  | LoopMulti loop ->
+      let body = expr_to_string env (indent ^ indent_incr) indent_incr loop.loop_expr in
+      let exits = List.mapi (fun i exit ->
+        indent ^ "exit@" ^ string_of_int i ^ ":\n" ^
+        expr_to_string env (indent ^ indent_incr) indent_incr exit.exit_expr)
+        loop.exits in
+      indent ^ "multi_loop@" ^ LoopId.to_string loop.loop_id ^ " {\n" ^
+      body ^ "\n" ^ String.concat "\n" exits ^ "\n" ^ indent ^ "}"
+  | LoopExit (ectx, loop_id, exit_id, values, abs) ->
+      indent ^ "exit@" ^ string_of_int exit_id ^ " " ^
+      loop_continue_break_to_string env indent indent_incr ~is_continue:false
+        ectx loop_id values abs
   | LoopContinue (ectx, loop_id, values, abs) ->
       loop_continue_break_to_string env indent indent_incr ~is_continue:true
         ectx loop_id values abs

@@ -53,12 +53,17 @@ let compute_contexts (crate : crate) : decls_ctx =
   let crate_graph = Deps.compute_graph_of_uses crate in
   let declarations = Option.get crate.declarations in
   let type_decls_list, _, _, _, _, _ = split_declarations declarations in
+  let type_decls_list = AppliedBuiltinUses.analysis_type_declarations crate type_decls_list in
   let fmt_env : Print.fmt_env = Charon.Print.crate_to_fmt_env crate in
 
   (* Split the declaration groups between the declaration kinds (types, functions, etc.) *)
-  let type_decls_groups, _, _, _, _, mixed_groups =
+  let _, _, _, _, _, mixed_groups =
     split_declarations_to_group_maps declarations
   in
+  let type_decls_groups = List.fold_left (fun groups group ->
+    List.fold_left (fun groups id -> TypeDeclId.Map.add id group groups)
+      groups (Charon.GAstUtils.g_declaration_group_to_list group))
+    TypeDeclId.Map.empty type_decls_list in
   (* Check if there are mixed groups: if there are, we report an error
      and ignore those. *)
   (if mixed_groups <> [] then
@@ -194,18 +199,37 @@ let compute_contexts (crate : crate) : decls_ctx =
             Some (TraitMethodId.Set.add method_id set))
           !trait_method_ids
     in
+    let name_matcher_ctx = Charon.NameMatcher.ctx_from_crate crate in
+    let builtin_trait_info (trait_decl : trait_decl) =
+      ExtractName.NameMatcherMap.find_opt name_matcher_ctx
+        trait_decl.item_meta.name (ExtractBuiltin.builtin_trait_decls_map ())
+    in
+    let default_requires_projection explicit_root trait_decl_id method_id =
+      let decl = TraitDeclId.Map.find trait_decl_id crate.trait_decls in
+      let meth = TraitMethodId.Map.find method_id decl.methods in
+      (* A direct default is an ordinary extracted function, not a dictionary
+         projection. Only the opt-in modeled external subset can omit the
+         latter demand. Keep every explicit root and all local/unmodeled
+         records; their method signatures still have to be representable. *)
+      not !Config.filter_trait_impl_methods
+      || explicit_root || decl.item_meta.is_local || decl.item_meta.started_from
+      || meth.binder_value.item_meta.started_from
+      || Option.is_none (builtin_trait_info decl)
+    in
     let visitor =
       object
         inherit [_] iter_crate as super
 
-        (* Include a method if an implementation of it is in the extracted functions. *)
-        method! visit_fun_source env (src : fun_source) =
+        method! visit_fun_source explicit_root (src : fun_source) =
           (match src with
-          | TraitDefaultFun (trait_ref, method_id)
+          | TraitDefaultFun (trait_ref, method_id) ->
+              if default_requires_projection explicit_root trait_ref.id method_id
+              then add_trait_method_id trait_ref.id method_id
           | TraitImplFun (_, trait_ref, method_id, _) ->
+              (* Real overrides keep their projection demand. *)
               add_trait_method_id trait_ref.id method_id
           | _ -> ());
-          super#visit_fun_source env src
+          super#visit_fun_source explicit_root src
 
         (* Include a method if it is mentioned in the extracted functions. *)
         method! visit_fn_ptr env fn_ptr =
@@ -218,18 +242,49 @@ let compute_contexts (crate : crate) : decls_ctx =
       end
     in
     List.iter
-      (visitor#visit_fun_decl ())
+      (fun (f : fun_decl) -> visitor#visit_fun_decl f.item_meta.started_from f)
       (FunDeclId.Map.values fun_ctx.to_extract);
     List.iter
-      (visitor#visit_global_decl ())
+      (visitor#visit_global_decl false)
       (GlobalDeclId.Map.values global_decls_to_extract);
     TraitDeclId.Map.iter
       (fun trait_decl_id (trait_decl : trait_decl) ->
         TraitMethodId.Map.iter
-          (fun method_id (_method : trait_method binder) ->
-            add_trait_method_id trait_decl_id method_id)
+          (fun method_id (meth : trait_method binder) ->
+            (* Merely retaining a modeled external trait is not a reference to
+               every native method: its record is supplied by the backend.
+               Explicit roots, real uses and retained fields are kept below. *)
+            if default_requires_projection
+                 meth.binder_value.item_meta.started_from trait_decl_id method_id
+            then add_trait_method_id trait_decl_id method_id)
           trait_decl.methods)
       trait_decls_to_extract;
+
+    if !Config.filter_trait_impl_methods then
+      TraitImplId.Map.iter
+        (fun _ (impl : trait_impl) ->
+          (* Signatures, predicates, parent clauses and function references in
+             retained dictionaries remain live. A supported emitted field must
+             demand its projection even if its function is a direct default. *)
+          visitor#visit_trait_impl impl.item_meta.started_from impl;
+          let trait_decl_id = impl.impl_trait.id in
+          let decl = TraitDeclId.Map.find trait_decl_id crate.trait_decls in
+          let keep_method method_id =
+            match builtin_trait_info decl with
+            | None -> true
+            | Some info ->
+                let name =
+                  Charon.GAstUtils.get_method_name crate trait_decl_id method_id
+                in
+                List.exists (fun (method_name, _) -> method_name = name)
+                  info.methods
+          in
+          TraitMethodId.Map.iter
+            (fun method_id _ ->
+              if keep_method method_id then
+                add_trait_method_id trait_decl_id method_id)
+            impl.methods)
+        trait_impls_to_extract;
 
     TraitDeclId.Map.mapi
       (fun trait_decl_id (trait_decl : trait_decl) ->

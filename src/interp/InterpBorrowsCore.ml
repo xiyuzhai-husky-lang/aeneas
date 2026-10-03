@@ -234,7 +234,8 @@ class virtual ['self] iter_eval_ctx_with_abs_levels =
           self#visit_aproj (self#incr_level state) p)
         loans
 
-    method! visit_aended_proj_borrows state { mvalues; loans } =
+    method! visit_aended_proj_borrows state { proj_ty; mvalues; loans } =
+      self#visit_ty state proj_ty;
       (* TODO: properly track the state for symbolic values *)
       self#visit_ended_proj_borrow_meta state mvalues;
       List.iter
@@ -257,7 +258,8 @@ class virtual ['self] iter_eval_ctx_with_abs_levels =
           self#visit_aproj (self#incr_level state) p)
         borrows
 
-    method! visit_aended_proj_loans state { proj; consumed; borrows } =
+    method! visit_aended_proj_loans state { proj_ty; proj; consumed; borrows } =
+      self#visit_ty state proj_ty;
       (* TODO: properly track the state for symbolic values *)
       self#visit_msymbolic_value_id state proj;
       List.iter
@@ -351,7 +353,8 @@ class virtual ['self] iter_eval_ctx_with_abs_levels =
           self#visit_eproj (self#incr_level state) p)
         loans
 
-    method! visit_eended_proj_loans state { proj; consumed; borrows } =
+    method! visit_eended_proj_loans state { proj_ty; proj; consumed; borrows } =
+      self#visit_ty state proj_ty;
       self#visit_msymbolic_value_id state proj;
       List.iter
         (fun (m, p) ->
@@ -364,7 +367,8 @@ class virtual ['self] iter_eval_ctx_with_abs_levels =
           self#visit_eproj (self#incr_level state) p)
         borrows
 
-    method! visit_eended_proj_borrows state { mvalues; loans } =
+    method! visit_eended_proj_borrows state { proj_ty; mvalues; loans } =
+      self#visit_ty state proj_ty;
       self#visit_ended_proj_borrow_meta state mvalues;
       List.iter
         (fun (m, p) ->
@@ -1686,13 +1690,17 @@ let update_aproj_loans_to_ended (span : Meta.span) (abs_id : AbsId.id)
     (sv_id : symbolic_value_id) (ctx : eval_ctx) : eval_ctx =
   (* Lookup the projector of loans *)
   match lookup_aproj_loans_opt span abs_id sv_id ctx with
-  | Some ({ proj = _; consumed; borrows }, eproj) ->
+  | Some ({ proj; consumed; borrows }, eproj) ->
       (* Create the new value for the projector *)
-      let nproj = AEndedProjLoans { proj = sv_id; consumed; borrows } in
+      let nproj =
+        AEndedProjLoans { proj_ty = proj.proj_ty; proj = sv_id; consumed; borrows }
+      in
       let neproj =
         match eproj with
-        | Some { proj = _; consumed; borrows } ->
-            Some (EEndedProjLoans { proj = sv_id; consumed; borrows })
+        | Some { proj; consumed; borrows } ->
+            Some
+              (EEndedProjLoans
+                 { proj_ty = proj.proj_ty; proj = sv_id; consumed; borrows })
         | None -> None
       in
       (* Insert it *)
@@ -1774,10 +1782,10 @@ let abs_has_non_ended_eborrows_or_eloans ~(borrows : bool) (abs : abs)
             opt_raise ~is_borrow:false level;
             List.iter (fun (_, x) -> self#visit_eproj (level + 1) x) consumed;
             List.iter (fun (_, x) -> self#visit_eproj (level + 1) x) borrows
-        | EEndedProjLoans { proj = _; consumed; borrows } ->
+        | EEndedProjLoans { proj_ty = _; proj = _; consumed; borrows } ->
             List.iter (fun (_, x) -> self#visit_eproj (level + 1) x) consumed;
             List.iter (fun (_, x) -> self#visit_eproj (level + 1) x) borrows
-        | EEndedProjBorrows { mvalues = _; loans } ->
+        | EEndedProjBorrows { proj_ty = _; mvalues = _; loans } ->
             List.iter (fun (_, x) -> self#visit_eproj (level + 1) x) loans
         | EEmpty -> ()
     end
@@ -1868,8 +1876,11 @@ let get_first_non_ignored_aloan_in_abs (span : Meta.span) (abs : abs)
       Some (SymbolicValue proj)
 
 let get_max_sub_abs_visitor ?(with_ended = false) ?(with_evalues = false)
-    (max_level : int ref) =
-  let save_level level = if level > !max_level then max_level := level in
+    ?(exclude_levels = AbsLevelSet.empty) (max_level : int ref) =
+  let save_level level =
+    if not (AbsLevelSet.mem level exclude_levels) && level > !max_level then
+      max_level := level
+  in
   object
     inherit [_] iter_abs_with_levels as super
     method incr_level level = level + 1
@@ -1950,12 +1961,107 @@ let get_max_sub_abs_visitor ?(with_ended = false) ?(with_evalues = false)
 (** Get the non-ended sub-abstraction with the highest level.
 
     Outputs -1 if no valid borrow/loan was found *)
-let get_max_sub_abs ?(with_ended = false) ?(with_evalues = false) (abs : abs) :
-    int =
+let get_max_sub_abs ?(with_ended = false) ?(with_evalues = false)
+    ?(exclude_levels = AbsLevelSet.empty) (abs : abs) : int =
   let max_level = ref (-1) in
-  let visitor = get_max_sub_abs_visitor ~with_ended ~with_evalues max_level in
+  let visitor =
+    get_max_sub_abs_visitor ~with_ended ~with_evalues ~exclude_levels max_level
+  in
   visitor#visit_abs 0 abs;
   !max_level
+
+(** Select pending levels without discarding retained historical values.
+    A recorded ended level must not still contain a live permission or a
+    tracked ignored ID. Check current A/E children at their exact levels;
+    opaque synthesis snapshots remain metadata and are not live ownership. *)
+let get_max_pending_sub_abs (span : Meta.span) (abs : abs) : int =
+  let check level live =
+    [%cassert] span
+      (not (AbsLevelSet.mem level abs.ended_subabs && live))
+      "An ended sub-abstraction still contains a live permission or ignored ID"
+  in
+  let visitor =
+    object
+      inherit [_] iter_abs_with_levels as super
+      method incr_level level = level + 1
+
+      method! visit_aloan_content level loan =
+        let live =
+          match loan with
+          | AMutLoan _ | ASharedLoan _ | AIgnoredMutLoan (Some _, _) -> true
+          | AIgnoredMutLoan (None, _)
+          | AEndedMutLoan _
+          | AEndedSharedLoan _
+          | AEndedIgnoredMutLoan _
+          | AIgnoredSharedLoan _ -> false
+        in
+        check level live;
+        super#visit_aloan_content level loan
+
+      method! visit_aborrow_content level borrow =
+        let live =
+          match borrow with
+          | AMutBorrow _ | ASharedBorrow _ | AIgnoredMutBorrow (Some _, _) -> true
+          | AProjSharedBorrow borrows -> borrows <> []
+          | AIgnoredMutBorrow (None, _)
+          | AEndedMutBorrow _
+          | AEndedSharedBorrow
+          | AEndedIgnoredMutBorrow _ -> false
+        in
+        check level live;
+        super#visit_aborrow_content level borrow
+
+      method! visit_borrow_content level borrow =
+        check level true;
+        super#visit_borrow_content level borrow
+
+      method! visit_loan_content level loan =
+        check level true;
+        super#visit_loan_content level loan
+
+      method! visit_aproj level proj =
+        let live =
+          match proj with
+          | AProjBorrows _ | AProjLoans _ -> true
+          | AEndedProjBorrows _ | AEndedProjLoans _ | AEmpty -> false
+        in
+        check level live;
+        super#visit_aproj level proj
+
+      method! visit_eloan_content level loan =
+        let live =
+          match loan with
+          | EMutLoan _ | EIgnoredMutLoan (Some _, _) -> true
+          | EIgnoredMutLoan (None, _)
+          | EEndedMutLoan _
+          | EEndedIgnoredMutLoan _ -> false
+        in
+        check level live;
+        super#visit_eloan_content level loan
+
+      method! visit_eborrow_content level borrow =
+        let live =
+          match borrow with
+          | EMutBorrow _ | EIgnoredMutBorrow (Some _, _) -> true
+          | EIgnoredMutBorrow (None, _)
+          | EEndedMutBorrow _
+          | EEndedIgnoredMutBorrow _ -> false
+        in
+        check level live;
+        super#visit_eborrow_content level borrow
+
+      method! visit_eproj level proj =
+        let live =
+          match proj with
+          | EProjBorrows _ | EProjLoans _ -> true
+          | EEndedProjBorrows _ | EEndedProjLoans _ | EEmpty -> false
+        in
+        check level live;
+        super#visit_eproj level proj
+    end
+  in
+  visitor#visit_abs 0 abs;
+  get_max_sub_abs ~exclude_levels:abs.ended_subabs abs
 
 let lookup_shared_value_opt (span : Meta.span) (env : env) (bid : BorrowId.id) :
     tvalue option =

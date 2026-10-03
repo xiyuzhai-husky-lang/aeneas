@@ -713,7 +713,7 @@ let check_typing_invariant_visitor span ctx (lookups : bool) =
           | AProjBorrows { proj; _ } ->
               check_symbolic_value_type proj.sv_id ty;
               [%sanity_check] span (ty_has_free_regions proj.proj_ty)
-          | AEndedProjLoans { proj = _; consumed; borrows } ->
+          | AEndedProjLoans { proj_ty = _; proj = _; consumed; borrows } ->
               List.iter
                 (fun (_, proj) ->
                   match proj with

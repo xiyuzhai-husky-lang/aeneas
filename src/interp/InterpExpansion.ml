@@ -50,6 +50,9 @@ let apply_symbolic_expansion_to_target_aevalues (span : Meta.span)
     (expansion : symbolic_expansion) (ctx : eval_ctx) : eval_ctx =
   (* Symbolic values contained in the expansion might contain already ended regions *)
   let check_symbolic_no_ended = false in
+  let target_only_borrow_guard =
+    Sys.getenv_opt "AENEAS_EXPERIMENTAL_TARGET_PROJECTOR_GUARD" = Some "1"
+  in
   (* Visitor to apply the expansion *)
   let obj =
     object (self)
@@ -122,9 +125,14 @@ let apply_symbolic_expansion_to_target_aevalues (span : Meta.span)
                by region abstractions, and is thus inaccessible: such a value can't
                be expanded)
             *)
-            [%cassert] span (loans = []) "Unreachable";
-            (* Check if this is the symbolic value we are looking for *)
-            if proj.sv_id = original_sv.sv_id then
+            (* Preserve the old global guard unless the private experiment is enabled. *)
+            if not target_only_borrow_guard then
+              [%cassert] span (loans = []) "Unreachable";
+            (* Only expansion of this consumed symbolic value is forbidden.
+               Non-target projectors still undergo the original recursive visit. *)
+            if proj.sv_id = original_sv.sv_id then (
+              if target_only_borrow_guard then
+                [%cassert] span (loans = []) "Unreachable";
               (* Convert the symbolic expansion to a value on which we can
                * apply a projector (if the expansion is a reference expansion,
                * convert it to a borrow) *)
@@ -140,7 +148,7 @@ let apply_symbolic_expansion_to_target_aevalues (span : Meta.span)
                   expansion proj.proj_ty
               in
               (* Replace *)
-              projected_value.value
+              projected_value.value)
             else
               (* Not the searched symbolic value: nothing to do *)
               super#visit_ASymbolic (Some current_abs) pm aproj
@@ -184,9 +192,14 @@ let apply_symbolic_expansion_to_target_aevalues (span : Meta.span)
                by region abstractions, and is thus inaccessible: such a value can't
                be expanded)
             *)
-            [%cassert] span (loans = []) "Unreachable";
-            (* Check if this is the symbolic value we are looking for *)
-            if proj.sv_id = original_sv.sv_id then
+            (* Preserve the old global guard unless the private experiment is enabled. *)
+            if not target_only_borrow_guard then
+              [%cassert] span (loans = []) "Unreachable";
+            (* Only expansion of this consumed symbolic value is forbidden.
+               Non-target projectors still undergo the original recursive visit. *)
+            if proj.sv_id = original_sv.sv_id then (
+              if target_only_borrow_guard then
+                [%cassert] span (loans = []) "Unreachable";
               (* Convert the symbolic expansion to a value on which we can
                * apply a projector (if the expansion is a reference expansion,
                * convert it to a borrow) *)
@@ -202,7 +215,7 @@ let apply_symbolic_expansion_to_target_aevalues (span : Meta.span)
                   proj_regions expansion proj.proj_ty
               in
               (* Replace *)
-              projected_value.value
+              projected_value.value)
             else
               (* Not the searched symbolic value: nothing to do *)
               super#visit_ESymbolic (Some current_abs) pm aproj
@@ -350,6 +363,9 @@ let expand_symbolic_value_shared_borrow (span : Meta.span)
     (original_sv : symbolic_value) (original_sv_place : SA.mplace option)
     (ref_ty : rty) : cm_fun =
  fun ctx ->
+  let target_only_shared_guard =
+    Sys.getenv_opt "AENEAS_EXPERIMENTAL_SHARED_TARGET_PROJECTOR_GUARD" = Some "1"
+  in
   (* First, replace the projectors on borrows. *)
   let bid = ctx.fresh_borrow_id () in
   (* The fresh symbolic value for the shared value *)
@@ -446,7 +462,10 @@ let expand_symbolic_value_shared_borrow (span : Meta.span)
                by region abstractions, and is thus inaccessible: such a value can't
                be expanded)
             *)
-            [%cassert] span (loans = []) "Unreachable";
+            (* An unrelated projector is preserved by the original recursive
+               visitor; it is not the shared value being expanded. *)
+            if (not target_only_shared_guard) || proj.sv_id = original_sv.sv_id then
+              [%cassert] span (loans = []) "Unreachable";
             (* Check if we need to reborrow *)
             match reborrow_ashared (Option.get proj_regions) proj with
             | None -> super#visit_ASymbolic proj_regions pm aproj
@@ -464,13 +483,16 @@ let expand_symbolic_value_shared_borrow (span : Meta.span)
         | EProjLoans _ ->
             (* Loans are handled later *)
             ESymbolic (pm, aproj)
-        | EProjBorrows { proj = _; loans } ->
+        | EProjBorrows { proj; loans } ->
             (* We should never expand a symbolic value which has consumed given
                back values (because then it means the symbolic value was consumed
                by region abstractions, and is thus inaccessible: such a value can't
                be expanded)
             *)
-            [%cassert] span (loans = []) "Unreachable";
+            (* An unrelated projector is preserved by the original recursive
+               visitor; it is not the shared value being expanded. *)
+            if (not target_only_shared_guard) || proj.sv_id = original_sv.sv_id then
+              [%cassert] span (loans = []) "Unreachable";
             (* No need to check for reborrows of shared values: we don't track
                them in abstraction expressions *)
             super#visit_ESymbolic proj_regions pm aproj

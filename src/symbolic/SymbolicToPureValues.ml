@@ -212,22 +212,24 @@ let compute_tavalue_proj_kind span type_infos (abs_regions : T.RegionId.Set.t)
   let visitor =
     object
       inherit [_] InterpBorrowsCore.iter_tavalue_with_levels as super
-      method incr_level (level, ty) = (level + 1, ty)
+      (* Crossing a history edge loses the typed-wrapper provenance. Each
+         active or ended child carries its own original projection type. *)
+      method incr_level (level, ty, _) = (level + 1, ty, false)
 
-      method! visit_tavalue (level, _) av =
+      method! visit_tavalue (level, _, _) av =
         (* Remember the type of the current value *)
-        super#visit_tavalue (level, av.ty) av
+        super#visit_tavalue (level, av.ty, true) av
 
-      method! visit_adt_avalue (level, ty) av =
+      method! visit_adt_avalue (level, ty, typed_root) av =
         if ty_has_mut_region ty then
           if
             (* TODO: problem with nested borrows *)
             av.borrow_proj
           then set_has_mut_borrows level
           else set_has_mut_loans level;
-        super#visit_adt_avalue (level, ty) av
+        super#visit_adt_avalue (level, ty, typed_root) av
 
-      method! visit_ALoan (level, ty) lc =
+      method! visit_ALoan (level, ty, typed_root) lc =
         set_has_loans level;
         begin
           match lc with
@@ -239,9 +241,9 @@ let compute_tavalue_proj_kind span type_infos (abs_regions : T.RegionId.Set.t)
           | AMutLoan _ | AEndedMutLoan _ -> set_has_mut_loans level
         end;
         (* Continue exploring as a sanity check: we want to make sure we don't find borrows *)
-        super#visit_ALoan (level, ty) lc
+        super#visit_ALoan (level, ty, typed_root) lc
 
-      method! visit_ABorrow (level, ty) bc =
+      method! visit_ABorrow (level, ty, typed_root) bc =
         set_has_borrows level;
         begin
           match bc with
@@ -253,45 +255,47 @@ let compute_tavalue_proj_kind span type_infos (abs_regions : T.RegionId.Set.t)
           | AMutBorrow _ | AEndedMutBorrow _ -> set_has_mut_borrows level
         end;
         (* Continue exploring as a sanity check: we want to make sure we don't find loans *)
-        super#visit_ABorrow (level, ty) bc
+        super#visit_ABorrow (level, ty, typed_root) bc
 
-      method! visit_ASymbolic (level, ty) pm aproj =
+      method! visit_ASymbolic (level, ty, typed_root) pm proj =
         [%sanity_check] span (pm = PNone);
-        (* TODO: levels may be wrong here *)
-        (* We forbid nested mutable borrows for now *)
+        (* Preserve the original typed-root nested-mutable-borrow guard. *)
         let info = TypesAnalysis.analyze_ty (Some span) type_infos ty in
         [%cassert] span (not info.contains_nested_mut) "Unimplemented";
-        match aproj with
-        | V.AEndedProjLoans _ ->
-            set_has_loans level;
-            (* We need to check wether the projected loans are mutable or not *)
-            if ty_has_mut_region ty then set_has_mut_loans level;
-            (* Continue exploring (same reasons as above) *)
-            super#visit_ASymbolic (level, ty) pm aproj
-        | AProjLoans _ ->
-            set_has_loans level;
-            (* We need to check wether the projected loans are mutable or not *)
-            if ty_has_mut_region ty then set_has_mut_loans level;
-            (* Continue exploring (same reasons as above) *)
-            super#visit_ASymbolic (level, ty) pm aproj
-        | AEndedProjBorrows _ ->
-            set_has_borrows level;
-            (* We need to check wether the projected borrows are mutable or not *)
-            if ty_has_mut_region ty then set_has_mut_borrows level;
-            (* Continue exploring (same reasons as above) *)
-            super#visit_ASymbolic (level, ty) pm aproj
-        | AProjBorrows _ ->
-            set_has_borrows level;
-            (* We need to check wether the projected borrows are mutable or not *)
-            if ty_has_mut_region ty then set_has_mut_borrows level;
-            (* Continue exploring (same reasons as above) *)
-            super#visit_ASymbolic (level, ty) pm aproj
-        | AEmpty ->
-            (* Continue exploring (same reasons as above) *)
-            super#visit_ASymbolic (level, ty) pm aproj
+        super#visit_ASymbolic (level, ty, typed_root) pm proj
+
+      method! visit_aproj (level, ty, typed_root) proj =
+        let proj_ty =
+          match proj with
+          | AProjLoans p -> if typed_root then ty else p.proj.proj_ty
+          | AProjBorrows p -> if typed_root then ty else p.proj.proj_ty
+          | AEndedProjLoans p -> if typed_root then ty else p.proj_ty
+          | AEndedProjBorrows p -> if typed_root then ty else p.proj_ty
+          | AEmpty -> ty
+        in
+        if not typed_root then begin
+          match proj with
+          | AProjLoans _ | AProjBorrows _
+          | AEndedProjLoans _ | AEndedProjBorrows _ ->
+              let info = TypesAnalysis.analyze_ty (Some span) type_infos proj_ty in
+              [%cassert] span (not info.contains_nested_mut) "Unimplemented"
+          | _ -> ()
+        end;
+        if level = abs_level then begin
+          match proj with
+          | AProjLoans _ | AEndedProjLoans _ ->
+              set_has_loans level;
+              if ty_has_mut_region proj_ty then set_has_mut_loans level
+          | AProjBorrows _ | AEndedProjBorrows _ ->
+              set_has_borrows level;
+              if ty_has_mut_region proj_ty then set_has_mut_borrows level
+          | AEmpty -> ()
+        end;
+        super#visit_aproj (level, proj_ty, typed_root) proj
+
     end
   in
-  visitor#visit_tavalue (current_level, av.ty) av;
+  visitor#visit_tavalue (current_level, av.ty, true) av;
   [%cassert] span ((not !has_borrows) || not !has_loans) "Unreachable";
   let to_borrow_kind b = if b then BMut else BShared in
   if !has_borrows then BorrowProj (to_borrow_kind !has_mut_borrows)
@@ -566,7 +570,7 @@ and aproj_to_consumed_aux (ctx : bs_ctx) (_abs_regions : T.RegionId.Set.t)
     (abs_level : abs_level) (current_level : abs_level) (aproj : V.aproj)
     (ty : T.ty) : texpr option =
   match aproj with
-  | V.AEndedProjLoans { proj = msv; consumed = []; borrows = [] } ->
+  | V.AEndedProjLoans { proj_ty = _; proj = msv; consumed = []; borrows = [] } ->
       if abs_level = current_level then
         (* The symbolic value was left unchanged.
 
@@ -576,7 +580,7 @@ and aproj_to_consumed_aux (ctx : bs_ctx) (_abs_regions : T.RegionId.Set.t)
         Some (symbolic_value_to_texpr ctx msv)
       else None
   | V.AEndedProjLoans
-      { proj = _; consumed = [ (mnv, child_aproj) ]; borrows = [] } ->
+      { proj_ty = _; proj = _; consumed = [ (mnv, child_aproj) ]; borrows = [] } ->
       if abs_level = current_level then (
         [%sanity_check] ctx.span (child_aproj = AEmpty);
         (* TODO: check that the updated symbolic values covers all the cases
@@ -601,7 +605,7 @@ and aproj_to_consumed_aux (ctx : bs_ctx) (_abs_regions : T.RegionId.Set.t)
       (* The symbolic value was updated, and the given back values come from several
          abstractions *)
       [%craise] ctx.span "Unimplemented"
-  | AEndedProjBorrows { mvalues = _; loans } -> (
+  | AEndedProjBorrows { proj_ty = _; mvalues = _; loans } -> (
       (* Happens in the case of nested borrows *)
       match loans with
       | [] ->
@@ -862,13 +866,13 @@ and aproj_to_given_back_aux (_abs_level : abs_level)
     (_current_level : abs_level) (mp : mplace option) (aproj : V.aproj)
     (ty : T.ty) (ctx : bs_ctx) : bs_ctx * tpat option =
   match aproj with
-  | V.AEndedProjLoans { proj = _; consumed; borrows } ->
+  | V.AEndedProjLoans { proj_ty = _; proj = _; consumed; borrows } ->
       [%cassert] ctx.span (borrows = []) "Unimplemented";
       (match consumed with
       | [] | [ _ ] -> ()
       | _ -> [%craise] ctx.span "Unimplemented");
       (ctx, None)
-  | AEndedProjBorrows { mvalues = mv; loans } ->
+  | AEndedProjBorrows { proj_ty = _; mvalues = mv; loans } ->
       [%cassert] ctx.span (loans = []) "Unreachable";
       (* Return the meta-value *)
       let ctx, var = fresh_var_for_symbolic_value mv.given_back ctx in

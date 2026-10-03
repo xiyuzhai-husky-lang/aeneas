@@ -249,7 +249,7 @@ module Values = struct
     match pv with
     | AProjLoans proj -> aproj_loans_to_string ~with_ended env proj
     | AProjBorrows proj -> aproj_borrows_to_string ~with_ended env proj
-    | AEndedProjLoans { proj = msv; consumed; borrows } ->
+    | AEndedProjLoans { proj_ty = _; proj = msv; consumed; borrows } ->
         let msv =
           if with_ended then
             "original_loan = " ^ symbolic_value_id_to_pretty_string msv
@@ -272,7 +272,7 @@ module Values = struct
             ", borrows=[" ^ String.concat "," borrows ^ "]"
         in
         "ended_aproj_loans (" ^ msv ^ consumed ^ borrows ^ ")"
-    | AEndedProjBorrows { mvalues; loans } ->
+    | AEndedProjBorrows { proj_ty = _; mvalues; loans } ->
         let meta =
           if with_ended then
             "original_borrow = "
@@ -605,7 +605,7 @@ module Values = struct
         "("
         ^ symbolic_value_proj_to_string env proj.sv_id proj.proj_ty
         ^ loans ^ ")"
-    | EEndedProjLoans { proj = msv; consumed; borrows } ->
+    | EEndedProjLoans { proj_ty = _; proj = msv; consumed; borrows } ->
         let msv =
           if with_ended then
             "original_loan = " ^ symbolic_value_id_to_pretty_string msv
@@ -628,7 +628,7 @@ module Values = struct
             ", borrows=[" ^ String.concat "," borrows ^ "]"
         in
         "ended_eproj_loans (" ^ msv ^ consumed ^ borrows ^ ")"
-    | EEndedProjBorrows { mvalues; loans } ->
+    | EEndedProjBorrows { proj_ty = _; mvalues; loans } ->
         let meta =
           if with_ended then
             "original_borrow = "

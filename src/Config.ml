@@ -614,6 +614,9 @@ let all_computable = ref false
     exist in the model, leading to code which does not typecheck. *)
 let filter_trait_impl_methods = ref false
 
+(** Experimental: preserve separate symbolic contexts for every loop exit. *)
+let multi_exit_loops = ref false
+
 (** Do not attempt to extract loops to recursive functions *)
 let no_recursive_loops = ref false
 
@@ -628,3 +631,10 @@ let max_recdepth = ref 2048
 (** If [false], evaluate [drop(p)] as [p := bottom]. Otherwise, evaluate it as a
     no-op (which means that we do not borrow-check the drops). *)
 let drop_as_no_op = ref true
+
+(* Isolated applied-library prototype; never enabled by default. *)
+let applied_slice_zip = ref false
+
+(** Private mixed Zip prototype: requires an approved pinned input record. *)
+let mixed_zip_admission = ref ""
+let mixed_zip_source_root = ref ""

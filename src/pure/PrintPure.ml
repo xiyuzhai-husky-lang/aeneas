@@ -378,6 +378,9 @@ and trait_decl_ref_to_string (env : fmt_env) (inside : bool)
 and trait_instance_id_to_string (env : fmt_env) (id : trait_instance_id) :
     string =
   match id with
+  | AppliedSliceVecZip (a,b) -> "AppliedSliceVecZip(" ^ ty_to_string env false a ^ ", " ^ ty_to_string env false b ^ ")"
+  | AppliedVecSliceZip (a,b) -> "AppliedVecSliceZip(" ^ ty_to_string env false a ^ ", " ^ ty_to_string env false b ^ ")"
+  | AppliedSliceZip (a, b) -> "AppliedSliceZip(" ^ ty_to_string env false a ^ ", " ^ ty_to_string env false b ^ ")"
   | Self -> "Self"
   | TraitImpl (impl_id, generics) ->
       let generics = generic_args_to_string env generics in
@@ -840,6 +843,12 @@ let fun_suffix (lp_id : (LoopId.id * bool) option) : string =
 
 let pure_builtin_fun_id_to_string (fid : pure_builtin_fun_id) : string =
   match fid with
+  | SliceZipNext -> "AppliedSliceZip.next"
+  | SliceZipFold -> "AppliedSliceZip.fold"
+  | SliceVecZipNext -> "AppliedSliceVecZip.next"
+  | SliceVecZipFold -> "AppliedSliceVecZip.fold"
+  | VecSliceZipNext -> "AppliedVecSliceZip.next"
+  | VecSliceZipFold -> "AppliedVecSliceZip.fold"
   | Return -> "@return"
   | Fail -> "@fail"
   | Assert -> "@assert"
@@ -907,6 +916,7 @@ let unop_to_string (env : fmt_env) (unop : unop) : string =
   | Neg _ -> "-"
   | Cast kind -> cast_kind_to_string env kind
   | ArrayToSlice -> "array_to_slice"
+  | SliceLen -> "slice_len"
 
 let binop_to_string (env : fmt_env) (binop : binop) =
   let int_ty_to_string int_ty = "::<" ^ integer_type_to_string int_ty ^ ">" in

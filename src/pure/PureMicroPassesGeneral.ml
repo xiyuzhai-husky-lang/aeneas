@@ -675,7 +675,7 @@ let simplify_duplicate_calls =
 let lift_unop (unop : unop) : bool =
   match unop with
   | Not None -> false
-  | Not (Some _) | Neg _ | Cast _ | ArrayToSlice -> true
+  | Not (Some _) | Neg _ | Cast _ | ArrayToSlice | SliceLen -> true
 
 (** A helper predicate *)
 let inline_unop unop = not (lift_unop unop)

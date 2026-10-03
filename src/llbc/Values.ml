@@ -576,6 +576,10 @@ and aproj_borrows = {
 
     See the explanations for {!AProjLoans} *)
 and aended_proj_loans = {
+  proj_ty : ty;
+      (** Full native projection type of this exact projector before it ended.
+          This is regular structural data: visitors, substitution and equality
+          must preserve it, including when this node is a history child. *)
   proj : msymbolic_value_id;
       (** The id of the original symbolic value, that we preserve as a
           meta-value *)
@@ -589,6 +593,10 @@ and aended_proj_loans = {
 }
 
 and aended_proj_borrows = {
+  proj_ty : ty;
+      (** Full native projection type of this exact projector before it ended.
+          This is regular structural data: visitors, substitution and equality
+          must preserve it, including when this node is a history child. *)
   mvalues : ended_proj_borrow_meta;
       (** This stores, for synthesis purposes:
           - the symbolic value which was consumed upon creating the projection
@@ -1075,6 +1083,10 @@ and eproj_borrows = {
 
     See the explanations for {!EprojLoans} *)
 and eended_proj_loans = {
+  proj_ty : ty;
+      (** Full native projection type of this exact projector before it ended.
+          This is regular structural data: visitors, substitution and equality
+          must preserve it, including when this node is a history child. *)
   proj : msymbolic_value_id;
       (** The id of the original symbolic value, that we preserve as a
           meta-value *)
@@ -1088,6 +1100,10 @@ and eended_proj_loans = {
 }
 
 and eended_proj_borrows = {
+  proj_ty : ty;
+      (** Full native projection type of this exact projector before it ended.
+          This is regular structural data: visitors, substitution and equality
+          must preserve it, including when this node is a history child. *)
   mvalues : ended_proj_borrow_meta;
       (** This stores, for synthesis purposes:
           - the symbolic value which was consumed upon creating the projection

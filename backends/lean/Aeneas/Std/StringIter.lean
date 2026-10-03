@@ -26,6 +26,8 @@ opaque core.str.iter.IteratorChars.collect
 def core.iter.traits.iterator.IteratorChars :
   core.iter.traits.iterator.Iterator core.str.iter.Chars Char := {
   next := core.str.iter.IteratorChars.next
+  -- Chars does not override fold; this retains the pre-existing opaque next boundary.
+  fold := core.iter.traits.iterator.Iterator.fold.default core.str.iter.IteratorChars.next
 }
 
 @[expose, rust_fun "core::str::{str}::chars"]

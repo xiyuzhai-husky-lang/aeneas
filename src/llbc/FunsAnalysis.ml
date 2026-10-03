@@ -80,6 +80,17 @@ let analyze_module (m : crate) (funs_map : fun_decl FunDeclId.Map.t) :
         trait_decl.methods)
     m.trait_decls;
 
+  (* Applied external calls keep their source signature and conservative effects.
+     Generic/mixed live declarations still undergo ordinary body analysis. *)
+  let declared = List.fold_left (fun ids group ->
+    List.fold_left (fun ids -> function Types.IdFun id -> FunDeclId.Set.add id ids | _ -> ids)
+      ids (declaration_group_to_list group)) FunDeclId.Set.empty
+      ([%silent_unwrap_opt_span] None m.declarations) in
+  FunDeclId.Map.iter (fun id _ -> if not (FunDeclId.Set.mem id declared) then
+    register_info (FunOrMethodId.Fun id)
+      {can_fail = true; can_diverge = true; stateful = false; is_rec = false})
+    (AppliedBuiltinUses.signature_dependencies m);
+
   (* Analyze a group of mutually recursive functions.
    * As the functions can call each other, we compute the same information
    * for all of them (if one of the functions can fail, then all of them

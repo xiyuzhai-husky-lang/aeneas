@@ -5,6 +5,20 @@ open Values
 open LlbcAst
 open SymbolicAst
 
+(** Recognize only the experimental, read-only length projection of a shared
+    slice reference. This is not a writable place and is not general pointer
+    metadata support. The interpreter rejects its evaluation in concrete mode. *)
+let shared_slice_metadata_base (p : place) : place option =
+  if not !Config.multi_exit_loops then None
+  else
+    match (p.kind, p.ty) with
+    | ( PlaceProjection (base, PtrMetadata),
+        TScalar (TInteger (Unsigned Usize)) ) -> (
+        match base.ty with
+        | TRef (_, TSlice (_, None), RShared) -> Some base
+        | _ -> None)
+    | _ -> None
+
 let mk_mplace (span : Meta.span) (p : place) (ctx : Contexts.eval_ctx) : mplace
     =
   let rec place_to_mplace (place : place) : mplace =
@@ -25,12 +39,17 @@ let mk_mplace (span : Meta.span) (p : place) (ctx : Contexts.eval_ctx) : mplace
 
 let mk_opt_mplace (span : Meta.span) (p : place option)
     (ctx : Contexts.eval_ctx) : mplace option =
-  Option.map (fun p -> mk_mplace span p ctx) p
+  match p with
+  | Some p when Option.is_some (shared_slice_metadata_base p) ->
+      (* The computed length has no ordinary memory place. Evaluation must
+         already have accepted the exact read shape before this naming step. *)
+      None
+  | _ -> Option.map (fun p -> mk_mplace span p ctx) p
 
 let mk_opt_place_from_op (span : Meta.span) (op : operand)
     (ctx : Contexts.eval_ctx) : mplace option =
   match op with
-  | Copy p | Move p -> Some (mk_mplace span p ctx)
+  | Copy p | Move p -> mk_opt_mplace span (Some p) ctx
   | Constant _ -> None
 
 let mk_emeta (m : emeta) (e : expr) : expr = Meta (m, e)
@@ -154,6 +173,12 @@ let synthesize_unary_op (span : Meta.span) (ctx : Contexts.eval_ctx)
   let generics = empty_generic_args in
   synthesize_function_call span (Unop unop) ctx None [] generics [ arg ]
     [ arg_place ] dest dest_place e
+
+let synthesize_slice_len (span : Meta.span) (ctx : Contexts.eval_ctx)
+    (arg : tvalue) (arg_place : mplace option) (dest : symbolic_value)
+    (e : expr) : expr =
+  synthesize_function_call span SliceLen ctx None [] empty_generic_args
+    [ arg ] [ arg_place ] dest None e
 
 let synthesize_binary_op (span : Meta.span) (ctx : Contexts.eval_ctx)
     (binop : binop) (arg0 : tvalue) (arg0_place : mplace option) (arg1 : tvalue)

@@ -175,3 +175,10 @@ val ctxs_are_equivalent : Meta.span -> ids_sets -> eval_ctx -> eval_ctx -> bool
     - [src_ctx] *)
 val prepare_match_ctx_with_target :
   config -> Meta.span -> recoverable:bool -> abs_kind -> eval_ctx -> cm_fun
+
+(** Narrow native-predicate hierarchy helpers, exposed for structural controls. *)
+val validate_symbolic_hierarchy_type :
+  Meta.span -> LlbcAst.crate -> TypesAnalysis.type_infos -> Types.ty -> Types.RegionId.Set.t
+val symbolic_hierarchy_parents :
+  Meta.span -> LlbcAst.crate -> TypesAnalysis.type_infos -> Types.RegionId.id list ->
+  Types.ty -> Types.RegionId.id list Types.RegionId.Map.t

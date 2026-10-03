@@ -432,6 +432,32 @@ def alloc.vec.Vec.extend_from_slice {T : Type} (cloneInst : core.clone.Clone T)
 def alloc.vec.Vec.deref {T : Type} (v : alloc.vec.Vec T) : Slice T :=
   .from v.val v.property
 
+/-- The shared slice view uses the existing logical `Vec.deref` contents.
+    This is a library interpretation of the native view, not a proof of its
+    unsafe pointer implementation or allocator behavior. -/
+@[expose, rust_fun "alloc::vec::{alloc::vec::Vec<@T>}::as_slice"
+           -canFail -lift (keepParams := [true, false])]
+def alloc.vec.Vec.as_slice {T : Type} (v : alloc.vec.Vec T) : Slice T :=
+  alloc.vec.Vec.deref v
+
+@[simp]
+theorem alloc.vec.Vec.as_slice_eq_deref {T : Type} (v : alloc.vec.Vec T) :
+    v.as_slice = v.deref := rfl
+
+theorem alloc.vec.Vec.as_slice_eq_slice {T : Type} (v : alloc.vec.Vec T) :
+    v.as_slice = v.slice := by
+  apply Slice.ext
+  simp [alloc.vec.Vec.as_slice, alloc.vec.Vec.deref, alloc.vec.Vec.val]
+
+theorem alloc.vec.Vec.as_slice_val {T : Type} (v : alloc.vec.Vec T) :
+    v.as_slice.val = v.val := by
+  simp [alloc.vec.Vec.as_slice, alloc.vec.Vec.deref]
+
+theorem alloc.vec.Vec.as_slice_len {T : Type} (v : alloc.vec.Vec T) :
+    (Slice.len v.as_slice).val = v.val.length := by
+  simpa only [Slice.len_val, Slice.length] using
+    congrArg List.length (alloc.vec.Vec.as_slice_val v)
+
 @[expose, reducible, rust_trait_impl "core::ops::deref::Deref<alloc::vec::Vec<@T>, [@T]>" (keepParams := [true, false])]
 def core.ops.deref.DerefVec {T : Type} : core.ops.deref.Deref (alloc.vec.Vec T) (Slice T) := {
   deref := fun v => ok (alloc.vec.Vec.deref v)

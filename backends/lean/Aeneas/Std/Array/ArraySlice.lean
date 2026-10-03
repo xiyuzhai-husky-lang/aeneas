@@ -489,4 +489,28 @@ def Array.Insts.CoreConvertAsMutSlice (T : Type) (N : Std.Usize) :
   as_mut := Array.Insts.CoreConvertAsMutSlice.as_mut
 }
 
+/-- Slice/array comparison uses the existing slice equality model after the
+    standard array-to-slice coercion. -/
+@[expose, rust_fun "core::array::equality::{core::cmp::PartialEq<[@T], [@U; @N]>}::eq"]
+def core.array.equality.PartialEqSliceArray.eq
+    {T U : Type} {N : Usize} (partialEq : core.cmp.PartialEq T U)
+    (left : Slice T) (right : Array U N) : Result Bool :=
+  core.slice.cmp.PartialEqSlice.eq partialEq left right.to_slice
+
+@[expose, reducible, rust_trait_impl "core::cmp::PartialEq<[@T], [@U; @N]>"]
+def core.array.equality.PartialEqSliceArray {T U : Type} (N : Usize)
+    (partialEq : core.cmp.PartialEq T U) : core.cmp.PartialEq (Slice T) (Array U N) where
+  eq := core.array.equality.PartialEqSliceArray.eq partialEq
+
+@[step]
+theorem core.array.equality.PartialEqSliceArray.eq_spec
+    {T : Type} {N : Usize} (partialEq : core.cmp.PartialEq T T)
+    (left : Slice T) (right : Array T N)
+    (hNe : ∀ x y, partialEq.ne x y ⦃ b => b ↔ ¬ (x = y) ⦄) :
+    core.array.equality.PartialEqSliceArray.eq partialEq left right
+      ⦃ b => b ↔ left.val = right.val ⦄ := by
+  apply spec_mono (core.slice.cmp.PartialEqSlice.eq_homo_spec partialEq left right.to_slice hNe)
+  intro b hb
+  simpa only [Slice.eq_iff, Array.val_to_slice] using hb
+
 end Aeneas.Std

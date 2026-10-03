@@ -2130,7 +2130,13 @@ let simplify_trait_calls (crate : crate) : crate =
   in
   FunDeclId.Map.iter
     (fun _ (f : fun_decl) ->
-      if f.item_meta.is_local then visitor#visit_fun_decl_id () f.def_id;
+      (* Charon's explicit extraction roots may be external functions. Keep
+         those roots even when no local caller references them. *)
+      if
+        f.item_meta.is_local
+        || (!Config.filter_trait_impl_methods && f.item_meta.started_from)
+      then
+        visitor#visit_fun_decl_id () f.def_id;
       match f.body with
       | StructuredBody body -> visitor#visit_block () body.body
       | TargetDispatchBody targets ->
@@ -2147,19 +2153,39 @@ let simplify_trait_calls (crate : crate) : crate =
 
   TraitDeclId.Map.iter
     (fun _ (d : trait_decl) ->
-      TraitMethodId.Map.iter
-        (fun _ (d : trait_method binder) ->
-          Option.iter
-            (fun (default : fun_decl_ref) ->
-              visitor#visit_fun_decl_id () default.id)
-            d.binder_value.default)
-        d.methods)
+      (* A registered trait's emitted record is supplied by the backend model;
+         its LLBC default-body metadata is not a function dependency. Under
+         the explicit supported-subset option, do not root defaults solely
+         for that metadata. All concrete body/global references and every
+         retained impl method are still visited independently, so actual
+         calls to defaults (including inherited defaults) remain roots.
+         Local and unregistered traits retain the original behavior. *)
+      let modeled_external =
+        !Config.filter_trait_impl_methods
+        && not d.item_meta.is_local
+        && not d.item_meta.started_from
+        && ExtractName.NameMatcherMap.mem
+             (Charon.NameMatcher.ctx_from_crate crate)
+             d.item_meta.name (ExtractBuiltin.builtin_trait_decls_map ())
+      in
+      if not modeled_external then
+        TraitMethodId.Map.iter
+          (fun _ (d : trait_method binder) ->
+            Option.iter
+              (fun (default : fun_decl_ref) ->
+                visitor#visit_fun_decl_id () default.id)
+              d.binder_value.default)
+          d.methods)
     crate.trait_decls;
 
-  (* Add the local trait impls *)
+  (* Add local and explicitly rooted trait impls. *)
   TraitImplId.Map.iter
     (fun _ (d : trait_impl) ->
-      if d.item_meta.is_local then visitor#visit_trait_impl_id () d.def_id)
+      if
+        d.item_meta.is_local
+        || (!Config.filter_trait_impl_methods && d.item_meta.started_from)
+      then
+        visitor#visit_trait_impl_id () d.def_id)
     crate.trait_impls;
 
   (* Explore the impls *)
@@ -2351,7 +2377,12 @@ let apply_passes (crate : crate) : crate =
       ("fix_closure_signature_regions", fix_closure_signature_regions);
       ("erase_body_regions", erase_body_regions);
       ("remove_unreachable", remove_unreachable);
-      ("update_loop", update_loops);
+      ("update_loop", (fun crate f ->
+        if !Config.multi_exit_loops then (
+          [%cassert] f.item_meta.span (Config.backend () = Config.Lean)
+            "Experimental multi-exit loops currently support only Lean";
+          f)
+        else update_loops crate f));
       ("remove_useless_joins", remove_useless_joins);
       ( "remove_shallow_borrows_storage_live_dead",
         remove_shallow_borrows_storage_live_dead );
@@ -2410,5 +2441,6 @@ let apply_passes (crate : crate) : crate =
   let crate = remove_vtables crate in
   let crate = rename_type_vars crate in
   let crate = simplify_trait_calls crate in
+  let crate = AppliedBuiltinUses.prune crate in
   [%ltrace "After pre-passes:\n" ^ Print.crate_to_string crate ^ "\n"];
   crate

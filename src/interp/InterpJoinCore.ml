@@ -21,12 +21,23 @@ exception ValueMatchFailure of updt_env_kind
 (** Utility exception *)
 exception Distinct of string
 
+(** A symbolic leaf copied while destructuring one side of a join. There is
+    no value on the opposite side: this is not a two-sided joined value. *)
+type symbolic_copy_origin = {
+  copy_side : proj_marker;
+  copy_fresh : symbolic_value;
+  copy_original : symbolic_value;
+}
+
 (** Information about the way contexts were joined *)
 type join_info = {
   joined_ctx : eval_ctx;  (** The result of the join *)
   symbolic_to_value : (tvalue * tvalue) SymbolicValueId.Map.t;
       (** Map from fresh symbolic value to the values coming from the left and
           right contexts *)
+  symbolic_copy_origins : symbolic_copy_origin SymbolicValueId.Map.t;
+      (** Side-specific, typed origins of fresh copies introduced only by
+          suffix abstraction destructuring. *)
 }
 
 type join_info_or_update = (join_info, updt_env_kind) result
@@ -127,6 +138,18 @@ module type PrimMatcher = sig
 
   val match_etys : eval_ctx -> eval_ctx -> ety -> ety -> ety
   val match_rtys : eval_ctx -> eval_ctx -> rty -> rty -> rty
+
+  (** Read-only permission for an already recursively matched identical shared
+      symbolic referent. The join matcher always refuses. No fixed-ID set or
+      map is extended by this query. *)
+  val identical_shared_referent_mappings :
+    symbolic_value_id -> RegionId.Set.t -> bool
+
+  (** Only structural equivalence/application matching may preserve this wrapper.
+      Its map query is read-only and validates any existing value binding too. *)
+  val supports_ignored_shared_projector : bool
+  val ignored_shared_projector_mappings :
+    symbolic_value -> RegionId.Set.t -> bool
 
   (** The input primitive values are not equal *)
   val match_distinct_literals :
@@ -862,7 +885,7 @@ let compute_fixed_abs_ids (ctx0 : eval_ctx) (ctx1 : eval_ctx) : AbsId.Set.t =
   let abs0 = ctx_get_abs ctx0 in
   let abs1 = ctx_get_abs ctx1 in
   let abs_ids = AbsId.Set.inter aids0 aids1 in
-  AbsId.Set.filter
+  let fixed = AbsId.Set.filter
     (fun aid ->
       let a0 = AbsId.Map.find aid abs0 in
       let a1 = AbsId.Map.find aid abs1 in
@@ -871,3 +894,39 @@ let compute_fixed_abs_ids (ctx0 : eval_ctx) (ctx1 : eval_ctx) : AbsId.Set.t =
          have an impact on the way we match/unify contexts. *)
       { a0 with cont = None } = { a1 with cont = None })
     abs_ids
+  in
+  if Sys.getenv_opt "AENEAS_EXPERIMENTAL_FIXED_ABS_CLOSURE" <> Some "1"
+  then fixed
+  else
+    (* Refreshing a non-fixed ID also refreshes every reference to it. Thus an
+       otherwise equal abstraction is stable only if all IDs in its regular
+       fields are fixed too. Continuations are deliberately ignored here just
+       as in the equality above; metadata visitors are already opaque. *)
+    let dependencies aid =
+      let ids = ref AbsId.Set.empty in
+      let visitor = object
+        inherit [_] iter_env
+        method! visit_abs_id _ id = ids := AbsId.Set.add id !ids
+      end in
+      visitor#visit_abs () { (AbsId.Map.find aid abs0) with cont = None };
+      !ids
+    in
+    let rec close fixed =
+      let next = AbsId.Set.filter
+        (fun aid -> AbsId.Set.subset (dependencies aid) fixed) fixed in
+      if AbsId.Set.equal next fixed then fixed else close next
+    in
+    let closed = close fixed in
+    (* Reclassifying an abstraction sends it through the existing fresh suffix
+       path, which is allowed to end it. Never unpin a boundary abstraction. *)
+    AbsId.Set.iter (fun aid ->
+      let a = AbsId.Map.find aid abs0 in
+      let boundary = match a.kind with
+        | SynthInput _ | SynthRet _ -> true
+        | _ -> false
+      in
+      if not a.can_end || boundary then
+        Errors.craise_opt_span __FILE__ __LINE__ None
+          "Fixed abstraction dependency closure would unpin a boundary abstraction")
+      (AbsId.Set.diff fixed closed);
+    closed

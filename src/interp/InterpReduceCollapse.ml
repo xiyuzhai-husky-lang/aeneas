@@ -249,11 +249,11 @@ let eliminate_ended_markers (_span : Meta.span) (ctx : eval_ctx) : eval_ctx =
 
         method! visit_ESymbolic env pm proj =
           match proj with
-          | EEndedProjLoans { proj = _; consumed; borrows }
+          | EEndedProjLoans { proj_ty = _; proj = _; consumed; borrows }
             when List.for_all
                    (fun (_, proj) -> proj = EEmpty)
                    (consumed @ borrows) -> super#visit_ESymbolic env PNone proj
-          | EEndedProjBorrows { mvalues = _; loans }
+          | EEndedProjBorrows { proj_ty = _; mvalues = _; loans }
             when List.for_all (fun (_, proj) -> proj = EEmpty) loans ->
               super#visit_ESymbolic env PNone proj
           | _ -> super#visit_ESymbolic env pm proj
@@ -278,7 +278,7 @@ let eliminate_ended_markers (_span : Meta.span) (ctx : eval_ctx) : eval_ctx =
 type ctx_with_info = { ctx : eval_ctx; info : abs_borrows_loans_maps }
 
 let ctx_with_info_merge_into_first_abs (span : Meta.span) (abs_kind : abs_kind)
-    ~(can_end : bool) ~(with_abs_conts : bool)
+    ~(fixed_abs_ids : AbsId.Set.t) ~(can_end : bool) ~(with_abs_conts : bool)
     (merge_funs : merge_duplicates_funcs option) (ctx : ctx_with_info)
     (abs_id0 : AbsId.id) (abs_id1 : AbsId.id) : ctx_with_info * abs_id =
   [%ldebug
@@ -286,10 +286,17 @@ let ctx_with_info_merge_into_first_abs (span : Meta.span) (abs_kind : abs_kind)
     ^ AbsId.to_string abs_id0];
   (* Compute the new context and the new abstraction id *)
   let nctx, nabs_id =
-    merge_into_first_abstraction span abs_kind ~can_end ~with_abs_conts
-      merge_funs ctx.ctx abs_id0 abs_id1
+    merge_into_first_abstraction ~packet_fixed_abs_ids:fixed_abs_ids
+      span abs_kind ~can_end ~with_abs_conts merge_funs ctx.ctx abs_id0 abs_id1
   in
   let nabs = ctx_lookup_abs nctx nabs_id in
+  if InterpPacketRouting.enabled () && InterpPacketRouting.requires_merge nabs then (
+    (* Rebuild from the actual new environment, not a singleton with stale ctx.
+       This indexes only roots and revalidates all retained packet histories. *)
+    let info = compute_abs_borrows_loans_maps span
+      (fun a -> not (AbsId.Set.mem a.abs_id fixed_abs_ids)) nctx nctx.env in
+    ({ctx=nctx;info},nabs_id))
+  else begin
   [%ldebug
     "abstraction resulting from the merge:\n" ^ abs_to_string span ctx.ctx nabs];
   (* Update the information *)
@@ -465,6 +472,7 @@ let ctx_with_info_merge_into_first_abs (span : Meta.span) (abs_kind : abs_kind)
     }
   in
   ({ ctx = nctx; info }, nabs_id)
+  end
 
 exception AbsToMerge of abs_id * abs_id
 
@@ -504,9 +512,14 @@ let repeat_iter_borrows_merge (span : Meta.span) (fixed_abs_ids : AbsId.Set.t)
       (* No exception raise: return the current context *)
       ctx.ctx
     with AbsToMerge (abs_id0, abs_id1) ->
+      if InterpPacketRouting.enabled () && Option.is_some sequence
+         && (InterpPacketRouting.requires_merge (ctx_lookup_abs ctx.ctx abs_id0)
+             || InterpPacketRouting.requires_merge (ctx_lookup_abs ctx.ctx abs_id1)) then
+        InterpPacketRouting.reject span
+          "packet merge cannot be recorded in the legacy three-ID sequence";
       (* Merge and recurse *)
       let ctx, naid =
-        ctx_with_info_merge_into_first_abs span abs_kind ~can_end
+        ctx_with_info_merge_into_first_abs span abs_kind ~fixed_abs_ids ~can_end
           ~with_abs_conts merge_funs ctx abs_id0 abs_id1
       in
       (* Sanity check: the information was properly updated *)
@@ -1085,13 +1098,118 @@ let eval_ctx_has_markers (ctx : eval_ctx) : bool =
 
     At the end of the second step, all markers should have been removed from the
     resulting environment. *)
+(** A strict analysis-only extension of the existing dead-projector ending
+    operation. We never end an abstraction, clear arbitrary markers, or change
+    IDs/parents. Recorded merge replays and all synthesized continuations retain
+    the original path. *)
+let end_dead_shared_analysis_projections (span : Meta.span)
+    ~(with_abs_conts : bool) ~(recording : bool)
+    (fixed_aids : AbsId.Set.t) (ctx : eval_ctx) : eval_ctx =
+  if Sys.getenv_opt "AENEAS_EXPERIMENTAL_DEAD_SHARED_ANALYSIS_PROJECTIONS"
+       <> Some "1" || with_abs_conts || recording then ctx
+  else
+    let used_elsewhere (ctx : eval_ctx) (target : abs) index sid =
+      (* Remove only this current top-level occurrence. Captured environments
+         retain the original abstraction and must be scanned independently. *)
+      let scan_env = List.map (function
+        | EAbs abs when abs.abs_id = target.abs_id ->
+            EAbs {abs with avalues = List.filteri (fun i _ -> i <> index) abs.avalues}
+        | entry -> entry) ctx.env in
+      let seen_envs = ref [] in
+      let visitor = object (self)
+        inherit [_] iter_eval_ctx as super
+        method! visit_env () env =
+          if not (List.exists (fun previous -> previous == env) !seen_envs) then (
+            seen_envs := env :: !seen_envs;
+            super#visit_env () env)
+        method! visit_symbolic_value_id () id = if id = sid then raise Found
+        method! visit_mvalue () value = self#visit_tvalue () value
+        method! visit_msymbolic_value () value = self#visit_symbolic_value () value
+        method! visit_msymbolic_value_id () id = self#visit_symbolic_value_id () id
+        method! visit_mconsumed_symb () value =
+          self#visit_symbolic_value_id () value.sv_id;
+          self#visit_ty () value.proj_ty
+        method! visit_mgiven_back_symb () value =
+          self#visit_symbolic_value_id () value.sv_id;
+          self#visit_ty () value.proj_ty
+        method! visit_ended_proj_borrow_meta () value =
+          self#visit_msymbolic_value_id () value.consumed;
+          self#visit_msymbolic_value () value.given_back
+        method! visit_aended_mut_borrow_meta () value =
+          self#visit_msymbolic_value () value.given_back
+        method! visit_eended_mut_borrow_meta () value =
+          self#visit_msymbolic_value () value.given_back
+        method! visit_EValue () captured value =
+          self#visit_env () captured;
+          self#visit_mvalue () value
+        method! visit_EIgnored () value =
+          match value with
+          | None -> ()
+          | Some (captured, value) ->
+              self#visit_env () captured;
+              self#visit_mvalue () value
+      end in
+      try
+        visitor#visit_env () scan_env;
+        ConstGenericVarId.Map.iter (fun _ value -> visitor#visit_tvalue () value)
+          ctx.const_generic_vars_map;
+        false
+      with Found -> true
+    in
+    let rec simplify ctx =
+      let rec find_in_env = function
+        | [] | EFrame :: _ -> None
+        | EAbs abs :: rest
+          when abs.can_end && abs.cont = None
+               && AbsLevelSet.is_empty abs.ended_subabs
+               && not (AbsId.Set.mem abs.abs_id fixed_aids)
+               && (match abs.kind with Loop _ -> true | _ -> false) ->
+            let occurrences = List.fold_left (fun n -> function
+              | EAbs other when other.abs_id = abs.abs_id -> n + 1
+              | _ -> n) 0 ctx.env in
+            let candidate = if occurrences <> 1 then None else
+              List.find_mapi (fun index (av : tavalue) ->
+                match av.value with
+                | ASymbolic ((PLeft | PRight),
+                    AProjLoans {proj; consumed=[]; borrows=[]})
+                  when Types.equal_ty av.ty proj.proj_ty
+                       && not (RegionId.Set.is_empty abs.regions.owned)
+                       && not (used_elsewhere ctx abs index proj.sv_id) ->
+                    let regions = validate_symbolic_hierarchy_type span
+                      ctx.crate ctx.type_ctx.type_infos proj.proj_ty in
+                    if RegionId.Set.subset abs.regions.owned regions
+                       && RegionId.Set.is_empty (RegionId.Set.inter regions ctx.ended_regions)
+                    then Some (abs.abs_id, proj.sv_id)
+                    else None
+                | _ -> None) abs.avalues in
+            (match candidate with Some _ -> candidate | None -> find_in_env rest)
+        | _ :: rest -> find_in_env rest
+      in
+      match find_in_env ctx.env with
+      | None -> ctx
+      | Some (aid, sid) ->
+          let ctx = update_aproj_loans_to_ended span aid sid ctx in
+          if Sys.getenv_opt "AENEAS_TRACE_DEAD_SHARED_ANALYSIS_PROJECTIONS" = Some "1" then
+            Printf.eprintf "DEAD_SHARED_ANALYSIS_PROJECTION abs=%s sid=%s\n%!"
+              (AbsId.to_string aid) (SymbolicValueId.to_string sid);
+          simplify ctx
+    in
+    simplify ctx
+
 let collapse_ctx_aux config (span : Meta.span)
+    (recorded_shared_leaves : InterpRecordedSharedLeaf.right_shared_leaf list ref option)
     (sequence : (abs_id * abs_id * abs_id) list ref option)
     (shared_borrows_seq :
       (abs_id * int * proj_marker * borrow_or_proj * ty) list ref option)
     (fresh_abs_kind : abs_kind) ~(with_abs_conts : bool)
     (merge_funs : merge_duplicates_funcs) (ctx0 : eval_ctx) : eval_ctx =
   [%ldebug "ctx0:\n" ^ eval_ctx_to_string ctx0];
+  Option.iter (fun actions ->
+    [%cassert] span (!actions = [] && with_abs_conts
+      && InterpRecordedSharedLeaf.enabled ()
+      && Option.is_some sequence && Option.is_some shared_borrows_seq)
+      "Recorded shared leaf: requires fresh local recorded synthesis route")
+    recorded_shared_leaves;
   let fixed_aids =
     (* We forbid modifying the abs which are frozen or which don't have any markers *)
     let frozen = ctx_get_frozen_abs_set ctx0 in
@@ -1123,6 +1241,9 @@ let collapse_ctx_aux config (span : Meta.span)
     "ctx after reduce, collapse and eliminate_shared_borrow_markers:\n"
     ^ eval_ctx_to_string ctx];
 
+  let ctx = end_dead_shared_analysis_projections span ~with_abs_conts
+    ~recording:(Option.is_some sequence || Option.is_some shared_borrows_seq)
+    fixed_aids ctx in
   let ctx = eliminate_shared_loans span ctx in
   [%ldebug
     "ctx after reduce, collapse and eliminate_shared_loans:\n"
@@ -1133,8 +1254,31 @@ let collapse_ctx_aux config (span : Meta.span)
     "ctx after reduce, collapse and eliminate_ended_markers:\n"
     ^ eval_ctx_to_string ctx];
 
-  (* Sanity check: there are no markers remaining *)
+  (* Record a separate typed program. Never put these actions into the old
+     merge triples, and publish nothing until the original marker guard passes. *)
+  let ctx, pending_actions = match recorded_shared_leaves with
+    | None -> ctx, []
+    | Some _ ->
+        let chronological_merges = List.rev !(Option.get sequence) in
+        let rec run ctx actions =
+          let candidate = List.find_map (function
+            | EAbs owner -> List.find_map (fun (i, (v : tavalue)) -> match v.value with
+                | ASymbolic (PRight, AProjLoans _) -> Some (owner, i)
+                | _ -> None) (List.mapi (fun i v -> i, v) owner.avalues)
+            | _ -> None) ctx.env in
+          match candidate with
+          | None -> ctx, List.rev actions
+          | Some (owner, index) ->
+              let action = InterpRecordedSharedLeaf.plan_right_leaf span
+                ~original_joined:ctx0 ~chronological_merges ~fixed_aids ctx owner index in
+              let next = InterpRecordedSharedLeaf.apply_planned_leaf span ~fixed_aids action ctx in
+              run next (action :: actions)
+        in
+        run ctx []
+  in
+  (* Sanity check: there are no markers remaining. Never weaken this guard. *)
   [%sanity_check] span (not (eval_ctx_has_markers ctx));
+  Option.iter (fun actions -> actions := pending_actions) recorded_shared_leaves;
 
   (* One last cleanup *)
   let ctx, _ =
@@ -1310,6 +1454,7 @@ let merge_into_first_abstraction (span : Meta.span) (abs_kind : abs_kind)
     (Some merge_funs) ctx aid0 aid1
 
 let collapse_ctx config (span : Meta.span)
+    ?(recorded_shared_leaves : InterpRecordedSharedLeaf.right_shared_leaf list ref option = None)
     ?(sequence : (abs_id * abs_id * abs_id) list ref option = None)
     ?(shared_borrows_seq :
         (abs_id * int * proj_marker * borrow_or_proj * ty) list ref option =
@@ -1321,7 +1466,7 @@ let collapse_ctx config (span : Meta.span)
       ~with_abs_conts ctx
   in
   try
-    collapse_ctx_aux config span ~with_abs_conts sequence shared_borrows_seq
+    collapse_ctx_aux config span ~with_abs_conts recorded_shared_leaves sequence shared_borrows_seq
       fresh_abs_kind merge_funs ctx
   with ValueMatchFailure _ -> [%internal_error] span
 
@@ -1383,6 +1528,8 @@ let add_shared_borrows (span : Meta.span)
 
 (** Collapse a context following a sequence *)
 let collapse_ctx_following_sequence (span : Meta.span)
+    ~(recorded_shared_leaves : InterpRecordedSharedLeaf.right_shared_leaf list)
+    ~(recorded_fixed_aids : AbsId.Set.t option)
     (sequence : (abs_id * abs_id * abs_id) list)
     (shared_borrows_seq :
       (abs_id * int * proj_marker * borrow_or_proj * ty) list)
@@ -1464,15 +1611,32 @@ let collapse_ctx_following_sequence (span : Meta.span)
   let ctx = eliminate_shared_loans span ctx in
   [%ldebug "ctx after eliminating the shared loans:\n" ^ eval_ctx_to_string ctx];
 
-  ctx
+  (* Revalidate only after all merges, reordering, shared-borrow introductions,
+     and the original concrete cleanup. The old sequence program is unchanged. *)
+  match recorded_shared_leaves with
+  | [] -> ctx
+  | actions ->
+      [%cassert] span (with_abs_conts && InterpRecordedSharedLeaf.enabled ())
+        "Recorded shared leaf: replay requires enabled synthesis route";
+      let fixed_aids = match recorded_fixed_aids with
+        | Some ids -> AbsId.Set.union ids (ctx_get_frozen_abs_set ctx)
+        | None -> [%craise] span "Recorded shared leaf: replay missing original fixed IDs" in
+      let ctx = List.fold_left (fun ctx action ->
+        InterpRecordedSharedLeaf.replay_right_leaf span ~resolve_owner:get_id
+          ~fixed_aids action ctx) ctx actions in
+      Invariants.check_invariants span ctx;
+      ctx
 
 let collapse_ctx_no_markers_following_sequence (span : Meta.span)
+    ?(recorded_shared_leaves : InterpRecordedSharedLeaf.right_shared_leaf list = [])
+    ?(recorded_fixed_aids : AbsId.Set.t option = None)
     (sequence : (abs_id * abs_id * abs_id) list)
     (shared_borrows_seq :
       (abs_id * int * proj_marker * borrow_or_proj * ty) list)
     (fresh_abs_kind : abs_kind) ~(with_abs_conts : bool) (ctx : eval_ctx) :
     eval_ctx =
   try
-    collapse_ctx_following_sequence span ~with_abs_conts sequence
+    collapse_ctx_following_sequence span ~with_abs_conts ~recorded_shared_leaves
+      ~recorded_fixed_aids sequence
       shared_borrows_seq fresh_abs_kind ctx
   with ValueMatchFailure _ -> [%internal_error] span

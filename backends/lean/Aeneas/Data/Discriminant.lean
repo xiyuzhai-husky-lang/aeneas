@@ -130,7 +130,10 @@ meta def generateReadDiscriminantCmds (declName : Name) (ty : ScalarTy) (discrVa
   -- Generate the syntax for the instance
   let binders := binders.extract 0 indVal.numParams
   let args := header.argNames.map mkIdent
-  let instStx ← `(@[expose] public instance $binders:bracketedBinder* :
+  -- Attribute elaboration does not retain the source namespace. Give the
+  -- instance a type-qualified name so separate extracted modules can be imported together.
+  let instName := Name.mkStr declName "instDiscriminant"
+  let instStx ← `(@[expose] public instance $(mkIdent instName):ident $binders:bracketedBinder* :
       Aeneas.Std.Discriminant ($header.targetType) ($ty) where
       read_discriminant := @$(mkIdent auxFunName):ident $args*)
 

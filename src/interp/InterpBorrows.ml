@@ -324,6 +324,20 @@ let end_proj_loan_get_concrete_priority (_span : Meta.span)
     None
   with Found -> Some (Option.get !found_outer)
 
+(** The identity-continuation branch of [end_proj_loans_symbolic]. This
+    helper deliberately has no recorded-action admission requirements: existing
+    callers may have a missing loan or non-leaf histories. Both standard queries
+    must return None before the original native update is performed. *)
+let end_unblocked_proj_loans (span : Meta.span) (abs_id : AbsId.id)
+    (regions : RegionId.Set.t) (proj : symbolic_proj) (ctx : eval_ctx) : eval_ctx =
+  [%cassert] span
+    (Option.is_none (lookup_intersecting_aproj_borrows_opt span true regions proj ctx))
+    "Unblocked projector ending: intersecting borrower";
+  [%cassert] span
+    (Option.is_none (end_proj_loan_get_concrete_priority span proj.sv_id ctx))
+    "Unblocked projector ending: concrete priority";
+  update_aproj_loans_to_ended span abs_id proj.sv_id ctx
+
 (** See [end_borrow_get_borrow] *)
 let end_concrete_borrow_get_borrow (span : Meta.span) (l : unique_borrow_id)
     (ctx : eval_ctx) :
@@ -698,7 +712,8 @@ let end_aproj_borrows (span : Meta.span) (ended_regions : RegionId.Set.t)
     if owned then
       (* There is nothing to project *)
       let mvalues = { consumed = proj.sv_id; given_back = nsv } in
-      AEndedProjBorrows { mvalues; loans = aproj.loans }
+      AEndedProjBorrows
+        { proj_ty = aproj.proj.proj_ty; mvalues; loans = aproj.loans }
     else
       (* Compute the projection over the given back value (we project the loans) *)
       let loan =
@@ -721,7 +736,8 @@ let end_aproj_borrows (span : Meta.span) (ended_regions : RegionId.Set.t)
     if owned then
       (* There is nothing to project *)
       let mvalues = { consumed = proj.sv_id; given_back = nsv } in
-      EEndedProjBorrows { mvalues; loans = aproj.loans }
+      EEndedProjBorrows
+        { proj_ty = aproj.proj.proj_ty; mvalues; loans = aproj.loans }
     else
       (* Compute the projection over the given back value (we project the loans) *)
       let loan =
@@ -1297,10 +1313,18 @@ and end_all_sub_abs (config : config) (span : Meta.span) ~(snapshots : bool)
   (* Lookup the abstraction *)
   let abs = ctx_lookup_abs ctx abs_id in
   (* Check whether we need to end sub-abstractions *)
-  let max_level = get_max_sub_abs abs in
+  let max_level = get_max_pending_sub_abs span abs in
   if max_level > level then
-    (* We do: end the sub-abstraction *)
-    end_abs_aux config span ~snapshots chain abs_id max_level ctx
+    (* End the current maximum, then check for remaining strict levels. *)
+    let ctx, cc =
+      end_abs_aux config span ~snapshots chain abs_id max_level ctx
+    in
+    let abs = ctx_lookup_abs ctx abs_id in
+    [%sanity_check] span (AbsLevelSet.mem max_level abs.ended_subabs);
+    let next_level = get_max_pending_sub_abs span abs in
+    [%cassert] span (next_level < max_level)
+      "Ending a strict sub-abstraction did not decrease the pending level";
+    comp cc (end_all_sub_abs config span ~snapshots chain abs_id level ctx)
   else
     (* No strict sub-abstraction to end. *)
     (ctx, fun e -> e)
@@ -1399,7 +1423,7 @@ and end_abs_borrows (config : config) (span : Meta.span) ~(snapshots : bool)
       method! visit_aproj env sproj =
         (match sproj with
         | AProjBorrows aproj ->
-            if check_level level then raise (FoundAProjBorrows aproj)
+            if check_level env then raise (FoundAProjBorrows aproj)
         | AProjLoans _ | AEndedProjLoans _ | AEndedProjBorrows _ | AEmpty -> ());
         super#visit_aproj env sproj
 
@@ -1606,7 +1630,7 @@ and end_proj_loans_symbolic (config : config) (span : Meta.span)
       match end_proj_loan_get_concrete_priority span proj.sv_id ctx with
       | None ->
           (* No outer borrows/loans found: we can end the loan projector *)
-          let ctx = update_aproj_loans_to_ended span abs_id proj.sv_id ctx in
+          let ctx = end_unblocked_proj_loans span abs_id regions proj ctx in
           (* Continue *)
           (ctx, fun e -> e)
       | Some outer ->
@@ -1919,7 +1943,9 @@ let rec promote_reserved_mut_borrow (config : config) (span : Meta.span)
         "Can't activate a reserved mutable borrow referencing a loan inside\n\
         \         a region abstraction"
 
-let destructure_abs (span : Meta.span) (abs_kind : abs_kind) ~(can_end : bool)
+let destructure_abs
+    ?(on_symbolic_copy : symbolic_value -> symbolic_value -> unit = fun _ _ -> ())
+    (span : Meta.span) (abs_kind : abs_kind) ~(can_end : bool)
     ~(destructure_shared_values : bool) (ctx : eval_ctx) (abs0 : abs) : abs =
   [%ltrace "- abs:\n" ^ abs_to_string span ctx abs0];
   (* Accumulator to store the destructured values *)
@@ -2003,15 +2029,76 @@ let destructure_abs (span : Meta.span) (abs_kind : abs_kind) ~(can_end : bool)
         | AEndedMutLoan
             { child = child_av; given_back = _; given_back_meta = _ }
         | AEndedIgnoredMutLoan
-            { child = child_av; given_back = _; given_back_meta = _ }
-        | AIgnoredSharedLoan child_av ->
+            { child = child_av; given_back = _; given_back_meta = _ } ->
             (* We don't support nested borrows for now *)
-            [%cassert] span
+            [%classert] span
               (not
                  (ty_has_borrows (Some span) ctx.type_ctx.type_infos child_av.ty))
-              "Nested borrows are not supported yet";
+              (lazy ("Unsupported nested ended mutable loan: "
+                ^ tavalue_to_string ~with_ended:true ctx av ^ "\n"
+                ^ abs_to_string span ~with_ended:true ctx abs0));
             (* Simply explore the child *)
-            list_avalues 0 push_fail child_av)
+            list_avalues 0 push_fail child_av
+        | AIgnoredSharedLoan child_av ->
+            (* An ignored outer shared region can wrap an independently owned
+               shared loan (Values.AIgnoredSharedLoan). Admit only this single
+               leaf at the top destructuring depth. Preserve the caller's push
+               function; do not bypass a surrounding push_fail context. *)
+            let supported_leaf =
+              Sys.getenv_opt "AENEAS_EXPERIMENTAL_IGNORED_SHARED_LEAF" = Some "1"
+              && allow_borrows = 2
+              &&
+              match (ty, child_av.ty, child_av.value) with
+              | ( TRef (RVar (Free outer), expected_child, RShared),
+                  TRef (RVar (Free inner), referent, RShared),
+                  ALoan (ASharedLoan (_, _, sv, leaf)) ) ->
+                  (not (RegionId.Set.mem outer abs0.regions.owned))
+                  && RegionId.Set.mem inner abs0.regions.owned
+                  && Types.equal_ty expected_child child_av.ty
+                  && Types.equal_ty referent sv.ty
+                  && Types.equal_ty referent leaf.ty
+                  && not
+                       (ty_has_borrows (Some span) ctx.type_ctx.type_infos referent)
+                  && not (tvalue_has_loans_or_borrows (Some span) ctx sv)
+                  && (match leaf.value with
+                     | AIgnored None -> true
+                     | AIgnored (Some mv) ->
+                         (* Structural typed-value equality, not equal_mvalue
+                            (which deliberately ignores metadata). The retained
+                            referent already carries exactly this value. *)
+                         Values.equal_tvalue mv sv
+                     | _ -> false)
+              | _ -> false
+            in
+            if supported_leaf then (
+              if Sys.getenv_opt "AENEAS_TRACE_IGNORED_SHARED_LEAF" = Some "1" then
+                Printf.eprintf
+                  "IGNORED_SHARED_LEAF_ACCEPT abs=%s child=%s\n%!"
+                  (AbsId.to_string abs0.abs_id)
+                  (tavalue_to_string ~with_ended:true ctx child_av);
+              (* Loan-only recursion uses the unchanged shared-loan case, which
+                 retains the marker/id/referent/type and existing copy observer.
+                 No mutable, projector, or given-back state is admitted here. *)
+              list_avalues 0 push child_av)
+            else if InterpSharedPacketSignature.enabled ()
+                    && allow_borrows = 2
+                    && ty_has_borrows (Some span) ctx.type_ctx.type_infos child_av.ty
+            then (
+              (* The structured child may contain projector histories or shared
+                 reborrows. Preserve its original wrapper and all descendants;
+                 the packet path performs any later cancellation separately. *)
+              ignore (InterpSharedPacketSignature.check span ctx
+                { abs0 with avalues = [av] });
+              push av)
+            else (
+              (* Original fallback for every unsupported shape and flag-off. *)
+              [%classert] span
+                (not
+                   (ty_has_borrows (Some span) ctx.type_ctx.type_infos child_av.ty))
+                (lazy ("Unsupported nested ignored shared loan: "
+                  ^ tavalue_to_string ~with_ended:true ctx av ^ "\n"
+                  ^ abs_to_string span ctx abs0));
+              list_avalues 0 push_fail child_av))
     | ABorrow bc -> (
         (* Sanity check - rem.: may be redundant with [push_fail] *)
         [%sanity_check] span (allow_borrows > 0);
@@ -2043,11 +2130,21 @@ let destructure_abs (span : Meta.span) (abs_kind : abs_kind) ~(can_end : bool)
             list_avalues allow_borrows push_avalue child_av;
             list_avalues allow_borrows push_avalue given_back
         | AProjSharedBorrow asb ->
-            (* We don't support nested borrows *)
-            [%cassert] span (asb = [])
-              "Found a case of unsupported nested borrows";
-            (* Nothing specific to do *)
-            ()
+            if asb = [] then ()
+            else if InterpSharedPacketSignature.enabled () then (
+              [%cassert] span (allow_borrows = 2)
+                "Nested projected shared borrow requires separate destructuring support";
+              (* Keep the exact shared permission and wrapper. This is not an
+                 ordinary AProjBorrows, and is never a packet cancellation root. *)
+              ignore (InterpSharedPacketSignature.check span ctx
+                { abs0 with avalues = [av] });
+              push av)
+            else
+              [%classert] span false
+                (lazy ("Unsupported projected shared borrow in abstraction "
+                  ^ AbsId.to_string abs0.abs_id ^ ": "
+                  ^ tavalue_to_string ~with_ended:true ctx av ^ "\n"
+                  ^ abs_to_string span ctx abs0))
         | AEndedMutBorrow _ | AEndedSharedBorrow ->
             (* If we get there it means the abstraction ended: it should not
                be in the context anymore (if we end *one* borrow in an abstraction,
@@ -2055,8 +2152,24 @@ let destructure_abs (span : Meta.span) (abs_kind : abs_kind) ~(can_end : bool)
             *)
             [%craise] span "Unreachable")
     | ASymbolic (_, aproj) -> (
-        (* *)
-        match aproj with
+        let has_history =
+          match aproj with
+          | AProjLoans p -> p.consumed <> [] || p.borrows <> []
+          | AProjBorrows p -> p.loans <> []
+          | AEndedProjLoans p -> p.consumed <> [] || p.borrows <> []
+          | AEndedProjBorrows p -> p.loans <> []
+          | AEmpty -> false
+        in
+        if has_history && InterpSharedPacketSignature.enabled () then (
+          (* Histories are already structured projector packets. Flattening or
+             dropping their children would lose permissions and given-back
+             metadata. Check the shared-only domain and retain the complete
+             original root, including ended roots with live history children.
+             The supplied [push] still enforces the enclosing borrow depth. *)
+          ignore (InterpSharedPacketSignature.check span ctx
+            { abs0 with avalues = [av] });
+          push av)
+        else match aproj with
         | AProjLoans { proj = _; consumed; borrows } ->
             (* There can be children in the presence of nested borrows: we
                don't handle those for now. *)
@@ -2070,14 +2183,14 @@ let destructure_abs (span : Meta.span) (abs_kind : abs_kind) ~(can_end : bool)
                don't handle those for now. *)
             [%sanity_check] span (loans = []);
             push av
-        | AEndedProjLoans { proj = _; consumed; borrows } ->
+        | AEndedProjLoans { proj_ty = _; proj = _; consumed; borrows } ->
             (* There can be children in the presence of nested borrows: we
                don't handle those for now. *)
             [%sanity_check] span (consumed = []);
             [%sanity_check] span (borrows = []);
             (* Just ignore *)
             ()
-        | AEndedProjBorrows { mvalues = _; loans } ->
+        | AEndedProjBorrows { proj_ty = _; mvalues = _; loans } ->
             (* There can be children in the presence of nested borrows: we
                don't handle those for now. *)
             [%sanity_check] span (loans = []);
@@ -2124,10 +2237,15 @@ let destructure_abs (span : Meta.span) (abs_kind : abs_kind) ~(can_end : bool)
                 let mk_value_with_fresh_sids (v : tvalue) : tvalue =
                   let visitor =
                     object
-                      inherit [_] map_tavalue
+                      inherit [_] map_tavalue as super
 
                       method! visit_symbolic_value_id _ _ =
                         ctx.fresh_symbolic_value_id ()
+
+                      method! visit_symbolic_value env original =
+                        let fresh = super#visit_symbolic_value env original in
+                        on_symbolic_copy fresh original;
+                        fresh
                     end
                   in
                   visitor#visit_tvalue () v
@@ -2312,27 +2430,26 @@ let abs_mut_borrows_loans_in_fixed span (ctx : eval_ctx)
     false
   with Found -> true
 
-let eliminate_ended_shared_loans (span : Meta.span) (ctx : eval_ctx) : eval_ctx
-    =
-  (* Filter the avalues *)
+(** Exact original top-root cleanup predicate, also shared with the narrowly
+    recorded leaf action. It does not examine or edit continuations. *)
+let ended_shared_loan_is_eliminable (span : Meta.span) (ctx : eval_ctx)
+    (v : tavalue) : bool =
+  match v.value with
+  | ALoan (AEndedSharedLoan (sv, child))
+    when (not (value_has_loans_or_borrows (Some span) ctx sv.value))
+         && is_aignored child.value -> true
+  | ASymbolic (_, AEndedProjLoans { proj_ty = _; proj = _; consumed; borrows })
+    when List.for_all (fun (_, proj) -> proj = AEmpty) (consumed @ borrows)
+    -> true
+  | _ -> false
+
+let eliminate_ended_shared_loans (span : Meta.span) (ctx : eval_ctx) : eval_ctx =
   let update_abs (abs : abs) : abs =
-    let keep (v : tavalue) : bool =
-      match v.value with
-      | ALoan (AEndedSharedLoan (sv, child))
-        when (not (value_has_loans_or_borrows (Some span) ctx sv.value))
-             && is_aignored child.value -> false
-      | ASymbolic (_, AEndedProjLoans { proj = _; consumed; borrows })
-        when List.for_all (fun (_, proj) -> proj = AEmpty) (consumed @ borrows)
-        -> false
-      | _ -> true
-    in
-    let avalues = List.filter keep abs.avalues in
+    let avalues = List.filter
+      (fun v -> not (ended_shared_loan_is_eliminable span ctx v)) abs.avalues in
     { abs with avalues }
   in
-  let ctx = ctx_map_abs update_abs ctx in
-
-  (* *)
-  ctx
+  ctx_map_abs update_abs ctx
 
 (* Repeat until we can't simplify the context anymore:
    - end the borrows which appear in anonymous values and don't contain loans

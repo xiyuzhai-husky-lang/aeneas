@@ -619,6 +619,24 @@ and extract_trait_instance_id (span : Meta.span) (ctx : extraction_ctx)
           F.pp_print_space fmt ();
           F.pp_print_string fmt "/- Unexpected occurrence of Self -/"
       | _ -> F.pp_print_string fmt "ERROR(\"Unexpected Self\")")
+  | (AppliedSliceVecZip (a,b) | AppliedVecSliceZip (a,b)) as mixed ->
+      [%cassert] span (backend () = Lean && AppliedMixedZip.enabled ())
+        "Applied mixed Zip requires the private admitted-input Lean boundary";
+      let generics = { empty_generic_args with types = [a;b] } in
+      if inside then F.pp_print_string fmt "(";
+      F.pp_print_string fmt (match mixed with AppliedSliceVecZip _ -> "core.iter.traits.iterator.IteratorSliceVecZip" | _ -> "core.iter.traits.iterator.IteratorVecSliceZip");
+      extract_generic_args span ctx fmt no_params_tys
+        ~explicit:(Some { explicit_types = [Explicit;Explicit]; explicit_const_generics = [] }) generics;
+      if inside then F.pp_print_string fmt ")"
+  | AppliedSliceZip (a, b) ->
+      [%cassert] span (backend () = Lean && !Config.applied_slice_zip)
+        "Applied shared-slice Zip is an opt-in Lean library boundary";
+      let generics = { empty_generic_args with types = [a; b] } in
+      if inside then F.pp_print_string fmt "(";
+      F.pp_print_string fmt "core.iter.traits.iterator.IteratorSliceZip";
+      extract_generic_args span ctx fmt no_params_tys
+        ~explicit:(Some { explicit_types = [Explicit; Explicit]; explicit_const_generics = [] }) generics;
+      if inside then F.pp_print_string fmt ")"
   | TraitImpl (id, generics) ->
       let name = ctx_get_trait_impl span id ctx in
       (* Lookup the the information about the explicit/implicit parameters. *)

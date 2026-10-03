@@ -142,6 +142,7 @@ val promote_reserved_mut_borrow :
      {- [abs] }
     } *)
 val destructure_abs :
+  ?on_symbolic_copy:(symbolic_value -> symbolic_value -> unit) ->
   Meta.span ->
   abs_kind ->
   can_end:bool ->
@@ -180,3 +181,11 @@ val eliminate_ended_shared_loans : Meta.span -> eval_ctx -> eval_ctx
       end them, nor their loans). *)
 val simplify_dummy_values_useless_abs :
   config -> ?snapshots:bool -> ?filter_avalues:bool -> Meta.span -> cm_fun
+
+(** Original double-None identity-continuation branch; no forced ending. *)
+val end_unblocked_proj_loans :
+  Meta.span -> AbsId.id -> Types.RegionId.Set.t -> symbolic_proj ->
+  eval_ctx -> eval_ctx
+
+(** Original top-root cleanup predicate, without filtering the environment. *)
+val ended_shared_loan_is_eliminable : Meta.span -> eval_ctx -> tavalue -> bool

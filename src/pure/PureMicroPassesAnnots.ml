@@ -205,6 +205,7 @@ let add_type_annotations_to_fun_decl (trans_ctx : trans_ctx)
               in
               (known_f_ty, [ collection_ty; TLiteral (TUInt Usize) ], false)
           | ResultUnwrapMut -> (hole, mk_holes (), false)
+          | SliceZipNext | SliceZipFold | SliceVecZipNext | SliceVecZipFold | VecSliceZipNext | VecSliceZipFold -> (f.ty, mk_known (), false)
           | GetTarget -> (f.ty, mk_known (), false)
           | TargetFeatureEnabled -> (f.ty, mk_known (), false)
         end
@@ -303,7 +304,7 @@ let add_type_annotations_to_fun_decl (trans_ctx : trans_ctx)
               | Fun fid -> begin compute_known_tys_from_fun_id qualif fid end
               | Unop unop -> begin
                   match unop with
-                  | Not _ | Neg _ | Cast _ | ArrayToSlice ->
+                  | Not _ | Neg _ | Cast _ | ArrayToSlice | SliceLen ->
                       (known_f_ty, known_args_tys, false)
                 end
               | Binop _ -> (known_f_ty, known_args_tys, false)

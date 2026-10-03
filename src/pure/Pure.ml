@@ -100,6 +100,14 @@ type array_or_slice = Array | Slice [@@deriving show, ord]
 
 (** Identifiers of builtin functions that we use only in the pure translation *)
 type pure_builtin_fun_id =
+  | SliceZipNext
+  | SliceZipFold
+  | SliceVecZipNext
+  | SliceVecZipFold
+  | VecSliceZipNext
+  | VecSliceZipFold
+      (** Applied external-library bindings; produced only after exact LLBC
+          shared-slice iterator and witness classification. *)
   | Return  (** The monadic return *)
   | Fail  (** The monadic fail *)
   | Assert  (** Assertion *)
@@ -681,6 +689,11 @@ and builtin_impl_data =
 
 and trait_instance_id =
   | Self
+  | AppliedSliceZip of ty * ty
+  | AppliedSliceVecZip of ty * ty
+  | AppliedVecSliceZip of ty * ty
+      (** A concrete Iterator dictionary for Zip<SliceIter<T>, SliceIter<U>>.
+          The enclosing trait_ref retains the original expected trait type. *)
   | TraitImpl of trait_impl_id * generic_args
   | Clause of trait_clause_id de_bruijn_var
     (* Note: the `de_bruijn_id`s are incorrect, see comment on `translate_region_binder` *)
@@ -1212,6 +1225,9 @@ type unop =
   | Neg of integer_type
   | Cast of cast_kind
   | ArrayToSlice
+  | SliceLen
+      (** Pure logical slice length, emitted only for safe shared-reference
+          metadata in the experimental Lean translation. *)
 
 and cast_kind =
   | CastLit of literal_type * literal_type

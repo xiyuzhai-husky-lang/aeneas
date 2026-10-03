@@ -695,6 +695,7 @@ let join_ctxs (span : Meta.span) (fresh_abs_kind : abs_kind)
   let nabs = ref [] in
 
   let symbolic_to_value = ref SymbolicValueId.Map.empty in
+  let symbolic_copy_origins = ref SymbolicValueId.Map.empty in
   let module S : MatchJoinState = struct
     let fresh_abs_kind = fresh_abs_kind
     let span = span
@@ -822,15 +823,31 @@ let join_ctxs (span : Meta.span) (fresh_abs_kind : abs_kind)
       (* Add projection marker to all abstractions in the left and right environments.
          Note that we destructure the fresh abstractions - TODO: make the merge more
          general *)
-      let destructure_abs ctx =
-        destructure_abs span fresh_abs_kind ~can_end:true
+      let destructure_abs ctx side =
+        let on_symbolic_copy fresh original =
+          if !Config.multi_exit_loops then begin
+            [%sanity_check] span (side = PLeft || side = PRight);
+            [%sanity_check] span (fresh.sv_ty = original.sv_ty);
+            [%sanity_check] span (ty_no_regions original.sv_ty);
+            [%sanity_check] span
+              (not (ty_has_borrows (Some span) ctx.type_ctx.type_infos
+                original.sv_ty));
+            [%sanity_check] span
+              (not (SymbolicValueId.Map.mem fresh.sv_id !symbolic_copy_origins));
+            let origin = { copy_side = side; copy_fresh = fresh;
+              copy_original = original } in
+            symbolic_copy_origins := SymbolicValueId.Map.add fresh.sv_id
+              origin !symbolic_copy_origins
+          end
+        in
+        destructure_abs ~on_symbolic_copy span fresh_abs_kind ~can_end:true
           ~destructure_shared_values:true ctx
       in
       let add_marker ctx (pm : proj_marker) (ee : env_elem) : env_elem list =
         match ee with
         | EAbs abs ->
             [
-              (let abs = destructure_abs ctx abs in
+              (let abs = destructure_abs ctx pm abs in
                EAbs (abs_add_marker span ctx pm abs));
             ]
         | EBinding (BDummy _, v) ->
@@ -839,7 +856,7 @@ let join_ctxs (span : Meta.span) (fresh_abs_kind : abs_kind)
               convert_value_to_abstractions span fresh_abs_kind ~can_end:true
                 ctx v
             in
-            let absl = List.map (destructure_abs ctx) absl in
+            let absl = List.map (destructure_abs ctx pm) absl in
             List.map (fun abs -> EAbs (abs_add_marker span ctx pm abs)) absl
         | EBinding (BVar _, _) | EFrame -> [%internal_error] span
       in
@@ -901,7 +918,8 @@ let join_ctxs (span : Meta.span) (fresh_abs_kind : abs_kind)
       }
     in
     let join_info : join_info =
-      { joined_ctx = ctx; symbolic_to_value = !symbolic_to_value }
+      { joined_ctx = ctx; symbolic_to_value = !symbolic_to_value;
+        symbolic_copy_origins = !symbolic_copy_origins }
     in
 
     (* Sanity check *)
@@ -1004,6 +1022,7 @@ let join_ctxs_list (config : config) (span : Meta.span)
 (** Destructure all the new abstractions *)
 let destructure_new_abs (span : Meta.span) (old_abs_ids : AbsId.Set.t)
     (ctx : eval_ctx) : eval_ctx =
+  let ctx = normalize_ended_shared_aliases span old_abs_ids ctx in
   [%ltrace "ctx:\n\n" ^ eval_ctx_to_string ctx];
   let is_fresh_abs_id (id : AbsId.id) : bool =
     not (AbsId.Set.mem id old_abs_ids)
@@ -1335,6 +1354,95 @@ let destructure_shared_loans (span : Meta.span) (fixed_aids : AbsId.Set.t) :
 
   (ctx, cc)
 
+(** Recover the target-side meaning of borrow-free symbolic copies created
+    only while destructuring join suffixes. The original join/matching keeps
+    distinct fresh IDs; only exported target values/abstractions are restored.
+
+    Shared-loan payloads and concrete continuation captures both need this
+    projection. Symbolic borrow/loan projectors are not concrete values and
+    are deliberately rejected if they unexpectedly mention a copied leaf. *)
+let project_right_symbolic_copies (span : Meta.span)
+    (origins : symbolic_copy_origin SymbolicValueId.Map.t)
+    (values : tvalue SymbolicValueId.Map.t) (absl : abs AbsId.Map.t) :
+    tvalue SymbolicValueId.Map.t * abs AbsId.Map.t =
+  if (not !Config.multi_exit_loops) || SymbolicValueId.Map.is_empty origins then
+    (values, absl)
+  else
+    let rec resolve seen (sv : symbolic_value) : symbolic_value =
+      match SymbolicValueId.Map.find_opt sv.sv_id origins with
+      | None -> sv
+      | Some origin when origin.copy_side = PLeft ->
+          (* Captured metadata environments can retain both sides. A left-only
+             copy has no right meaning; leave it unchanged, never select its
+             origin as a target value. Ordinary unbound-variable checks still
+             reject it if a later consumer attempts to use it. *)
+          [%cassert] span (SymbolicValueId.Set.is_empty seen)
+            "A right symbolic-copy origin crosses to a left-only copy";
+          sv
+      | Some origin ->
+          [%cassert] span (origin.copy_side = PRight)
+            "Invalid side on a destructured symbolic copy";
+          [%cassert] span
+            (origin.copy_fresh.sv_id = sv.sv_id
+             && origin.copy_fresh.sv_ty = sv.sv_ty
+             && origin.copy_original.sv_ty = sv.sv_ty)
+            "A destructured symbolic copy changed type";
+          if origin.copy_original.sv_id = sv.sv_id then sv
+          else begin
+            [%cassert] span (not (SymbolicValueId.Set.mem sv.sv_id seen))
+              "Cyclic destructured symbolic-copy provenance";
+            resolve (SymbolicValueId.Set.add sv.sv_id seen) origin.copy_original
+          end
+    in
+    (* Continuation snapshots form a shared immutable graph. Cache by physical
+       identity rather than repeatedly rebuilding each captured environment. *)
+    let module EnvTable = Hashtbl.Make (struct
+      type t = env
+      let equal a b = a == b
+      let hash = Hashtbl.hash
+    end) in
+    let environments = EnvTable.create 16 in
+    let pending = EnvTable.create 16 in
+    let visitor = object (self)
+      inherit [_] map_abs as super
+
+      method! visit_VSymbolic _ sv =
+        VSymbolic (resolve SymbolicValueId.Set.empty sv)
+
+      method! visit_symbolic_value_id _ sid =
+        [%cassert] span
+          (match SymbolicValueId.Map.find_opt sid origins with
+           | Some origin -> origin.copy_side <> PRight
+           | None -> true)
+          "A destructured concrete copy appeared in a symbolic-only projector";
+        sid
+
+      method! visit_mvalue env v = self#visit_tvalue env v
+
+      method! visit_env env snapshot =
+        match EnvTable.find_opt environments snapshot with
+        | Some projected -> projected
+        | None ->
+            [%cassert] span (not (EnvTable.mem pending snapshot))
+              "Cyclic continuation environment during copy projection";
+            EnvTable.add pending snapshot ();
+            let projected = super#visit_env env snapshot in
+            EnvTable.remove pending snapshot;
+            EnvTable.add environments snapshot projected;
+            projected
+
+      (* [menv] and [mvalue] are opaque to the default visitor, but these two
+         concrete expression constructors are consumed by Pure translation. *)
+      method! visit_EValue env snapshot v =
+        EValue (self#visit_env env snapshot, self#visit_tvalue env v)
+
+      method! visit_EIgnored env value =
+        EIgnored (Option.map (fun (snapshot, v) ->
+          (self#visit_env env snapshot, self#visit_tvalue env v)) value)
+    end in
+    (SymbolicValueId.Map.map (visitor#visit_tvalue ()) values,
+     AbsId.Map.map (visitor#visit_abs ()) absl)
+
 let match_ctx_with_target (config : config) (span : Meta.span)
     (fresh_abs_kind : abs_kind) (fixed_aids : AbsId.Set.t)
     (fixed_dids : DummyVarId.Set.t) (input_abs : AbsId.id list)
@@ -1389,6 +1497,10 @@ let match_ctx_with_target (config : config) (span : Meta.span)
     "- tgt_ctx after simplify_dummy_values_useless_abs (ii):\n"
     ^ eval_ctx_to_string tgt_ctx];
 
+  (* Mirror the permission-only move used by fixed-point normalization. The
+     continuation returned by earlier preparation remains composed below. *)
+  let tgt_ctx = normalize_ended_shared_aliases span fixed_aids tgt_ctx in
+
   (* Removed the ended shared loans and destructure the shared loans.
      We destructure the shared loans in the abstractions which appear in
      [tgt_ctx] but not [src_ctx]. TODO: generalize. *)
@@ -1440,9 +1552,11 @@ let match_ctx_with_target (config : config) (span : Meta.span)
   *)
   let merge_seq = ref [] in
   let add_borrows_seq = ref [] in
+  let recorded_shared_leaves =
+    if InterpRecordedSharedLeaf.enabled () then Some (ref []) else None in
   let joined_ctx_not_projected =
     collapse_ctx config span ~sequence:(Some merge_seq)
-      ~shared_borrows_seq:(Some add_borrows_seq) ~recoverable
+      ~recorded_shared_leaves ~shared_borrows_seq:(Some add_borrows_seq) ~recoverable
       ~with_abs_conts:true fresh_abs_kind joined_ctx
   in
   let merge_seq = List.rev !merge_seq in
@@ -1481,6 +1595,8 @@ let match_ctx_with_target (config : config) (span : Meta.span)
   (* Apply the sequence of merges to the projected context *)
   let joined_ctx =
     collapse_ctx_no_markers_following_sequence span merge_seq add_borrows_seq
+      ~recorded_shared_leaves:(match recorded_shared_leaves with None -> [] | Some r -> !r)
+      ~recorded_fixed_aids:(match recorded_shared_leaves with None -> None | Some _ -> Some fixed_aids)
       ~with_abs_conts:true fresh_abs_kind joined_ctx
   in
   [%ltrace
@@ -1619,6 +1735,11 @@ let match_ctx_with_target (config : config) (span : Meta.span)
            | None -> [%internal_error] span
            | Some joined_id -> (input_aid, ctx_lookup_abs joined_ctx joined_id))
          input_abs)
+  in
+
+  let input_values, input_abs =
+    project_right_symbolic_copies span join_info.symbolic_copy_origins
+      input_values input_abs
   in
 
   [%ltrace

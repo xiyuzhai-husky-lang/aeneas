@@ -218,6 +218,7 @@ type merge_duplicates_funcs = {
     We return the updated context as well as the id of the new abstraction which
     results from the merge. *)
 val merge_into_first_abstraction :
+  ?packet_fixed_abs_ids:AbsId.Set.t ->
   Meta.span ->
   abs_kind ->
   can_end:bool ->
@@ -261,4 +262,13 @@ val project_context :
     joined context, we replace the abstraction continuations of the fresh
     abstractions to reflect the fact that they should be introduced by the
     loop/join. *)
-val add_abs_cont_to_abs : Meta.span -> eval_ctx -> abs -> abs_fun -> abs
+val add_abs_cont_to_abs :
+  ?shared_packet_signature:bool -> Meta.span -> eval_ctx -> abs -> abs_fun -> abs
+
+(** Narrow opt-in move of shared-only ended-loan aliases in fresh contexts. *)
+val normalize_ended_shared_aliases :
+  ?strict_shared_roots:bool -> Meta.span -> AbsId.Set.t -> eval_ctx -> eval_ctx
+
+(** Separate default-off single-context multi-exit loop boundary admission. *)
+val normalize_after_loop_ended_shared_aliases :
+  Meta.span -> AbsId.Set.t -> eval_ctx -> eval_ctx
