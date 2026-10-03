@@ -808,7 +808,37 @@ let ctx_get_raw (span : Meta.span option) (id : id) (ctx : extraction_ctx) :
     to be printed. See {!escape_name} for the meaning of [qualified]. *)
 let ctx_get ?(qualified : bool = false) (span : Meta.span option) (id : id)
     (ctx : extraction_ctx) : string =
-  escape_name ~qualified (ctx_get_raw span id ctx)
+  let name = ctx_get_raw span id ctx in
+  let name =
+    match (backend (), id) with
+    | Lean, VariantId (TBuiltin ty, _) ->
+        (* A field such as [Solver.ok] shadows the opened [Result.ok] inside
+           definitions in that namespace. Qualify builtin constructors when
+           any registered declaration or field can hide their short name. *)
+        let parent =
+          match ty with
+          | TResult -> Some "Aeneas.Std.Result"
+          | TError -> Some "Aeneas.Std.Error"
+          | TLoopResult -> Some "Aeneas.Std.ControlFlow"
+          | _ -> None
+        in
+        let shadows other =
+          other = name || String.ends_with ~suffix:("." ^ name) other
+        in
+        let shadowed =
+          IdMap.exists
+            (fun other_id other -> other_id <> id && shadows other)
+            ctx.names_maps.names_map.id_to_name
+          || IdMap.exists
+               (fun _ other -> shadows other)
+               ctx.names_maps.unsafe_names_map.id_to_name
+        in
+        (match parent with
+        | Some parent when shadowed -> "_root_." ^ parent ^ "." ^ name
+        | _ -> name)
+    | _ -> name
+  in
+  escape_name ~qualified name
 
 let ctx_get_global (span : Meta.span) (id : A.GlobalDeclId.id)
     (ctx : extraction_ctx) : string =
@@ -2129,6 +2159,12 @@ let basename_to_unique (ctx : extraction_ctx) (name : string) =
        the backend allows such collisions *)
     StringSet.mem s ctx.names_maps.names_map.names_set
     || StringSet.mem s ctx.names_maps.strict_names_map.names_set
+    || (backend () = Lean
+       && StringSet.exists
+            (String.starts_with ~prefix:(s ^ "."))
+            ctx.names_maps.names_map.names_set)
+    (* A local [clause] also hides qualified references such as [clause.CRef]:
+       Lean tries field notation on the local instead of resolving the module. *)
   in
   basename_to_unique_aux collision name_append_index name
 
@@ -2456,7 +2492,11 @@ let ctx_compute_global_name_no_suffix (item_meta : T.item_meta)
     their names registered through {!ctx_add_fun_decl}. *)
 let ctx_add_global_decl (def : global_decl) (ctx : extraction_ctx) :
     extraction_ctx =
-  let name = ctx_compute_global_name_no_suffix def.item_meta def.src ctx in
+  let name =
+    match def.builtin_info with
+    | Some info -> info.extract_name
+    | None -> ctx_compute_global_name_no_suffix def.item_meta def.src ctx
+  in
   ctx_add def.item_meta.span (GlobalId def.def_id) name ctx
 
 let ctx_compute_fun_name (def : fun_decl) (is_trait_decl_field : bool)

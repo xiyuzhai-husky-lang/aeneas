@@ -42,6 +42,8 @@ package «tests» {}
 @[default_target] lean_lib Floats
 @[default_target] lean_lib FloatsArithmetic
 @[default_target] lean_lib FloatsCasts
+@[default_target] lean_lib FloatsStd
+@[default_target] lean_lib FloatsStdTests
 @[default_target] lean_lib FloatsTests
 @[default_target] lean_lib FromTo
 @[default_target] lean_lib GenericUnitOutput

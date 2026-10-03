@@ -5,6 +5,7 @@ public import Aeneas.Std.Core
 public import Aeneas.Std.Float
 public import Aeneas.Std.FloatCasts
 public import Aeneas.Std.FloatLemmas
+public import Aeneas.Std.FloatTraits
 public import Aeneas.Std.Primitives
 public import Aeneas.Std.PrimitivesLemmas
 public import Aeneas.Std.RawPtr

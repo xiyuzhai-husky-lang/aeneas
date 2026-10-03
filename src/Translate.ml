@@ -1003,9 +1003,6 @@ let export_global (fmt : Format.formatter) (config : gen_config) (ctx : gen_ctx)
 
   let is_opaque = Option.is_none body.Pure.body in
 
-  (* Save the fact that we extract opaque definitions, if we do *)
-  ctx.extracted_opaque := is_opaque || !(ctx.extracted_opaque);
-
   (* Check if it is a builtin global - if yes, we ignore it (together with the
      auxiliary functions introduced for the loops it may contain) because we
      map the definition to one in the standard library *)
@@ -1024,6 +1021,8 @@ let export_global (fmt : Format.formatter) (config : gen_config) (ctx : gen_ctx)
     && not is_builtin
   in
   if extract then (
+    (* Builtin constants do not emit opaque declarations. *)
+    ctx.extracted_opaque := is_opaque || !(ctx.extracted_opaque);
     (* We don't wrap global declaration groups between calls to functions
        [{start, end}_global_decl_group] (which don't exist): global declaration
        groups are always singletons, so the [extract_global_decl] function

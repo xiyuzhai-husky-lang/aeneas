@@ -79,6 +79,11 @@ let mk_struct_constructor (type_name : string) : string =
   in
   prefix ^ type_name ^ suffix
 
+(** Descriptor emitted by Lean's [rust_const] exporter. *)
+let mk_global ?(can_fail = false) (rust_name : string)
+    (extract_name : string) : Pure.builtin_global_info =
+  { rust_name; extract_name; can_fail }
+
 let mk_fun ?(keep_params : bool list option = None)
     ?(keep_trait_clauses : bool list option = None) ?(can_fail = true)
     ?(stateful = false) ?(lift = true) ?(has_default = false)

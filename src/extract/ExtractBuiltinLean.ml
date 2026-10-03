@@ -182,7 +182,13 @@ let lean_builtin_types =
     mk_type "core::sync::atomic::AtomicU32" "core.sync.atomic.AtomicU32";
   ]
 
-let lean_builtin_consts = []
+let lean_builtin_consts =
+  [
+    (* file: "Aeneas/Std/FloatTraits.lean", line: 48 *)
+    mk_global "core::f32::{f32}::INFINITY" "F32.INFINITY" ~can_fail:false;
+    (* file: "Aeneas/Std/FloatTraits.lean", line: 61 *)
+    mk_global "core::f64::{f64}::INFINITY" "F64.INFINITY" ~can_fail:false;
+  ]
 
 let lean_builtin_funs =
   [
@@ -392,6 +398,10 @@ let lean_builtin_funs =
     (* file: "Aeneas/Std/Core/Core.lean", line: 136 *)
     mk_fun "core::clone::impls::{core::clone::Clone<&'0 @T>}::clone"
       "core.clone.impls.CloneShared.clone";
+    (* file: "Aeneas/Std/FloatTraits.lean", line: 38 *)
+    mk_fun "core::clone::impls::{core::clone::Clone<f32>}::clone" "F32.clone";
+    (* file: "Aeneas/Std/FloatTraits.lean", line: 51 *)
+    mk_fun "core::clone::impls::{core::clone::Clone<f64>}::clone" "F64.clone";
     (* file: "Aeneas/Std/Core/Cmp.lean", line: 23 *)
     mk_fun "core::cmp::Eq::assert_fields_are_eq"
       "core.cmp.Eq.assert_fields_are_eq.default";
@@ -448,6 +458,10 @@ let lean_builtin_funs =
     (* file: "Aeneas/Std/Core/Cmp.lean", line: 228 *)
     mk_fun "core::cmp::impls::{core::cmp::PartialOrd<(), ()>}::partial_cmp"
       "core.cmp.impls.PartialOrdUnit.partial_cmp";
+    (* file: "Aeneas/Std/FloatTraits.lean", line: 44 *)
+    mk_fun "core::cmp::impls::{core::cmp::PartialOrd<f32, f32>}::partial_cmp" "F32.partial_cmp";
+    (* file: "Aeneas/Std/FloatTraits.lean", line: 57 *)
+    mk_fun "core::cmp::impls::{core::cmp::PartialOrd<f64, f64>}::partial_cmp" "F64.partial_cmp";
     (* file: "Aeneas/Std/Core/Cmp.lean", line: 211 *)
     mk_fun "core::cmp::max" "core.cmp.max";
     (* file: "Aeneas/Std/Core/Cmp.lean", line: 206 *)
@@ -469,6 +483,10 @@ let lean_builtin_funs =
     (* file: "Aeneas/Std/Core/Default.lean", line: 12 *)
     mk_fun "core::default::{core::default::Default<bool>}::default"
       "core.default.DefaultBool.default";
+    (* file: "Aeneas/Std/FloatTraits.lean", line: 41 *)
+    mk_fun "core::default::{core::default::Default<f32>}::default" "F32.default";
+    (* file: "Aeneas/Std/FloatTraits.lean", line: 54 *)
+    mk_fun "core::default::{core::default::Default<f64>}::default" "F64.default";
     (* file: "Aeneas/Std/Scalar/Display.lean", line: 58 *)
     mk_fun "core::fmt::num::imp::{core::fmt::Display<i128>}::fmt"
       "core.fmt.num.imp.DisplayI128.fmt";

@@ -3635,7 +3635,9 @@ let extract_trait_impl (ctx : extraction_ctx) (fmt : F.formatter)
           if not global_decl.can_fail then (
             let ok =
               match backend () with
-              | Lean -> "ok"
+              | Lean ->
+                  ctx_get (Some span)
+                    (VariantId (TBuiltin TResult, result_ok_id)) ctx
               | _ -> "Ok"
             in
             F.pp_print_string fmt ok;

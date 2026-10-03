@@ -20,8 +20,62 @@ set_option maxRecDepth 2048
 namespace names
 
 /-- [names::Struct]
-    Source: 'tests/src/names.rs', lines 3:0-5:1 -/
+    Source: 'tests/src/names.rs', lines 6:0-8:1 -/
 structure Struct where
   «name» : String
+
+/-- [names::clause::Clause]
+    Source: 'tests/src/names.rs', lines 11:4-13:5
+    Visibility: public -/
+structure clause.Clause where
+  value : Std.U32
+
+/-- [names::namespace_collision]:
+    Source: 'tests/src/names.rs', lines 17:0-21:1
+    Visibility: public -/
+def namespace_collision (clause1 : clause.Clause) : Result clause.Clause := do
+  _root_.Aeneas.Std.Result.ok clause1
+
+/-- [names::State]
+    Source: 'tests/src/names.rs', lines 23:0-27:1
+    Visibility: public -/
+structure State where
+  ok : Bool
+  fail : Bool
+  panic : Bool
+
+/-- [names::{names::State}::read]:
+    Source: 'tests/src/names.rs', lines 32:4-34:5
+    Visibility: public -/
+def State.read (self : State) : Result Bool := do
+  _root_.Aeneas.Std.Result.ok self.ok
+
+/-- [names::{names::State}::check]:
+    Source: 'tests/src/names.rs', lines 36:4-38:5
+    Visibility: public -/
+def State.check (self : State) : Result Unit := do
+  massert self.ok
+
+/-- [names::{names::State}::fail_if_set]:
+    Source: 'tests/src/names.rs', lines 40:4-45:5
+    Visibility: public -/
+def State.fail_if_set (self : State) : Result Bool := do
+  massert (¬ self.fail)
+  _root_.Aeneas.Std.Result.ok self.ok
+
+/-- [names::name_collisions_work]:
+    Source: 'tests/src/names.rs', lines 49:0-60:1
+    Visibility: public -/
+def name_collisions_work : Result Unit := do
+  let value ← namespace_collision { value := 7#u32 }
+  massert (value.value = 7#u32)
+  let b ← State.read { ok := true, fail := false, panic := false }
+  massert b
+  let b1 ← State.fail_if_set { ok := true, fail := false, panic := false }
+  massert b1
+  State.check { ok := true, fail := false, panic := false }
+
+/- Unit test for [names::name_collisions_work] -/
+#assert (name_collisions_work).reducesTo ()
 
 end names
