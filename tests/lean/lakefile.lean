@@ -98,6 +98,8 @@ package «tests» {}
 @[default_target] lean_lib NestedSharedBorrows
 @[default_target] lean_lib NoNestedBorrows
 @[default_target] lean_lib OpaqueMutRegion
+@[default_target] lean_lib OptionOperations
+@[default_target] lean_lib OptionOperationsTests
 @[default_target] lean_lib Options
 @[default_target] lean_lib Order
 @[default_target] lean_lib OverflowingOps
@@ -107,6 +109,8 @@ package «tests» {}
 @[default_target] lean_lib Range
 @[default_target] lean_lib RenameAttribute
 @[default_target] lean_lib RustBorrowCheckIssues
+@[default_target] lean_lib ScalarTraitOps
+@[default_target] lean_lib ScalarTraitOpsTests
 @[default_target] lean_lib Scalars
 @[default_target] lean_lib Slices
 @[default_target] lean_lib Static

@@ -2,6 +2,8 @@ module
 public import Aeneas.Std.Alloc
 public import Aeneas.Std.Array
 public import Aeneas.Std.Core
+public import Aeneas.Std.Core.MarkerDefault
+public import Aeneas.Std.Core.Option
 public import Aeneas.Std.Float
 public import Aeneas.Std.FloatCasts
 public import Aeneas.Std.FloatLemmas
@@ -10,6 +12,7 @@ public import Aeneas.Std.Primitives
 public import Aeneas.Std.PrimitivesLemmas
 public import Aeneas.Std.RawPtr
 public import Aeneas.Std.Scalar
+public import Aeneas.Std.Scalar.TraitOps
 public import Aeneas.Std.Slice
 public import Aeneas.Std.SliceDef
 public import Aeneas.Std.SliceIter

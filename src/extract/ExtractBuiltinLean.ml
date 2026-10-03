@@ -192,6 +192,32 @@ let lean_builtin_consts =
 
 let lean_builtin_funs =
   [
+    (* file: "Aeneas/Std/Core/MarkerDefault.lean", line: 7 *)
+    mk_fun "core::marker::{core::default::Default<core::marker::PhantomData<@T>>}::default" "core.marker.phantomDataDefault";
+    (* file: "Aeneas/Std/Scalar/TraitOps.lean", line: 14 *)
+    mk_fun "core::ops::arith::{core::ops::arith::Add<u32, u32, u32>}::add" "U32.traitAdd";
+    (* file: "Aeneas/Std/Scalar/TraitOps.lean", line: 20 *)
+    mk_fun "core::ops::arith::{core::ops::arith::Rem<u32, u32, u32>}::rem" "U32.traitRem";
+    (* file: "Aeneas/Std/Scalar/TraitOps.lean", line: 17 *)
+    mk_fun "core::ops::arith::{core::ops::arith::Sub<u32, u32, u32>}::sub" "U32.traitSub";
+    (* file: "Aeneas/Std/Scalar/TraitOps.lean", line: 26 *)
+    mk_fun "core::ops::bit::{core::ops::bit::BitAnd<u32, u32, u32>}::bitand" "U32.traitAnd";
+    (* file: "Aeneas/Std/Scalar/TraitOps.lean", line: 29 *)
+    mk_fun "core::ops::bit::{core::ops::bit::BitOr<u32, u32, u32>}::bitor" "U32.traitOr";
+    (* file: "Aeneas/Std/Scalar/TraitOps.lean", line: 32 *)
+    mk_fun "core::ops::bit::{core::ops::bit::BitXor<u32, u32, u32>}::bitxor" "U32.traitXor";
+    (* file: "Aeneas/Std/Scalar/TraitOps.lean", line: 23 *)
+    mk_fun "core::ops::bit::{core::ops::bit::Not<u32, u32>}::not" "U32.traitNot";
+    (* file: "Aeneas/Std/Scalar/TraitOps.lean", line: 35 *)
+    mk_fun "core::ops::bit::{core::ops::bit::Shl<u32, usize, u32>}::shl" "U32.traitShl";
+    (* file: "Aeneas/Std/Scalar/TraitOps.lean", line: 38 *)
+    mk_fun "core::ops::bit::{core::ops::bit::Shr<u32, usize, u32>}::shr" "U32.traitShr";
+    (* file: "Aeneas/Std/Core/Option.lean", line: 47 *)
+    mk_fun "core::option::{core::option::Option<&'0 @T>}::cloned" "core.option.Option.cloned";
+    (* file: "Aeneas/Std/Core/Option.lean", line: 8 *)
+    mk_fun "core::option::{core::option::Option<@T>}::map" "core.option.Option.map";
+    (* file: "Aeneas/Std/Core/Option.lean", line: 32 *)
+    mk_fun "core::option::{core::option::Option<@T>}::map_or" "core.option.Option.map_or";
     (* file: "Aeneas/Std/VecOps.lean", line: 16 *)
     mk_fun "alloc::vec::{alloc::vec::Vec<@T>}::as_slice" "alloc.vec.Vec.as_slice" ~keep_params:(Some [true; false]) ~can_fail:false ~lift:false;
     (* file: "Aeneas/Std/VecOps.lean", line: 74 *)
