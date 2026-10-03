@@ -16,6 +16,8 @@ package «tests» {}
 @[default_target] lean_lib AssertCfg
 @[default_target] lean_lib Avl
 @[default_target] lean_lib BaseTutorial
+@[default_target] lean_lib BitBlockOps
+@[default_target] lean_lib BitBlockOpsTests
 @[default_target] lean_lib Bitwise
 @[default_target] lean_lib BlanketImpl
 @[default_target] lean_lib BoolCmp

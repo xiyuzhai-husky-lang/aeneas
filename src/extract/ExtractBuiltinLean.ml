@@ -192,6 +192,10 @@ let lean_builtin_consts =
 
 let lean_builtin_funs =
   [
+    (* file: "Aeneas/Std/Core/Hash.lean", line: 20 *)
+    mk_fun "core::hash::impls::{core::hash::Hash<u32>}::hash" "core.hash.hashU32";
+    (* file: "Aeneas/Std/Scalar/CountOnes.lean", line: 14 *)
+    mk_fun "core::num::{u32}::count_ones" "core.num.U32.countOnes";
     (* file: "Aeneas/Std/Core/MarkerDefault.lean", line: 7 *)
     mk_fun "core::marker::{core::default::Default<core::marker::PhantomData<@T>>}::default" "core.marker.phantomDataDefault";
     (* file: "Aeneas/Std/Scalar/TraitOps.lean", line: 14 *)
@@ -1436,8 +1440,7 @@ let lean_builtin_trait_decls =
     mk_trait_decl "core::hash::Hash" "core.hash.Hash"
       ~methods:[ ("hash", "hash") ];
     (* file: "Aeneas/Std/Core/Hash.lean", line: 8 *)
-    mk_trait_decl "core::hash::Hasher" "core.hash.Hasher"
-      ~methods:[ ("finish", "finish"); ("write", "write") ];
+    mk_trait_decl "core::hash::Hasher" "core.hash.Hasher" ~methods:[("finish", "finish"); ("write", "write"); ("write_u32", "write_u32")];
     (* file: "Aeneas/Std/Core/Iter.lean", line: 28 *)
     mk_trait_decl "core::iter::adapters::zip::TrustedRandomAccessNoCoerce"
       "core.iter.adapters.zip.TrustedRandomAccessNoCoerce"
