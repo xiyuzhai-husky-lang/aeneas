@@ -937,6 +937,7 @@ let unop_name (unop : unop) : string =
       match backend () with
       | Lean -> "-."
       | _ -> int_name int_ty ^ "_neg")
+  | FloatNeg fty -> float_name fty ^ ".neg"
   | ArrayToSlice -> (
       match backend () with
       | Lean -> "Std.Array.to_slice"
@@ -956,6 +957,17 @@ let named_binop_name (binop : binop) : string =
     | FStar | Coq | HOL4 -> int_name int_ty ^ "_"
   in
   match binop with
+  | FloatCmp (op, fty) ->
+      let op =
+        match op with
+        | FpEq -> "eq"
+        | FpNe -> "ne"
+        | FpLt -> "lt"
+        | FpLe -> "le"
+        | FpGe -> "ge"
+        | FpGt -> "gt"
+      in
+      float_name fty ^ "." ^ op
   | Div (_, ty) -> add_int_name ty ^ "div"
   | Rem (_, ty) -> add_int_name ty ^ "rem"
   | Add (_, ty) -> add_int_name ty ^ "add"

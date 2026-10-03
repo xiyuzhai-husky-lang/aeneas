@@ -388,6 +388,7 @@ let check_literal_type (span : Meta.span) (cv : literal) (ty : scalar_type) :
   | VScalar (UnsignedInteger (sv_ty, _)), TInteger (Unsigned int_ty) ->
       [%sanity_check] span (sv_ty = int_ty)
   | VBool _, TBool | VChar _, TChar -> ()
+  | VFloat fv, TFloat fty -> [%sanity_check] span (fv.float_ty = fty)
   | _ -> [%craise] span "Erroneous typing"
 
 (** If [lookups] is [true] whenever we encounter a loan/borrow we lookup the

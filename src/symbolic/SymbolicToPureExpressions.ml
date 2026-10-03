@@ -541,6 +541,21 @@ and translate_function_call_aux (call : S.call) (e : S.expr) (ctx : bs_ctx) :
             let dest = mk_tpat_from_fvar dest_mplace dest in
             (ctx, Unop (Not ty), effect_info, args, [], dest)
         | _ -> [%craise] ctx.span "Unreachable")
+    | S.Unop (E.Neg _)
+      when (match args with
+            | [ { ty = TLiteral (TFloat _); _ } ] -> true
+            | _ -> false) -> (
+        match args with
+        | [ { ty = TLiteral (TFloat fty); _ } ] ->
+            [%cassert] ctx.span (Config.backend () = Lean)
+              "Floating-point negation is currently supported only in Lean";
+            let effect_info =
+              { can_fail = false; can_diverge = false; is_rec = false }
+            in
+            let ctx, dest = fresh_var_for_symbolic_value call.dest ctx in
+            let dest = mk_tpat_from_fvar dest_mplace dest in
+            (ctx, Unop (FloatNeg fty), effect_info, args, [], dest)
+        | _ -> [%internal_error] ctx.span)
     | S.Unop (E.Neg overflow) -> (
         match args with
         | [ arg ] ->
@@ -635,7 +650,24 @@ and translate_function_call_aux (call : S.call) (e : S.expr) (ctx : bs_ctx) :
               lit_ty0
             in
             let binop =
-              match binop with
+              match arg0.ty with
+              | TLiteral (TFloat fty) ->
+                  [%sanity_check] ctx.span (arg0.ty = arg1.ty);
+                  [%cassert] ctx.span (Config.backend () = Lean)
+                    "Floating-point comparisons are currently supported only in Lean";
+                  let op =
+                    match binop with
+                    | Expressions.Eq -> FpEq
+                    | Expressions.Ne -> FpNe
+                    | Expressions.Lt -> FpLt
+                    | Expressions.Le -> FpLe
+                    | Expressions.Ge -> FpGe
+                    | Expressions.Gt -> FpGt
+                    | _ ->
+                        [%craise] ctx.span "Unsupported floating-point operation"
+                  in
+                  FloatCmp (op, fty)
+              | _ -> (match binop with
               | Expressions.BitXor ->
                   if arg0.ty = TLiteral TBool then BoolXor
                   else BitXor (get_single_int_ty ())
@@ -673,7 +705,7 @@ and translate_function_call_aux (call : S.call) (e : S.expr) (ctx : bs_ctx) :
                   Shr (om, ty0, ty1)
               | Expressions.Offset ->
                   [%craise] ctx.span "Not supported: `binop::offset`"
-              | Expressions.Cmp -> Cmp (get_single_int_ty ())
+              | Expressions.Cmp -> Cmp (get_single_int_ty ()))
             in
             (ctx, Binop binop, effect_info, args, [], dest)
         | _ -> [%craise] ctx.span "Unreachable")

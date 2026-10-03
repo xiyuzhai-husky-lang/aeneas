@@ -105,6 +105,7 @@ let check_literal (span : Meta.span) (v : literal) (ty : literal_type) : unit =
   | TUInt int_ty, VScalar (UnsignedInteger (ty, _)) ->
       [%sanity_check] span (int_ty = ty)
   | TBool, VBool _ | TChar, VChar _ -> ()
+  | TFloat fty, VFloat fv -> [%sanity_check] span (fty = fv.float_ty)
   | _ -> [%craise] span "Inconsistent type"
 
 let tc_ctx_start_pbenv (ctx : tc_ctx) : tc_ctx =

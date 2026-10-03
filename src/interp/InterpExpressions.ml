@@ -103,6 +103,9 @@ let literal_to_tvalue (span : Meta.span) (ty : scalar_type) (cv : literal)
   (* Scalar, boolean... *)
   | TBool, VBool v -> { value = VLiteral (VBool v); ty = TScalar ty }
   | TChar, VChar v -> { value = VLiteral (VChar v); ty = TScalar ty }
+  | TFloat float_ty, VFloat fv ->
+      [%sanity_check] span (float_ty = fv.float_ty);
+      { value = VLiteral (VFloat fv); ty = TScalar ty }
   | TInteger (Signed int_ty), VScalar (SignedInteger (sv_ty, _) as sv) ->
       (* Check the type and the ranges *)
       [%sanity_check] span (int_ty = sv_ty);
@@ -964,6 +967,7 @@ let eval_unary_op_symbolic (config : config) (span : Meta.span) (unop : unop)
         | Not, (TScalar (TInteger (Unsigned _)) as lty) -> lty
         | Neg OPanic, (TScalar (TInteger (Signed _)) as lty) -> lty
         | Neg OPanic, (TScalar (TInteger (Unsigned _)) as lty) -> lty
+        | Neg _, (TScalar (TFloat _) as lty) -> lty
         | Cast (CastScalar (_, tgt_ty)), _ -> TScalar tgt_ty
         | Cast (CastUnsize (ty0, ty1, _)), _ ->
             (* If the following function succeeds, then it means the cast is well-formed
@@ -1001,6 +1005,12 @@ let eval_unary_op (config : config) (span : Meta.span) (unop : unop)
     the binop *after* the operands have been successfully evaluated *)
 let eval_binary_op_concrete_compute (span : Meta.span) (binop : binop)
     (v1 : tvalue) (v2 : tvalue) (ctx : eval_ctx) : (tvalue, eval_error) result =
+  (* Never apply structural equality to floating-point operands in concrete
+     mode. Float operations are currently supported by symbolic extraction. *)
+  (match v1.ty with
+  | TScalar (TFloat _) ->
+      [%craise] span "Concrete floating-point evaluation is not supported"
+  | _ -> ());
   (* Equality check binops (Eq, Ne) accept values from a wide variety of types.
    * The remaining binops only operate on scalars. *)
   if binop = Eq || binop = Ne then (
@@ -1148,6 +1158,10 @@ let eval_binary_op_symbolic (config : config) (span : Meta.span) (binop : binop)
       | TScalar TBool, TScalar TBool
         when binop = Lt || binop = Le || binop = Ge || binop = Gt
              || binop = BitAnd || binop = BitOr || binop = BitXor ->
+          TScalar TBool
+      | TScalar (TFloat fty1), TScalar (TFloat fty2)
+        when binop = Lt || binop = Le || binop = Ge || binop = Gt ->
+          [%sanity_check] span (fty1 = fty2);
           TScalar TBool
       | TScalar lty1, TScalar lty2
         when scalar_type_is_integer lty1 && scalar_type_is_integer lty2 -> (

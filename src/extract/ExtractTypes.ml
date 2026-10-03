@@ -97,10 +97,16 @@ let extract_literal (span : Meta.span) (fmt : F.formatter) ~(is_pattern : bool)
           F.pp_print_string fmt c;
           if inside then F.pp_print_string fmt ")")
   | VStr s -> extract_str span ~inside fmt s
-  | VChar _ | VFloat _ | VByteStr _ ->
+  | VFloat fv ->
+      [%cassert] span (backend () = Lean)
+        "Floating-point literals are currently supported only in Lean";
+      let bits = FloatLiterals.to_bits span fv in
+      if inside then F.pp_print_string fmt "(";
+      F.fprintf fmt "%s.ofBits %s" (float_name fv.float_ty) (Z.to_string bits);
+      if inside then F.pp_print_string fmt ")"
+  | VChar _ | VByteStr _ ->
       [%admit_raise] span
-        "Float, string, non-ASCII chars and byte string literals are \
-         unsupported"
+        "Non-ASCII chars and byte string literals are unsupported"
         fmt
   | VPureNat n -> F.pp_print_string fmt (Z.to_string n)
   | VPureInt n ->
@@ -287,8 +293,8 @@ let extract_const_generic (span : Meta.span) (ctx : extraction_ctx)
       let s = ctx_get_const_generic_var span origin id ctx in
       F.pp_print_string fmt s
 
-let extract_literal_type (_ctx : extraction_ctx) (fmt : F.formatter)
-    (ty : literal_type) : unit =
+let extract_literal_type (span : Meta.span) (_ctx : extraction_ctx)
+    (fmt : F.formatter) (ty : literal_type) : unit =
   match ty with
   | TBool -> F.pp_print_string fmt (bool_name ())
   | TChar -> F.pp_print_string fmt (char_name ())
@@ -298,7 +304,11 @@ let extract_literal_type (_ctx : extraction_ctx) (fmt : F.formatter)
   | TUInt int_ty ->
       let prefix = if backend () = Lean then "Std." else "" in
       F.pp_print_string fmt (prefix ^ int_name (Unsigned int_ty))
-  | TFloat float_ty -> F.pp_print_string fmt (float_name float_ty)
+  | TFloat float_ty ->
+      [%cassert] span (backend () = Lean)
+        "Floating-point types are currently supported only in Lean";
+      let _ = FloatLiterals.format span float_ty in
+      F.pp_print_string fmt (float_name float_ty)
   | TPureNat -> F.pp_print_string fmt "ℕ"
   | TPureInt -> F.pp_print_string fmt "ℤ"
 
@@ -456,7 +466,7 @@ let rec extract_ty (span : Meta.span) (ctx : extraction_ctx) (fmt : F.formatter)
   | TVar var ->
       let origin, id = origin_from_de_bruijn_var var in
       F.pp_print_string fmt (ctx_get_type_var span origin id ctx)
-  | TLiteral lty -> extract_literal_type ctx fmt lty
+  | TLiteral lty -> extract_literal_type span ctx fmt lty
   | TArrow (arg_ty, ret_ty) ->
       if inside then F.pp_print_string fmt "(";
       extract_rec ~inside:false arg_ty;
@@ -1391,7 +1401,7 @@ let extract_generic_params (span : Meta.span) (ctx : extraction_ctx)
             F.pp_print_space fmt ();
             F.pp_print_string fmt ":";
             F.pp_print_space fmt ();
-            extract_literal_type ctx fmt var.ty;
+            extract_literal_type span ctx fmt var.ty;
             (* ) *)
             right_bracket expl;
             if use_arrows then (

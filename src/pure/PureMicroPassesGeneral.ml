@@ -674,7 +674,7 @@ let simplify_duplicate_calls =
 (** A helper predicate *)
 let lift_unop (unop : unop) : bool =
   match unop with
-  | Not None -> false
+  | Not None | FloatNeg _ -> false
   | Not (Some _) | Neg _ | Cast _ | ArrayToSlice -> true
 
 (** A helper predicate *)
@@ -683,7 +683,7 @@ let inline_unop unop = not (lift_unop unop)
 (** A helper predicate *)
 let lift_binop (binop : binop) : bool =
   match binop with
-  | Eq _ | Lt _ | Le _ | Ne _ | Ge _ | Gt _ | BoolAnd | BoolOr | BoolXor ->
+  | FloatCmp _ | Eq _ | Lt _ | Le _ | Ne _ | Ge _ | Gt _ | BoolAnd | BoolOr | BoolXor ->
       false
   | BitXor _
   | BitAnd _

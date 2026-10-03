@@ -904,7 +904,7 @@ let cast_kind_to_string (env : fmt_env) (kind : cast_kind) : string =
 let unop_to_string (env : fmt_env) (unop : unop) : string =
   match unop with
   | Not _ -> "¬"
-  | Neg _ -> "-"
+  | Neg _ | FloatNeg _ -> "-"
   | Cast kind -> cast_kind_to_string env kind
   | ArrayToSlice -> "array_to_slice"
 
@@ -922,6 +922,17 @@ let binop_to_string (env : fmt_env) (binop : binop) =
   | BitXor int_ty -> "^" ^ int_ty_to_string int_ty
   | BitAnd int_ty -> "&" ^ int_ty_to_string int_ty
   | BitOr int_ty -> "|" ^ int_ty_to_string int_ty
+  | FloatCmp (op, fty) ->
+      let op =
+        match op with
+        | FpEq -> "=="
+        | FpNe -> "!="
+        | FpLt -> "<"
+        | FpLe -> "<="
+        | FpGe -> ">="
+        | FpGt -> ">"
+      in
+      op ^ "::<" ^ float_type_to_string fty ^ ">"
   | Eq ty -> "==" ^ "::<" ^ ty_to_string env false ty ^ ">"
   | Ne ty -> "!=" ^ "::<" ^ ty_to_string env false ty ^ ">"
   | Lt lit_ty -> "<" ^ lit_ty_to_string lit_ty

@@ -633,7 +633,11 @@ and trait_type_constraint = {
 and predicates = { trait_type_constraints : trait_type_constraint list }
 
 (** See the documentation of [E.binop] *)
+and float_comparison = FpEq | FpNe | FpLt | FpLe | FpGe | FpGt
+
 and binop =
+  | FloatCmp of float_comparison * float_type
+      (** IEEE comparisons, deliberately distinct from propositional equality. *)
   | BitXor of integer_type
   | BitAnd of integer_type
   | BitOr of integer_type
@@ -1210,6 +1214,7 @@ and tpat = { pat : pat; ty : ty }
 type unop =
   | Not of integer_type option
   | Neg of integer_type
+  | FloatNeg of float_type
   | Cast of cast_kind
   | ArrayToSlice
 
