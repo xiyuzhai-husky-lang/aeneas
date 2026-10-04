@@ -21,7 +21,15 @@ The generic Zip trait uses the existing functional short-circuiting `next` model
 and ordinary fold default, including callback effects. The SAT bridge core now
 translates and compiles against this trait record.
 
+`StringIter` now has a concrete UTF-8 `Chars::next` model. Its state keeps the
+native byte position; a successful step returns one Unicode scalar and advances
+by that scalar's UTF-8 length. Its proofs derive the exact encoded tail, initial
+Unicode sequence, exhaustion, and rejection of invalid modeled bytes. The initial
+String byte-carrier roundtrip is kernel-checked. `Chars::collect` uses the concrete
+iterator dictionary and ordinary collection interface.
+
 These are functional standard-library models. Correspondence to native unsafe
-iterator or allocator bodies is not proved here. Full chapter 28b/28c translation
-and their composed correctness proofs are still in progress; Unicode character
-iteration is also an outstanding model boundary.
+iterator or allocator bodies is not proved here. Chapter 28b's actual valid-graph
+solver is now proved by concrete composition with the frozen CDCL chapter;
+malformed-input coverage and chapter 28c's composed frontend proof remain in
+progress. Unicode iteration is no longer an opaque functional-model boundary.
