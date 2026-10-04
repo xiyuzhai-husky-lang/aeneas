@@ -194,6 +194,26 @@ let lean_builtin_consts =
 
 let lean_builtin_funs =
   [
+  (* file: "Aeneas/Std/SearchSupport.lean", line: 37 *)
+  mk_fun "alloc::vec::{core::convert::From<alloc::vec::Vec<@T>, &'0 [@T]>}::from" "alloc.vec.VecFromSlice.from";
+  (* file: "Aeneas/Std/SearchSupport.lean", line: 22 *)
+  mk_fun "alloc::vec::{core::iter::traits::collect::IntoIterator<&'a alloc::vec::Vec<@T>, &'a @T, core::slice::iter::Iter<'a, @T>>}::into_iter" "SharedVec.IntoIterator.into_iter" ~keep_params:(Some [true; false]);
+  (* file: "Aeneas/Std/SearchSupport.lean", line: 29 *)
+  mk_fun "alloc::vec::{core::iter::traits::collect::IntoIterator<&'a mut alloc::vec::Vec<@T>, &'a mut @T, core::slice::iter::IterMut<'a, @T>>}::into_iter" "MutVec.IntoIterator.into_iter" ~keep_params:(Some [true; false]);
+  (* file: "Aeneas/Std/SearchSupport.lean", line: 15 *)
+  mk_fun "core::cmp::impls::{core::cmp::Ord<bool>}::cmp" "core.cmp.impls.OrdBool.cmp";
+  (* file: "Aeneas/Std/SearchSupport.lean", line: 10 *)
+  mk_fun "core::cmp::{core::cmp::Ordering}::then" "core.cmp.Ordering.then";
+  (* file: "Aeneas/Std/IteratorPredicates.lean", line: 26 *)
+  mk_fun "core::iter::traits::iterator::Iterator::all" "core.iter.traits.iterator.Iterator.all.default";
+  (* file: "Aeneas/Std/IteratorPredicates.lean", line: 11 *)
+  mk_fun "core::iter::traits::iterator::Iterator::any" "core.iter.traits.iterator.Iterator.any.default";
+  (* file: "Aeneas/Std/IteratorPredicates.lean", line: 111 *)
+  mk_fun "core::slice::iter::{core::iter::traits::double_ended::DoubleEndedIterator<core::slice::iter::Iter<'a, @T>, &'_ @T>}::next_back" "core.slice.iter.IteratorSliceIter.next_back";
+  (* file: "Aeneas/Std/IteratorPredicates.lean", line: 46 *)
+  mk_fun "core::slice::iter::{core::iter::traits::iterator::Iterator<core::slice::iter::Iter<'a, @T>, &'a @T>}::all" "core.slice.iter.IteratorSliceIter.all";
+  (* file: "Aeneas/Std/IteratorPredicates.lean", line: 39 *)
+  mk_fun "core::slice::iter::{core::iter::traits::iterator::Iterator<core::slice::iter::Iter<'a, @T>, &'a @T>}::any" "core.slice.iter.IteratorSliceIter.any";
     (* file: "Aeneas/Std/VecSupport.lean", line: 20 *)
   mk_fun "alloc::vec::{alloc::vec::Vec<@T>}::reserve" "alloc.vec.Vec.reserve" ~keep_params:(Some [true; false]);
     (* file: "Aeneas/Std/VecSupport.lean", line: 10 *)
