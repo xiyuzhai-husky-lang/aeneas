@@ -1134,6 +1134,8 @@ let lean_builtin_funs =
     mk_fun "core::num::{u8}::wrapping_shr" "core.num.U8.wrapping_shr"
       ~can_fail:false;
     (* file: "Aeneas/Std/Scalar/CoreConvertNum.lean", line: 699 *)
+    mk_fun "core::num::{usize}::saturating_mul" "core.num.Usize.saturating_mul"
+      ~can_fail:false;
     mk_fun "core::num::{usize}::cast_signed" "core.num.Usize.cast_signed";
     (* file: "Aeneas/Std/Scalar/CoreConvertNum.lean", line: 789 *)
     mk_fun "core::num::{usize}::is_multiple_of" "core.num.Usize.is_multiple_of";

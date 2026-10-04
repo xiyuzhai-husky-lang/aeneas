@@ -47,4 +47,21 @@ def IScalar.saturating_sub {ty : IScalarTy} (x y : IScalar ty) : IScalar ty :=
 /- [core::num::{i8}::saturating_sub] -/
 iscalar def core.num.«%S».saturating_sub := @IScalar.saturating_sub IScalarTy.«%S»
 
+def UScalar.saturating_mul {ty : UScalarTy} (x y : UScalar ty) : UScalar ty :=
+  ⟨BitVec.ofNat _ (min (UScalar.max ty) (x.val * y.val))⟩
+
+theorem UScalar.saturating_mul_val {ty : UScalarTy} (x y : UScalar ty) :
+    (UScalar.saturating_mul x y).val = min (UScalar.max ty) (x.val * y.val) := by
+  simp only [UScalar.saturating_mul,UScalar.val,BitVec.toNat_ofNat]
+  apply Nat.mod_eq_of_lt
+  have bound : UScalar.max ty < 2 ^ ty.numBits := by
+    rw [UScalar.max]
+    have positive : 0 < 2 ^ ty.numBits := Nat.two_pow_pos ty.numBits
+    omega
+  exact lt_of_le_of_lt (Nat.min_le_left _ _) bound
+
+/- [core::num::{usize}::saturating_mul] -/
+@[rust_fun "core::num::{usize}::saturating_mul"]
+def core.num.Usize.saturating_mul := @UScalar.saturating_mul .Usize
+
 end Aeneas.Std
