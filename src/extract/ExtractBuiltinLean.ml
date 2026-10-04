@@ -195,6 +195,24 @@ let lean_builtin_consts = []
 
 let lean_builtin_funs =
   [
+    mk_fun
+      "core::slice::index::{core::slice::index::SliceIndex<core::ops::range::RangeInclusive<usize>, [@T], [@T]>}::get"
+      "core.slice.index.SliceIndexRangeInclusiveUsizeSlice.get";
+    mk_fun
+      "core::slice::index::{core::slice::index::SliceIndex<core::ops::range::RangeInclusive<usize>, [@T], [@T]>}::get_mut"
+      "core.slice.index.SliceIndexRangeInclusiveUsizeSlice.get_mut";
+    mk_fun
+      "core::slice::index::{core::slice::index::SliceIndex<core::ops::range::RangeInclusive<usize>, [@T], [@T]>}::get_unchecked"
+      "core.slice.index.SliceIndexRangeInclusiveUsizeSlice.get_unchecked";
+    mk_fun
+      "core::slice::index::{core::slice::index::SliceIndex<core::ops::range::RangeInclusive<usize>, [@T], [@T]>}::get_unchecked_mut"
+      "core.slice.index.SliceIndexRangeInclusiveUsizeSlice.get_unchecked_mut";
+    mk_fun
+      "core::slice::index::{core::slice::index::SliceIndex<core::ops::range::RangeInclusive<usize>, [@T], [@T]>}::index"
+      "core.slice.index.SliceIndexRangeInclusiveUsizeSlice.index";
+    mk_fun
+      "core::slice::index::{core::slice::index::SliceIndex<core::ops::range::RangeInclusive<usize>, [@T], [@T]>}::index_mut"
+      "core.slice.index.SliceIndexRangeInclusiveUsizeSlice.index_mut";
     mk_fun "core::result::{core::result::Result<@T, @E>}::ok" "core.result.Result.ok";
     mk_fun "core::slice::{[@T]}::split" "core.slice.Slice.split";
     mk_fun "core::slice::iter::{core::iter::traits::iterator::Iterator<core::slice::iter::Split<'a, @T, @P>, &'a [@T]>}::next"
@@ -1670,6 +1688,9 @@ let lean_builtin_trait_decls =
 
 let lean_builtin_trait_impls =
   [
+    mk_trait_impl
+      "core::slice::index::SliceIndex<core::ops::range::RangeInclusive<usize>, [@T], [@T]>"
+      "core.slice.index.SliceIndexRangeInclusiveUsizeSlice";
     mk_trait_impl "core::slice::SlicePattern<[@T; @N], @T>" "Array.Insts.CoreSliceSlicePattern";
     mk_trait_impl "core::slice::SlicePattern<[@T], @T>" "Slice.Insts.CoreSliceSlicePattern";
     mk_trait_impl "core::iter::traits::iterator::Iterator<core::slice::iter::Split<'a, @T, @P>, &'a [@T]>"

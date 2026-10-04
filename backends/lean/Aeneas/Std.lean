@@ -43,3 +43,5 @@ public import Aeneas.Std.SliceSplit
 public import Aeneas.Std.SlicePrefix
 
 public import Aeneas.Std.ZipBack
+
+public import Aeneas.Std.SliceInclusive
