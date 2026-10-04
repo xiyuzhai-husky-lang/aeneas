@@ -2678,6 +2678,12 @@ let merge_into_first_abstraction_legacy (span : Meta.span) (abs_kind : abs_kind)
   (* Update the environment: replace the abstraction 0 with the result of the merge,
      remove the abstraction 1 *)
   let ctx = fst (ctx_subst_abs span ctx abs_id0 nabs) in
+  (* Both original owners become the merged owner. Preserve dependent native
+     ignored-borrow subscriptions when the second owner is removed too. *)
+  let ctx =
+    if Sys.getenv_opt "AENEAS_EXPERIMENTAL_ALL_FRAME_PARENTS" = Some "1" then
+      InterpPacketRouting.remap_borrower_parents abs_id1 nabs.abs_id ctx
+    else ctx in
   let ctx = fst (ctx_remove_abs span ctx abs_id1) in
 
   (* Merge all the regions from the abstraction into one (the first - i.e., the
