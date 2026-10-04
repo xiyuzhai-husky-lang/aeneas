@@ -45,3 +45,6 @@ public import Aeneas.Std.SlicePrefix
 public import Aeneas.Std.ZipBack
 
 public import Aeneas.Std.SliceInclusive
+
+public import Aeneas.Std.StringPatterns
+public import Aeneas.Std.StringParse

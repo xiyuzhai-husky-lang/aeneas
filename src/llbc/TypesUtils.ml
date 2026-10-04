@@ -56,6 +56,8 @@ let ty_regions (ty : ty) : RegionId.Set.t =
       inherit [_] iter_ty as super
       method! visit_region _env r = add_region r
 
+      method! visit_TFnDef _ _ = ()
+
       method! visit_TDynTrait env tr =
         (* Ignore the dyn traits by default *)
         if Config.type_analysis_ignore_dyn then ()
@@ -78,6 +80,8 @@ let ty_has_regions_in_pred (pred : region -> bool) (ty : ty) : bool =
     object
       inherit [_] iter_ty as super
       method! visit_region _ r = if pred r then raise Found
+
+      method! visit_TFnDef _ _ = ()
 
       method! visit_TDynTrait env tr =
         (* Ignore the dyn traits by default *)
@@ -367,14 +371,21 @@ let raise_if_not_rty_visitor =
       | RStatic | RVar (Free _) -> ()
       | RBody _ -> [%craise_opt_span] None "unsupported: Body region"
 
+    method! visit_TFnDef _ _ =
+      (* A function item is a zero-sized callable identity. Its instantiated
+         or locally-bound signature lifetimes are phantom parameters, not
+         runtime storage regions of the value. The actual function signature
+         still goes through the implied-bound and hierarchy analyses. *)
+      ()
+
     method! visit_TDynTrait env tr =
       (* Ignore dyn traits by default *)
       if Config.type_analysis_ignore_dyn then ()
       else super#visit_TDynTrait env tr
   end
 
-(** Return [true] if the type is a region type (i.e., it doesn't contain erased
-    regions), and only contains free regions) *)
+(** Return [true] if runtime storage lifetimes are free and not erased.
+    Function-item signature parameters do not describe runtime storage. *)
 let ty_is_rty (ty : ty) : bool =
   try
     raise_if_not_rty_visitor#visit_ty () ty;

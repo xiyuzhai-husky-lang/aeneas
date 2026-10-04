@@ -766,6 +766,21 @@ def core.iter.adapters.zip.Zip.Insts.CoreIterTraitsIteratorIteratorPair.next
       | none => ok (none, ⟨a', b'⟩)
       | some b => ok (some (a, b), ⟨a', b'⟩)
 
+/-- The generic zip iterator uses the already modeled short-circuiting next
+    operation and the ordinary Iterator fold default. -/
+@[reducible, rust_trait_impl
+  "core::iter::traits::iterator::Iterator<core::iter::adapters::zip::Zip<@A, @B>, (@Clause0_Item, @Clause1_Item)>"]
+impl_def core.iter.traits.iterator.IteratorZip {A B Item_A Item_B : Type}
+    (left : core.iter.traits.iterator.Iterator A Item_A)
+    (right : core.iter.traits.iterator.Iterator B Item_B) :
+    core.iter.traits.iterator.Iterator (core.iter.adapters.zip.Zip A B) (Item_A × Item_B) := {
+  next := core.iter.adapters.zip.Zip.Insts.CoreIterTraitsIteratorIteratorPair.next left right
+  fold := core.iter.traits.iterator.Iterator.fold.default
+    (core.iter.adapters.zip.Zip.Insts.CoreIterTraitsIteratorIteratorPair.next left right)
+  enumerate := core.iter.traits.iterator.Iterator.enumerate.trait_default
+    (core.iter.traits.iterator.IteratorZip left right)
+}
+
 @[rust_fun "core::ops::range::{core::ops::range::RangeInclusive<@Idx>}::new"]
 def core.ops.range.RangeInclusive.new {Idx : Type}
     (start «end» : Idx) : Result (core.ops.range.RangeInclusive Idx) :=

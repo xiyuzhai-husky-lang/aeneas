@@ -184,6 +184,7 @@ let lean_builtin_types =
     mk_type "core::slice::iter::IterMut" "core.slice.iter.IterMut"
       ~mut_regions:[ 0 ];
     (* file: "Aeneas/Std/StringIter.lean", line: 9 *)
+    mk_type "core::num::error::ParseIntError" "core.num.error.ParseIntError";
     mk_type "core::str::iter::Chars" "core.str.iter.Chars";
     (* file: "Aeneas/Std/Core/Atomic.lean", line: 8 *)
     mk_type "core::sync::atomic::AtomicBool" "core.sync.atomic.AtomicBool";
@@ -1474,6 +1475,10 @@ let lean_builtin_funs =
        char>}::next"
       "core.str.iter.IteratorChars.next";
     (* file: "Aeneas/Std/StringIter.lean", line: 31 *)
+    mk_fun "core::str::{str}::starts_with" "core.str.Str.starts_with";
+    mk_fun "core::str::{str}::strip_prefix" "core.str.Str.strip_prefix";
+    mk_fun "core::str::{str}::parse" "core.str.Str.parse";
+    mk_fun "core::num::{core::str::traits::FromStr<usize, core::num::error::ParseIntError>}::from_str" "core.num.Usize.from_str";
     mk_fun "core::str::{str}::chars" "core.str.Str.chars";
     (* file: "Aeneas/Std/Std/Io.lean", line: 7 *)
     mk_fun "std::io::stdio::_print" "std.io.stdio._print";
@@ -1481,6 +1486,9 @@ let lean_builtin_funs =
 
 let lean_builtin_trait_decls =
   [
+    mk_trait_decl "core::str::pattern::Pattern" "core.str.pattern.Pattern";
+    mk_trait_decl "core::str::traits::FromStr" "core.str.traits.FromStr"
+      ~methods:[ ("from_str", "from_str") ];
     mk_trait_decl "core::slice::SlicePattern" "core.slice.SlicePattern"
       ~methods:[("as_slice", "as_slice")];
     (* file: "Aeneas/Std/Core/Ptr.lean", line: 85 *)
@@ -1693,6 +1701,11 @@ let lean_builtin_trait_impls =
     mk_trait_impl
       "core::slice::index::SliceIndex<core::ops::range::RangeInclusive<usize>, [@T], [@T]>"
       "core.slice.index.SliceIndexRangeInclusiveUsizeSlice";
+    mk_trait_impl "core::str::pattern::Pattern<char>" "core.str.pattern.PatternChar";
+    mk_trait_impl "core::str::pattern::Pattern<&'b str>" "core.str.pattern.PatternStr";
+    mk_trait_impl "core::iter::traits::iterator::Iterator<core::iter::adapters::zip::Zip<@A, @B>, (@Clause0_Item, @Clause1_Item)>"
+      "core.iter.traits.iterator.IteratorZip";
+    mk_trait_impl "core::str::traits::FromStr<usize, core::num::error::ParseIntError>" "core.str.traits.FromStrUsize";
     mk_trait_impl "core::slice::SlicePattern<[@T; @N], @T>" "Array.Insts.CoreSliceSlicePattern";
     mk_trait_impl "core::slice::SlicePattern<[@T], @T>" "Slice.Insts.CoreSliceSlicePattern";
     mk_trait_impl "core::iter::traits::iterator::Iterator<core::slice::iter::Split<'a, @T, @P>, &'a [@T]>"

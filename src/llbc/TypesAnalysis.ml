@@ -459,27 +459,9 @@ let analyze_full_ty (span : Meta.span option) (updated : bool ref)
             ty_info inputs
         in
         analyze span expl_info ty_info output
-    | TFnDef { binder_regions; binder_value = { kind = _; generics } } ->
-        (* For now we check that there are no regions anywhere.
-
-           TODO: the best would be to open all binders and then do a sanity
-           check (probably that no region bound at the level of the signature
-           is outlived by a locally bound region).
-         *)
-        [%cassert_opt_span] span (binder_regions = []) "Unimplemented";
-        let visitor =
-          object
-            inherit [_] iter_ty
-            method! visit_region _ _ = raise Utils.Found
-          end
-        in
-        let has_regions =
-          try
-            visitor#visit_generic_args () generics;
-            false
-          with Utils.Found -> true
-        in
-        [%cassert_opt_span] span (not has_regions) "Unimplemented";
+    | TFnDef _ ->
+        (* A function item has no stored payload. Its signature's generic
+           regions do not create runtime borrows in the item value. *)
         ty_info
     | TError _ ->
         [%craise_opt_span] span "Found type error in the output of charon"
@@ -999,6 +981,14 @@ let check_no_bound_free_implied_bounds (span : Meta.span option)
                is shorter than the lifetimes appearing in the referent), as well
                as the outer borrow regions: we record [r] and dive in. *)
             self#visit_ty (r :: outer) ref_ty
+        | TFnDef _ | TFnPtr _ ->
+            (* Function-item and function-pointer lifetime arguments describe
+               callable signatures, not references stored in the referent.
+               Borrowing a polymorphic function value does not require every
+               locally-bound call lifetime to outlive that borrow. Reset only
+               the enclosing storage-borrow stack: constraints inside the
+               callable signature and its ADTs are still checked normally. *)
+            super#visit_ty [] ty
         | TAdt { id; generics = adt_generics; builtin } ->
             (* The implied bounds coming from the ADT's own declaration
                (constraints between its lifetime/type parameters). *)
