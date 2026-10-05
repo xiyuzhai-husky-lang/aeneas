@@ -22,7 +22,7 @@ let log = Logging.match_ctxs_log
 (** Validate the concrete fragment for which the existing native-predicate
     hierarchy computes every relevant region edge. This runs before refresh,
     so erased or bound input regions cannot be disguised as fresh free ones. *)
-let validate_symbolic_hierarchy_type (span : Meta.span)
+let validate_symbolic_hierarchy_type ?(allow_mutable = false) (span : Meta.span)
     (crate : LlbcAst.crate) (infos : TypesAnalysis.type_infos)
     (ty : ty) : RegionId.Set.t =
   let fail what = [%craise] span ("Unsupported symbolic region hierarchy: " ^ what) in
@@ -68,7 +68,8 @@ let validate_symbolic_hierarchy_type (span : Meta.span)
     | TSlice (element, None) -> check active element
     | TArray (element, length, None) ->
         literal_array_length length; check active element
-    | TRef (r, referent, RShared) -> check_region r; check active referent
+    | TRef (r, referent, kind) when kind = RShared || allow_mutable ->
+        check_region r; check active referent
     | TAdt { id; generics; builtin } ->
         let array_iter = builtin=None && canonical_array_iter id generics in
         if (generics.const_generics <> [] && not array_iter)
@@ -107,8 +108,8 @@ let validate_symbolic_hierarchy_type (span : Meta.span)
     | _ -> fail "type outside concrete scalar/shared-reference/ADT fragment"
     in
     let info = TypesAnalysis.analyze_ty (Some span) infos ty in
-    if info.contains_static || info.contains_mut_borrow then
-      fail "type analysis finds static or mutable borrows"
+    if info.contains_static || (info.contains_mut_borrow && not allow_mutable) then
+      fail "type analysis finds unsupported static or mutable borrows"
   in
   check [] ty;
   !all_regions
@@ -181,9 +182,9 @@ let closed_static_shared_type (span : Meta.span) (ctx : eval_ctx) (ty : ty) =
 
 (** Derive fresh-region parents from native ADT well-formedness predicates using
     the same hierarchy machinery as instantiated function signatures. *)
-let symbolic_hierarchy_parents (span : Meta.span) (crate : LlbcAst.crate)
+let symbolic_hierarchy_parents ?(allow_mutable = false) (span : Meta.span) (crate : LlbcAst.crate)
     (infos : TypesAnalysis.type_infos) (fresh_regions : RegionId.id list) (ty : ty) : RegionId.id list RegionId.Map.t =
-  let regions = validate_symbolic_hierarchy_type span crate infos ty in
+  let regions = validate_symbolic_hierarchy_type ~allow_mutable span crate infos ty in
   let expected = RegionId.Set.of_list fresh_regions in
   [%cassert] span
     (RegionId.Set.cardinal expected = List.length fresh_regions
@@ -1293,15 +1294,22 @@ module MakeJoinMatcher (S : MatchJoinState) : PrimMatcher = struct
        ending the interior permission before its enclosing shared iterator.
        Derive this from the complete refreshed type and ADT predicates, without
        quotienting any region or changing the original value projections. *)
+    let recursive_projection =
+      Sys.getenv_opt "AENEAS_EXPERIMENTAL_RECURSIVE_JOIN_PROJECTION" = Some "1"
+      && (List.length fresh_regions > 1
+          || ty_has_nested_borrows (Some span) ctx0.type_ctx.type_infos ty_with_regions)
+    in
     let hierarchy =
       let info=TypesAnalysis.analyze_ty (Some span) ctx0.type_ctx.type_infos
         ty_with_regions in
-      if Sys.getenv_opt "AENEAS_EXPERIMENTAL_SYMBOLIC_REGION_HIERARCHY" <> Some "1"
+      if (not recursive_projection
+          && Sys.getenv_opt "AENEAS_EXPERIMENTAL_SYMBOLIC_REGION_HIERARCHY" <> Some "1")
         || fresh_regions=[] || not info.contains_borrow
-        || info.contains_mut_borrow || info.contains_static then None
+        || (info.contains_mut_borrow && not recursive_projection)
+        || info.contains_static then None
       else
-        let parents=symbolic_hierarchy_parents span ctx0.crate
-          ctx0.type_ctx.type_infos fresh_regions ty_with_regions in
+        let parents=symbolic_hierarchy_parents ~allow_mutable:recursive_projection
+          span ctx0.crate ctx0.type_ctx.type_infos fresh_regions ty_with_regions in
         let ids=List.fold_left (fun ids rid ->
           RegionId.Map.add rid (ctx0.fresh_abs_id ()) ids)
           RegionId.Map.empty fresh_regions in
@@ -1313,14 +1321,39 @@ module MakeJoinMatcher (S : MatchJoinState) : PrimMatcher = struct
     (* Project the ADTs into different region abstractions *)
     let project (rid : RegionId.id) =
       let regions = RegionId.Set.singleton rid in
-      let avl0, output0 =
-        convert_value_to_output_avalues span ctx0 PLeft v0 regions
-          ty_with_regions
+      (* Preserve the complete nested interface with the native recursive
+         projectors. Only fresh projector markers receive a join side;
+         opaque meta environments and values retain their original markers. *)
+      let project_value ctx side value =
+        if Sys.getenv_opt "AENEAS_TRACE_RECURSIVE_JOIN_PROJECTION" = Some "1" then
+          Printf.eprintf "RECURSIVE_JOIN enabled=%b nested=%b mutable=%b ty=%s\nvalue=%s\n%!"
+            recursive_projection
+            (ty_has_nested_borrows (Some span) ctx.type_ctx.type_infos ty_with_regions)
+            (ty_has_mut_borrows ctx.type_ctx.type_infos ty_with_regions)
+            (ty_to_string ctx ty_with_regions) (show_tvalue value);
+        if not recursive_projection then
+          convert_value_to_output_avalues span ctx side value regions ty_with_regions
+        else
+          let marker marker =
+            [%cassert] span (marker = PNone)
+              "Recursive join projection unexpectedly contains an existing marker";
+            side in
+          let amap = object
+            inherit [_] map_tavalue
+            method! visit_proj_marker _ p = marker p
+          end in
+          let emap = object
+            inherit [_] map_tevalue
+            method! visit_proj_marker _ p = marker p
+          end in
+          let av = InterpProjectors.apply_proj_borrows_on_input_value
+            span ctx regions value ty_with_regions in
+          let output = InterpProjectors.apply_eproj_borrows_on_input_value
+            span ctx regions value ty_with_regions in
+          ([amap#visit_tavalue () av], emap#visit_tevalue () output)
       in
-      let avl1, output1 =
-        convert_value_to_output_avalues span ctx1 PRight v1 regions
-          ty_with_regions
-      in
+      let avl0, output0 = project_value ctx0 PLeft v0 in
+      let avl1, output1 = project_value ctx1 PRight v1 in
       let av : tavalue =
         let proj : symbolic_proj =
           { sv_id = sv_s.sv_id; proj_ty = ty_with_regions }
@@ -1402,6 +1435,10 @@ module MakeJoinMatcher (S : MatchJoinState) : PrimMatcher = struct
         }
       in
       [%ldebug "Pushing abs:\n" ^ abs_to_string span ctx0 abs];
+      if recursive_projection
+         && Sys.getenv_opt "AENEAS_TRACE_RECURSIVE_JOIN_PROJECTION" = Some "1" then
+        Printf.eprintf "RECURSIVE_JOIN_OWNER\n%s\n%!"
+          (abs_to_string span ctx0 abs);
       if trace_shared_alias_join then
         Printf.eprintf "SHARED_ALIAS_JOIN_OWNER joined=%s\n%s\n%!"
           (SymbolicValueId.to_string sv_s.sv_id) (abs_to_string span ctx0 abs);
@@ -2772,7 +2809,21 @@ struct
           ^ ", sv1: "
           ^ tvalue_to_string ~span:(Some span) ctx1 v1];
 
-        let _ = match_tvalues v0 v1 in
+        (try ignore(match_tvalues v0 v1) with error ->
+          if Sys.getenv_opt "AENEAS_TRACE_SHARED_MATCH_REFERENTS"=Some "1" then
+            Printf.eprintf "SHARED_MATCH_REFERENTS bid=%s/%s\nleft=%s\nright=%s\n%!"
+              (BorrowId.to_string bid0) (BorrowId.to_string bid1)
+              (tvalue_to_string ~span:(Some span) ctx0 v0)
+              (tvalue_to_string ~span:(Some span) ctx1 v1);
+          if Sys.getenv_opt "AENEAS_TRACE_SHARED_MATCH_REFERENTS"=Some "1" then (
+            let visitor=object inherit [_] iter_tvalue
+              method! visit_VSharedLoan () lid payload =
+                let peer=InterpBorrowsCore.lookup_shared_value_opt span ctx1.env lid in
+                Printf.eprintf "NESTED_SHARED_PEER %s value=%s peer=%s\n%!"
+                  (BorrowId.to_string lid) (tvalue_to_string ctx0 payload)
+                  (match peer with None -> "missing" | Some v -> tvalue_to_string ctx1 v)
+            end in visitor#visit_tvalue () v0);
+          raise error);
         ()
     in
     (* The shared borrow id doesn't really matter but it's always safer to refresh it *)
@@ -3592,6 +3643,9 @@ let match_ctxs (span : Meta.span) ~(check_equiv : bool)
                   ctx.type_ctx.type_infos ty in
                 not info.contains_mut_borrow && not info.contains_static in
               let shared_type ty=shared_type ctx0 ty && shared_type ctx1 ty in
+              let rec historical_type = function
+                | TRef(_,target,RMut) -> historical_type target
+                | ty -> shared_type ty in
               let rec packet = function
                 | AProjLoans {proj;consumed=[];borrows} ->
                     shared_type proj.proj_ty && history borrows
@@ -3602,16 +3656,25 @@ let match_ctxs (span : Meta.span) ~(check_equiv : bool)
                 | _ -> false
               and history entries=List.for_all (fun ((meta:mconsumed_symb),child) ->
                 shared_type meta.proj_ty && packet child) entries in
-              let rec shared_tree (value:tavalue) =
-                shared_type value.ty && match value.value with
-                | ASymbolic(PNone,p) -> packet p
-                | AAdt adt -> List.for_all shared_tree adt.fields
-                | AIgnored None -> true
-                | AIgnored(Some {value=VSymbolic symbolic;ty}) ->
-                    equal_ty ty (Substitute.erase_regions symbolic.sv_ty)
-                    && not(TypesUtils.ty_has_borrows (Some span) ctx0.type_ctx.type_infos symbolic.sv_ty)
-                    && not(TypesUtils.ty_has_borrows (Some span) ctx1.type_ctx.type_infos symbolic.sv_ty)
-                | _ -> false in
+              let rec shared_tree (value:tavalue) = match value.value with
+                | ABorrow(AEndedIgnoredMutBorrow b) ->
+                    shared_tree b.child && shared_tree b.given_back
+                    && historical_type b.given_back_meta.sv_ty
+                | ALoan(AEndedIgnoredMutLoan b) ->
+                    shared_tree b.child && shared_tree b.given_back
+                    && historical_type b.given_back_meta.ty
+                    && (match b.given_back_meta.value with
+                      | VSymbolic symbolic -> historical_type symbolic.sv_ty
+                      | _ -> false)
+                | _ -> shared_type value.ty && match value.value with
+                  | ASymbolic(PNone,p) -> packet p
+                  | AAdt adt -> List.for_all shared_tree adt.fields
+                  | AIgnored None -> true
+                  | AIgnored(Some {value=VSymbolic symbolic;ty}) ->
+                      equal_ty ty (Substitute.erase_regions symbolic.sv_ty)
+                      && not(TypesUtils.ty_has_borrows (Some span) ctx0.type_ctx.type_infos symbolic.sv_ty)
+                      && not(TypesUtils.ty_has_borrows (Some span) ctx1.type_ctx.type_infos symbolic.sv_ty)
+                  | _ -> false in
               match_current_interface && not check_equiv
               && InterpSharedPacketSignature.enabled () && abs_id0=abs_id1
               && RegionId.Set.equal abs0.regions.owned abs1.regions.owned
@@ -3622,7 +3685,13 @@ let match_ctxs (span : Meta.span) ~(check_equiv : bool)
                     shared_type v0.ty && packet p
                 | ABorrow(AEndedIgnoredMutBorrow b) ->
                     shared_tree b.child && shared_tree b.given_back
-                    && shared_type b.given_back_meta.sv_ty
+                    && historical_type b.given_back_meta.sv_ty
+                | ALoan(AEndedIgnoredMutLoan b) ->
+                    shared_tree b.child && shared_tree b.given_back
+                    && historical_type b.given_back_meta.ty
+                    && (match b.given_back_meta.value with
+                      | VSymbolic symbolic -> historical_type symbolic.sv_ty
+                      | _ -> false)
                 | AAdt _ -> shared_tree v0
                 | _ -> false)
               && InterpSharedHistory.empty_native_interface span ctx0 abs0 v0
@@ -3662,6 +3731,14 @@ let match_ctxs (span : Meta.span) ~(check_equiv : bool)
                 ignore(match_types ctx0 ctx1 value.ty value.ty);
                 match value.value with
                 | ASymbolic(PNone,p) -> packet p
+                | ABorrow(AEndedIgnoredMutBorrow b) ->
+                    ignore(match_types ctx0 ctx1 b.given_back_meta.sv_ty b.given_back_meta.sv_ty);
+                    ignore(match_sid b.given_back_meta.sv_id b.given_back_meta.sv_id);
+                    shared_tree b.child; shared_tree b.given_back
+                | ALoan(AEndedIgnoredMutLoan b) ->
+                    let match_values=if recover then RecoverM.match_tvalues else M.match_tvalues in
+                    ignore(match_values ctx0 ctx1 b.given_back_meta b.given_back_meta);
+                    shared_tree b.child; shared_tree b.given_back
                 | AAdt adt -> List.iter shared_tree adt.fields
                 | AIgnored None -> ()
                 | AIgnored(Some ({value=VSymbolic symbolic;_} as value)) ->
@@ -3680,6 +3757,14 @@ let match_ctxs (span : Meta.span) ~(check_equiv : bool)
                     ignore(match_types ctx0 ctx1 b.given_back.ty b.given_back.ty);
                     ignore(match_types ctx0 ctx1 b.given_back_meta.sv_ty b.given_back_meta.sv_ty);
                     ignore(match_sid b.given_back_meta.sv_id b.given_back_meta.sv_id);
+                    shared_tree b.child; shared_tree b.given_back
+                | ALoan(AEndedIgnoredMutLoan b) ->
+                    (* Identical retained loan history is the dual of the
+                       ended borrow case above. Keep its two native levels and
+                       exact concrete return metadata, and match every type,
+                       SID and metadata value through the ordinary callbacks. *)
+                    let match_values=if recover then RecoverM.match_tvalues else M.match_tvalues in
+                    ignore(match_values ctx0 ctx1 b.given_back_meta b.given_back_meta);
                     shared_tree b.child; shared_tree b.given_back
                 | _ -> [%internal_error] span);
               v0

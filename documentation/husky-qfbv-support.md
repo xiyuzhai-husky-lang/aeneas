@@ -33,3 +33,26 @@ iterator or allocator bodies is not proved here. Chapter 28b's actual valid-grap
 solver is now proved by concrete composition with the frozen CDCL chapter;
 malformed-input coverage and chapter 28c's composed frontend proof remain in
 progress. Unicode iteration is no longer an opaque functional-model boundary.
+
+## Parser translation candidates at the requested stop
+
+The pending chapter 28c exploration is saved separately from the completed
+chapter proofs. It adds MIR normalization for character switches, shared Box
+payload reborrows, standard Global Box deallocation, and terminal drop routing.
+The recursive join projector candidate uses the native borrow/projector trees
+and region hierarchy under `AENEAS_EXPERIMENTAL_RECURSIVE_JOIN_PROJECTION=1`.
+The historical shared-subscription candidate is restricted to children of ended
+ignored-borrow wrappers under
+`AENEAS_EXPERIMENTAL_HISTORICAL_SHARED_SUBSCRIPTION=1`; it retains subscription
+IDs and compares the live parent permission without equating historical shared
+referent lifetimes.
+
+These compiler candidates are unfinished. The last executable translated the
+fresh `crate::parse` extraction only up to an ignored-borrow parent-type mismatch
+(`Chars` historical region 131 versus live region 150, borrow 44). The latest
+historical-subscription source change has not been rebuilt or validated. The
+OCaml/full-MIR temporary environments were removed, and compiler restoration
+was not completed before the user requested a stop. No successful complete
+frontend translation or end-to-end QF_BV proof is claimed. Resume by restoring
+the focused compiler dependencies, rebuilding these candidates, and rerunning
+the unchanged frontend extraction.

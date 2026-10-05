@@ -192,7 +192,9 @@ val prepare_match_ctx_with_target :
 
 (** Narrow native-predicate hierarchy helpers, exposed for structural controls. *)
 val validate_symbolic_hierarchy_type :
+  ?allow_mutable:bool ->
   Meta.span -> LlbcAst.crate -> TypesAnalysis.type_infos -> Types.ty -> Types.RegionId.Set.t
 val symbolic_hierarchy_parents :
+  ?allow_mutable:bool ->
   Meta.span -> LlbcAst.crate -> TypesAnalysis.type_infos -> Types.RegionId.id list ->
   Types.ty -> Types.RegionId.id list Types.RegionId.Map.t

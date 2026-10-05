@@ -521,7 +521,7 @@ let check_retained_shared_loan ?(allow_marked=false) span (ctx : eval_ctx) (owne
 (** Some bid is the native parent-return notification from apply_proj_borrows,
     not another UMut borrow. Validate the original parent permission and loan;
     retain the ID, wrapper and parent edges for give_back_value's A/E transition. *)
-let check_tracked_ignored_mut ?(allow_marked=false) ~is_borrow span (ctx : eval_ctx)
+let check_tracked_ignored_mut ?(allow_marked=false) ~historical_shared ~is_borrow span (ctx : eval_ctx)
     (owner : abs) level bid ty child_ty =
   let checked condition message = require span condition
       (message ^ " (tracked reference=" ^ BorrowId.to_string bid
@@ -529,6 +529,27 @@ let check_tracked_ignored_mut ?(allow_marked=false) ~is_borrow span (ctx : eval_
   let outer, target = match ty with
     | TRef (RVar (Free outer), target, RMut) -> outer,target
     | _ -> reject span "tracked ignored reference needs its native mutable-reference type" in
+  (* A retained child of an ended ignored-borrow wrapper describes the earlier
+     projection, not the parent's new shared projection scope after a join.
+     Keep both complete types and all subscription IDs. Only the mutable outer
+     permission must coincide; any mutable referent or different carrier is
+     rejected. This is observation of historical metadata, not region unification. *)
+  let parent_type_matches actual =
+    equal_ty actual ty ||
+    (historical_shared
+     && Sys.getenv_opt "AENEAS_EXPERIMENTAL_HISTORICAL_SHARED_SUBSCRIPTION" = Some "1"
+     && match actual with
+        | TRef (RVar (Free actual_outer),actual_target,RMut) ->
+            if actual_outer=outer
+               && not (TypesUtils.ty_has_mut_borrows ctx.type_ctx.type_infos target)
+               && not (TypesUtils.ty_has_mut_borrows ctx.type_ctx.type_infos actual_target)
+               && equal_ty (Substitute.erase_regions target) (Substitute.erase_regions actual_target)
+            then (
+              check_type span ctx owner actual;
+              RegionId.Set.is_empty (RegionId.Set.inter (TypesUtils.ty_regions actual) ctx.ended_regions))
+            else false
+        | _ -> false)
+  in
   check_type span ctx owner ty;
   checked (equal_ty target child_ty) "tracked ignored reference child type changed";
   checked (not (RegionId.Set.mem outer owner.regions.owned))
@@ -556,7 +577,7 @@ let check_tracked_ignored_mut ?(allow_marked=false) ~is_borrow span (ctx : eval_
         (match value.value with
         | ABorrow (AMutBorrow (marker,id,_)) when is_borrow && id=bid ->
             checked (allow_marked || marker=PNone) "marked parent borrow is unsupported";
-            checked (equal_ty value.ty ty && RegionId.Set.mem outer parent.regions.owned
+            checked (parent_type_matches value.ty && RegionId.Set.mem outer parent.regions.owned
               && not (AbsLevelSet.mem level parent.ended_subabs))
               "tracked ignored reference disagrees with its live parent permission";
             parents := marker :: !parents
@@ -607,10 +628,10 @@ let check_tracked_ignored_mut ?(allow_marked=false) ~is_borrow span (ctx : eval_
   checked (!loans=1) "tracked ignored reference needs one current mutable counterpart"
 
 let check_tracked_ignored_mut_borrow ?allow_marked =
-  check_tracked_ignored_mut ?allow_marked ~is_borrow:true
+  check_tracked_ignored_mut ?allow_marked ~historical_shared:false ~is_borrow:true
 
 let check_tracked_ignored_mut_loan ?allow_marked =
-  check_tracked_ignored_mut ?allow_marked ~is_borrow:false
+  check_tracked_ignored_mut ?allow_marked ~historical_shared:false ~is_borrow:false
 
 let check ?(allow_marked=false) span (ctx : eval_ctx) (owner : abs) : certificate =
   let slots = ref [] in
@@ -693,14 +714,14 @@ let check ?(allow_marked=false) span (ctx : eval_ctx) (owner : abs) : certificat
           p.mvalues.given_back.sv_id p.mvalues.given_back.sv_ty;
         history (path @ ["loans"]) level p.loans
     | AEmpty -> ()
-  and avalue path level (v : tavalue) =
+  and avalue ?(historical_shared=false) path level (v : tavalue) =
     current_value := Some (path,level,v);
     typed path level "typed-wrapper" v.ty;
     match v.value with
     | AAdt a ->
         (* The native checker below validates the real variant and full typed
            projected field representation, not a filtered Pure tuple. *)
-        List.iteri (fun i f -> avalue (path @ ["field";string_of_int i]) level f) a.fields
+        List.iteri (fun i f -> avalue ~historical_shared (path @ ["field";string_of_int i]) level f) a.fields
     | AIgnored None -> ()
     | AIgnored (Some ({value=VBorrow(VSharedBorrow _);_} as metadata))
       when level=0 && (match path with ["avalue";_]->true|_->false) ->
@@ -795,10 +816,11 @@ let check ?(allow_marked=false) span (ctx : eval_ctx) (owner : abs) : certificat
         | _ -> reject span "ended ignored mutable wrapper requires a native mutable reference");
         symbolic (path @ ["given_back_metadata"]) level "given-back-metadata"
           b.given_back_meta.sv_id b.given_back_meta.sv_ty;
-        avalue (path @ ["child"]) level b.child;
+        avalue ~historical_shared:true (path @ ["child"]) level b.child;
         avalue (path @ ["given_back"]) (level + 1) b.given_back
     | ABorrow (AIgnoredMutBorrow (Some bid,child)) ->
-        check_tracked_ignored_mut_borrow ~allow_marked span ctx owner level bid v.ty child.ty;
+        check_tracked_ignored_mut ~allow_marked ~historical_shared ~is_borrow:true
+          span ctx owner level bid v.ty child.ty;
         polarity level true;
         avalue (path @ ["child"]) level child
     | ABorrow (AIgnoredMutBorrow (None,child)) ->

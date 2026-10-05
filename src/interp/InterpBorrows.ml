@@ -2283,6 +2283,16 @@ let destructure_abs
             (* Just explore the child *)
             list_avalues (allow_borrows - 1) push_fail child_av
         | AEndedIgnoredMutBorrow
+            {child={value=ABorrow(AIgnoredMutBorrow(Some _,_));_};_}
+          when InterpSharedPacketSignature.enabled () && allow_borrows=2 ->
+            (* Keep the ended outer return wrapper and the exact nested
+               parent subscription at their native levels. Flattening these
+               independently loses the pending return notification. The
+               explicit signature validates the full original typed tree. *)
+            ignore (InterpSharedPacketSignature.check ~allow_marked:true span ctx
+              {abs0 with avalues=[av]});
+            push av
+        | AEndedIgnoredMutBorrow
             { child = child_av; given_back; given_back_meta = _ } ->
             (* Just explore the child *)
             let allow_borrows = allow_borrows - 1 in

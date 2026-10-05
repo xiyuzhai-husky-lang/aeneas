@@ -2367,6 +2367,181 @@ let fix_closure_signature_regions (crate : crate) (f : fun_decl) : fun_decl =
       else f
   | _ -> f
 
+(** Dependency MIR can copy a Box's raw pointer into a temporary solely to
+    reborrow its payload. Treating this as a functional Box value copy loses the
+    original borrow provenance. Fuse that adjacent pointer-copy/reborrow pair,
+    only when the temporary has no other use (apart from storage-dead markers).
+    The source is a Box behind a shared reference and the resulting borrow stays
+    shared; no owning Box, allocation or destructor is copied or removed. *)
+let normalize_shared_box_pointer_reborrows (_crate : crate) (f : fun_decl) : fun_decl =
+  match f.body with
+  | StructuredBody body ->
+      let counts=ref LocalId.Map.empty in
+      let count=object
+        inherit [_] iter_statement
+        method! visit_StorageDead () _ = ()
+        method! visit_local_id () id =
+          counts:=LocalId.Map.add id (1 + Option.value ~default:0
+            (LocalId.Map.find_opt id !counts)) !counts
+      end in
+      count#visit_block () body.body;
+      let is_shared_source (source:place) = match source.kind,source.ty with
+        | PlaceProjection(parent,Deref),TAdt {builtin=Some TBox;_} ->
+            (match parent.ty with TRef(_,ty,RShared) -> equal_ty ty source.ty | _ -> false)
+        | _ -> false in
+      let removed=ref LocalId.Set.empty in
+      let rec update = function
+        | {kind=Assign({kind=PlaceLocal id;_} as temporary,Use(Copy source,NoRetag));_}
+          :: ({kind=Assign(destination,RvRef({kind=PlaceProjection(base,Deref);ty},BShared,retag));_} as borrow)
+          :: rest when base=temporary && is_shared_source source
+            && LocalId.Map.find_opt id !counts=Some 2 ->
+              removed:=LocalId.Set.add id !removed;
+              {borrow with kind=Assign(destination,RvRef({kind=PlaceProjection(source,Deref);ty},BShared,retag))}
+                :: update rest
+        | first::rest -> first::update rest
+        | [] -> [] in
+      let visitor=object
+        inherit [_] map_statement_base as super
+        method! visit_block env block =
+          super#visit_block env {block with statements=update block.statements}
+      end in
+      let transformed=visitor#visit_block () body.body in
+      let transformed=map_statement (fun statement -> match statement.kind with
+        | StorageDead id when LocalId.Set.mem id !removed -> []
+        | _ -> [statement]) transformed in
+      {f with body=StructuredBody {body with body=transformed}}
+  | _ -> f
+
+(** Rust's elaborated MIR may call Box's deallocation-only Drop method after
+    moving out its payload. Aeneas already treats Box as a functional value and
+    Drop as permission cleanup, without native allocator effects. Restore that
+    same Drop operation before the synthetic &mut Box read, which would
+    incorrectly demand that the moved payload remain initialized. Only the
+    standard Global allocator is admitted; arbitrary user destructors and
+    custom allocators retain their ordinary translation. *)
+let normalize_global_box_deallocation (crate : crate) (f : fun_decl) : fun_decl =
+  let drop_pattern = NameMatcher.parse_pattern
+    "alloc::boxed::{core::ops::drop::Drop<alloc::boxed::Box<@T>>}::drop" in
+  let global_pattern = NameMatcher.parse_pattern "alloc::alloc::Global" in
+  let matches = ExtractName.match_name crate in
+  let is_global = function
+    | TAdt {id; generics; builtin=None} when generics=empty_generic_args ->
+        (match TypeDeclId.Map.find_opt id crate.type_decls with
+        | Some d -> matches global_pattern d.item_meta.name
+        | None -> false)
+    | _ -> false in
+  let rec update = function
+    | ({kind=Assign (destination,RvRef (boxed,BMut,_));_} as _reference)
+      :: ({kind=Call ({func=FnOpRegular ({kind=Fun fid;generics} as ptr);
+                        args=[Move argument];dest},on_unwind);_} as call)
+      :: rest when destination=argument ->
+        let recognized = match FunDeclId.Map.find_opt fid crate.fun_decls,
+                               generics.types with
+          | Some d,[_element;allocator] ->
+              matches drop_pattern d.item_meta.name && is_global allocator
+          | _ -> false in
+        if recognized then
+          {call with kind=Drop(boxed,ptr,Precise,on_unwind)} ::
+          {call with kind=Assign(dest,Aggregate(AggregatedAdt((match mk_unit_ty with
+            | TAdt tref -> tref | _ -> assert false),None,None),[]))} :: update rest
+        else _reference :: update (call::rest)
+    | first::rest -> first::update rest
+    | [] -> [] in
+  let visitor=object
+    inherit [_] map_statement_base as super
+    method! visit_block env block =
+      super#visit_block env {block with statements=update block.statements}
+  end in
+  match f.body with
+  | StructuredBody body ->
+      {f with body=StructuredBody {body with body=visitor#visit_block () body.body}}
+  | _ -> f
+
+(** The interpreter drops the entire frame on Return. Dependency MIR can
+    additionally route that same terminal cleanup through drop flags and enum
+    discriminants, including discriminants of already-moved values. If a suffix
+    has no computation other than native Drop, routing and Return, normalize it
+    to the existing frame cleanup. Storage-dead markers are also frame cleanup. Explicit destructor calls, assignments,
+    assertions, loops and all other observable computations are not admitted. *)
+let normalize_terminal_drop_routing (_crate : crate) (f : fun_decl) : fun_decl =
+  let rec cleanup (statement : statement) = match statement.kind with
+    | Return | Nop | Drop _ | StorageDead _ -> true
+    | Switch (_,branches) -> List.for_all (fun b -> List.for_all cleanup b.statements) branches
+    | _ -> false in
+  let rec terminal statements = match List.rev statements with
+    | {kind=Return;_}::_ -> true
+    | {kind=Switch (_,branches);_}::_ ->
+        branches<>[] && List.for_all (fun b -> terminal b.statements) branches
+    | _ -> false in
+  let update statements =
+    if not (terminal statements) then statements else
+    let rec trim = function
+      | statement::rest when cleanup statement -> trim rest
+      | kept -> kept in
+    match List.rev statements with
+    | [] -> []
+    | last::rest ->
+        let return={last with kind=Return} in
+        List.rev (trim (last::rest)) @ [return] in
+  let visitor=object
+    inherit [_] map_statement_base as super
+    method! visit_block env block =
+      let block=super#visit_block env block in
+      {block with statements=update block.statements}
+  end in
+  match f.body with
+  | StructuredBody body ->
+      let result={f with body=StructuredBody {body with body=visitor#visit_block () body.body}} in
+      if Sys.getenv_opt "AENEAS_TRACE_TERMINAL_DROP_ROUTING"=Some "1"
+        && ExtractName.match_name _crate (NameMatcher.parse_pattern "minimal_sat::refresh_all") f.item_meta.name then
+          Printf.eprintf "TERMINAL_DROP_ROUTING_RESULT\n%s\n%!"
+            (Print.fun_decl_to_string (Print.crate_to_fmt_env _crate) "" "  " result);
+      result
+  | _ -> f
+
+(** Lower character switches to the already-supported equality/Bool routing.
+    Evaluate the scrutinee exactly once and retain the original case order and
+    fallback. This does not interpret Unicode as arbitrary integer values. *)
+let lower_character_switches (_crate : crate) (f : fun_decl) : fun_decl =
+  match f.body with
+  | StructuredBody body ->
+      let added=ref [] in
+      let _,fresh=LocalId.mk_stateful_generator_starting_at_id
+        (LocalId.of_int (List.length body.locals.locals)) in
+      let local ty =
+        let index=fresh () in
+        added := {index;local_ty=ty;name=None;span=f.item_meta.span;drop_flag_for=None}::!added;
+        {kind=PlaceLocal index;ty} in
+      let operand_type = function Copy p | Move p -> p.ty | Constant c -> c.ty in
+      let visitor=object
+        inherit [_] map_statement_base as super
+        method! visit_block env block =
+          let block=super#visit_block env block in
+          let lower (statement:statement) = match statement.kind with
+            | Switch ({scrutinee=SwitchValue operand;branches;fallback},targets)
+              when operand_type operand=TScalar TChar ->
+                let captured=local (TScalar TChar) in
+                let mk kind={statement with kind;statement_id=StatementId.zero;comments_before=[]} in
+                let otherwise=match fallback with
+                  | Some index -> List.nth targets (BranchId.to_int index)
+                  | None -> {block with statements=[mk (Abort UndefinedBehavior)]} in
+                let routed=List.fold_right (fun ((case:constant_expr),index) fallback ->
+                  [%sanity_check] statement.span (match case.kind with CChar _ -> true | _ -> false);
+                  let condition=local (TScalar TBool) in
+                  let true_case : constant_expr = {kind=CBool true;ty=TScalar TBool} in
+                  let branch=mk (Switch({scrutinee=SwitchValue(Copy condition);
+                    branches=[true_case,BranchId.zero];fallback=Some (BranchId.of_int 1)},[List.nth targets (BranchId.to_int index);fallback])) in
+                  {block with statements=[mk (Assign(condition,BinaryOp(Eq,Copy captured,Constant case)));branch]})
+                  branches otherwise in
+                mk (Assign(captured,Use(operand,NoRetag)))::routed.statements
+            | _ -> [statement] in
+          {block with statements=List.concat_map lower block.statements}
+      end in
+      let translated=visitor#visit_block () body.body in
+      {f with body=StructuredBody {body with body=translated;
+        locals={body.locals with locals=body.locals.locals @ List.rev !added}}}
+  | _ -> f
+
 let apply_passes (crate : crate) : crate =
   (* Passes that apply to the whole crate *)
   let crate = update_array_default crate in
@@ -2376,6 +2551,7 @@ let apply_passes (crate : crate) : crate =
       ("fix_closure_lifetimes", fix_closure_lifetimes);
       ("fix_closure_signature_regions", fix_closure_signature_regions);
       ("erase_body_regions", erase_body_regions);
+      ("lower_character_switches", lower_character_switches);
       ("remove_unreachable", remove_unreachable);
       ("update_loop", (fun crate f ->
         if !Config.multi_exit_loops then (
@@ -2386,6 +2562,9 @@ let apply_passes (crate : crate) : crate =
       ("remove_useless_joins", remove_useless_joins);
       ( "remove_shallow_borrows_storage_live_dead",
         remove_shallow_borrows_storage_live_dead );
+      ("normalize_shared_box_pointer_reborrows", normalize_shared_box_pointer_reborrows);
+      ("normalize_global_box_deallocation", normalize_global_box_deallocation);
+      ("normalize_terminal_drop_routing", normalize_terminal_drop_routing);
       ("decompose_str_borrows", decompose_str_borrows);
       ("simplify_panics", simplify_panics);
       ("decompose_global_accesses", decompose_global_accesses);
